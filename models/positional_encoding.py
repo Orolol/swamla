@@ -87,47 +87,6 @@ class RoPE(nn.Module):
             seq_len = x.shape[-2]
         return self._rotate_half(x, seq_len)
 
-class AlibiPositionalBias(nn.Module):
-    """
-    ALiBi (Attention with Linear Biases) implementation.
-    Paper: https://arxiv.org/abs/2108.12409
-    """
-    def __init__(self, num_heads: int, max_seq_len: int):
-        super().__init__()
-        
-        # Calculate ALiBi slopes
-        def get_slopes(n_heads: int) -> torch.Tensor:
-            def get_slopes_power_of_2(n_heads: int) -> list:
-                start = 2 ** (-(2 ** -(math.log2(n_heads) - 3)))
-                ratio = start
-                return [start * (ratio ** i) for i in range(n_heads)]
-
-            if math.log2(n_heads).is_integer():
-                return torch.tensor(get_slopes_power_of_2(n_heads))
-            
-            closest_power_of_2 = 2 ** math.floor(math.log2(n_heads))
-            base_slopes = torch.tensor(get_slopes_power_of_2(closest_power_of_2))
-            
-            if n_heads <= 2 * closest_power_of_2:
-                slopes = torch.concat([base_slopes, base_slopes[0::2]])[:n_heads]
-            else:
-                slopes = torch.concat([base_slopes, base_slopes[0::2], base_slopes[1::2]])[:n_heads]
-            
-            return slopes
-
-        slopes = get_slopes(num_heads)
-        # Create position bias matrix
-        pos = torch.arange(max_seq_len)
-        rel_pos = pos.unsqueeze(0) - pos.unsqueeze(1)  # [seq_len, seq_len]
-        
-        # [num_heads, seq_len, seq_len]
-        alibi = slopes.unsqueeze(1).unsqueeze(1) * rel_pos.unsqueeze(0)
-        
-        # Register as buffer since it's position-dependent but not trainable
-        self.register_buffer('alibi', alibi)
-        
-    def get_bias(self, T: int, device: torch.device) -> torch.Tensor:
-        return self.alibi.to(device)[:, :T, :T]
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:

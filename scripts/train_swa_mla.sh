@@ -9,6 +9,7 @@ BLOCK_SIZE=${3:-2048}
 OUTPUT_DIR=${4:-outputs/swa_mla}
 RESUME=${5:-false}
 OPTIMIZER=${6:-adamw}  # adamw or lion
+HF_REPO_ID=${7:-}  # e.g., "Orosius/swamla"
 
 echo "Training SWA+MLA hybrid model..."
 echo "Model size: $MODEL_SIZE"
@@ -16,6 +17,9 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Optimizer: $OPTIMIZER"
+if [ -n "$HF_REPO_ID" ]; then
+    echo "HF Repo: $HF_REPO_ID (automatic push on val loss improvement)"
+fi
 echo ""
 
 # Determine if we should use FP8
@@ -28,6 +32,12 @@ if command -v nvidia-smi &> /dev/null; then
     else
         echo "GPU: $GPU_NAME - using BF16 training"
     fi
+fi
+
+# Build HF repo argument if provided
+HF_REPO_ARG=""
+if [ -n "$HF_REPO_ID" ]; then
+    HF_REPO_ARG="--hf_repo_id $HF_REPO_ID"
 fi
 
 python train.py \
@@ -58,11 +68,13 @@ python train.py \
     --save_interval 5000 \
     --compile \
     --gradient_checkpointing \
-    $USE_FP8
+    $USE_FP8 \
+    $HF_REPO_ARG
 
 # Usage examples:
-# ./train_swa_mla.sh small 16 2048                                 # Train small model
-# ./train_swa_mla.sh medium 8 2048 outputs/my_model                # Train medium model with custom output
-# ./train_swa_mla.sh small 16 2048 outputs/my_model false lion     # Use Lion optimizer
+# ./train_swa_mla.sh small 16 2048                                                  # Train small model
+# ./train_swa_mla.sh medium 8 2048 outputs/my_model                                 # Train medium model with custom output
+# ./train_swa_mla.sh small 16 2048 outputs/my_model false lion                      # Use Lion optimizer
+# ./train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"    # Auto-push to HuggingFace
 
 exit 0

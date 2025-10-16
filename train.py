@@ -32,6 +32,14 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not available - logging to console only")
 
+# Try to import huggingface_hub
+try:
+    from huggingface_hub import HfApi
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    print("huggingface_hub not available - HF push disabled")
+
 # Try to import Lion optimizer
 try:
     from lion_pytorch import Lion
@@ -119,6 +127,134 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     return optimizer
 
 
+def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token):
+    """Push model to Hugging Face Hub with automatic naming."""
+    if not HF_AVAILABLE:
+        print("huggingface_hub not available - skipping HF push")
+        return
+
+    if not hf_token:
+        print("HF_TOKEN not set - skipping HF push")
+        return
+
+    try:
+        # Create temporary save directory with informative name
+        # Format: tokens_XXXk_loss_Y.YYYY
+        tokens_str = f"{total_tokens // 1000}k" if total_tokens < 1_000_000 else f"{total_tokens // 1_000_000}M"
+        model_name = f"checkpoint_tokens_{tokens_str}_loss_{val_loss:.4f}"
+        save_path = os.path.join(output_dir, "hf_upload", model_name)
+        os.makedirs(save_path, exist_ok=True)
+
+        # Save model state dict and config
+        print(f"Saving model to {save_path}...")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'config': config_args,
+            'total_tokens': total_tokens,
+            'val_loss': val_loss,
+        }, os.path.join(save_path, "pytorch_model.bin"))
+
+        # Save tokenizer
+        tokenizer.save_pretrained(save_path)
+
+        # Save model config as JSON
+        import json
+        with open(os.path.join(save_path, "config.json"), "w") as f:
+            json.dump({
+                'model_type': 'swa_mla',
+                'total_tokens': total_tokens,
+                'val_loss': val_loss,
+                'training_config': config_args,
+            }, f, indent=2)
+
+        # Create a comprehensive README
+        readme_content = f"""---
+license: apache-2.0
+tags:
+- swamla
+- sliding-window-attention
+- multi-head-latent-attention
+- pytorch
+- causal-lm
+---
+
+# SWA-MLA Model Checkpoint
+
+**Training Progress:**
+- Total tokens processed: {total_tokens:,}
+- Validation loss: {val_loss:.4f}
+- Perplexity: {math.exp(val_loss):.2f}
+
+This is an automatic checkpoint uploaded during training when validation loss improved.
+
+## Model Architecture
+Hybrid architecture combining:
+- **Sliding Window Attention (SWA)** blocks for efficient local context
+- **Multi-head Latent Attention (MLA)** blocks for global context with KV compression
+
+## Model Configuration
+- Size: {config_args.get('size', 'unknown')}
+- Block size (context length): {config_args.get('block_size', 'unknown')}
+- SWA layers per cycle: {config_args.get('swa_layers_per_cycle', 'unknown')}
+- MLA layers per cycle: {config_args.get('mla_layers_per_cycle', 'unknown')}
+- SWA window size: {config_args.get('swa_window', 'unknown')}
+- MLA KV LoRA rank: {config_args.get('mla_kv_lora_rank', 'unknown')}
+
+## Loading the Model
+```python
+import torch
+from transformers import AutoTokenizer
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained("{repo_id}", subfolder="{model_name}")
+
+# Load model checkpoint
+checkpoint = torch.hub.load_state_dict_from_url(
+    f"https://huggingface.co/{repo_id}/resolve/main/{model_name}/pytorch_model.bin",
+    map_location="cpu"
+)
+
+# You'll need the SWA-MLA model code to instantiate the model
+# See: https://github.com/yourusername/swamla for the model implementation
+```
+
+## Training Details
+- Optimizer: {config_args.get('optimizer_type', 'unknown')}
+- Learning rate: {config_args.get('learning_rate', 'unknown')}
+- Batch size: {config_args.get('batch_size', 'unknown')}
+- Gradient accumulation: {config_args.get('gradient_accumulation_steps', 'unknown')}
+
+---
+Generated with [SWA-MLA](https://github.com/yourusername/swamla)
+"""
+
+        with open(os.path.join(save_path, "README.md"), "w") as f:
+            f.write(readme_content)
+
+        # Upload to HF
+        print(f"Uploading to Hugging Face: {repo_id}/{model_name}...")
+        api = HfApi(token=hf_token)
+        api.upload_folder(
+            folder_path=save_path,
+            repo_id=repo_id,
+            repo_type="model",
+            path_in_repo=model_name,
+            commit_message=f"Add checkpoint: {total_tokens:,} tokens, val_loss={val_loss:.4f}"
+        )
+
+        print(f"Successfully uploaded to https://huggingface.co/{repo_id}/tree/main/{model_name}")
+
+        # Clean up local upload directory (optional, to save disk space)
+        import shutil
+        shutil.rmtree(save_path)
+        print(f"Cleaned up local upload directory")
+
+    except Exception as e:
+        print(f"Error pushing to Hugging Face: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def train(args):
     """Main training function."""
     # Setup distributed training
@@ -134,6 +270,7 @@ def train(args):
     # Setup wandb (will be updated with model stats later)
     wandb_run = None
     if master_process and WANDB_AVAILABLE and args.wandb_project:
+        wandb.login()
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or f"swa_mla_{args.size}",
@@ -197,7 +334,7 @@ def train(args):
     if args.compile:
         if master_process:
             print("Compiling model with torch.compile()...")
-        model = torch.compile(model)
+        model = torch.compile(model, mode='max-autotune')
 
     # Wrap with DDP
     if is_ddp:
@@ -243,6 +380,10 @@ def train(args):
     running_loss = 0.0
     t0 = time.time()
 
+    # Track best validation loss for HF push
+    best_val_loss = float('inf')
+    total_tokens_seen = 0
+
     for step in range(args.max_iters):
         # Update learning rate
         lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
@@ -283,6 +424,9 @@ def train(args):
         scaler.update()
 
         running_loss += accum_loss
+
+        # Track total tokens processed
+        total_tokens_seen += args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size
 
         # Logging
         if step % args.log_interval == 0 and master_process:
@@ -338,6 +482,29 @@ def train(args):
                     'val/perplexity': perplexity,
                     'step': step
                 })
+
+            # Push to HF if validation loss improved
+            if val_loss < best_val_loss and args.hf_repo_id:
+                print(f"New best validation loss: {val_loss:.4f} (previous: {best_val_loss:.4f})")
+                best_val_loss = val_loss
+
+                # Get HF token from environment
+                hf_token = os.getenv("HF_TOKEN")
+
+                if hf_token:
+                    print(f"Pushing model to Hugging Face...")
+                    push_to_huggingface(
+                        model=raw_model,
+                        tokenizer=tokenizer,
+                        config_args=vars(args),
+                        output_dir=args.output_dir,
+                        total_tokens=total_tokens_seen,
+                        val_loss=val_loss,
+                        repo_id=args.hf_repo_id,
+                        hf_token=hf_token
+                    )
+                else:
+                    print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
 
         # Checkpointing
         if step % args.save_interval == 0 and step > 0 and master_process:
@@ -407,6 +574,9 @@ def main():
     parser.add_argument('--save_interval', type=int, default=5000)
     parser.add_argument('--wandb_project', type=str, default="swamla")
     parser.add_argument('--wandb_run_name', type=str, default=None)
+
+    # Hugging Face integration
+    parser.add_argument('--hf_repo_id', type=str, default=None, help='HuggingFace repo ID (e.g., "username/model-name"). Set HF_TOKEN env var for authentication.')
 
     # Performance
     parser.add_argument('--compile', action='store_true')

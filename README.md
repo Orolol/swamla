@@ -12,6 +12,7 @@ A completely self-contained implementation of the SWA-MLA hybrid architecture fo
 - **Wandb Integration**: Built-in experiment tracking
 - **Multi-GPU Ready**: Full DDP support with optimized communication
 - **torch.compile Compatible**: Enhanced performance with PyTorch 2.0+ compilation
+- **Automatic HuggingFace Push**: Auto-upload checkpoints to HuggingFace Hub when validation loss improves
 
 ## Architecture Overview
 
@@ -53,6 +54,10 @@ pip install -r requirements.txt
 
 # Train with Lion optimizer
 ./scripts/train_swa_mla.sh small 16 2048 outputs/my_model false lion
+
+# Train with automatic HuggingFace push (set HF_TOKEN env var first)
+export HF_TOKEN="your_hf_token_here"
+./scripts/train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"
 ```
 
 ### Advanced Training
@@ -194,6 +199,29 @@ Tracks:
 - Learning rate schedule
 - Tokens per second
 - GPU memory usage
+
+### Automatic HuggingFace Push
+
+The training script can automatically push checkpoints to HuggingFace Hub when validation loss improves. See [HUGGINGFACE_PUSH.md](HUGGINGFACE_PUSH.md) for complete documentation.
+
+**Quick setup:**
+```bash
+# 1. Set your HuggingFace token
+export HF_TOKEN="your_hf_token_here"
+
+# 2. Train with automatic push
+python train.py \
+    --size small \
+    --batch_size 8 \
+    --hf_repo_id "YourUsername/your-repo"
+```
+
+Features:
+- Automatically pushes when validation loss improves
+- Checkpoints named by tokens processed and loss (e.g., `checkpoint_tokens_512M_loss_2.3456`)
+- Includes model weights, config, tokenizer, and comprehensive README
+- Only master process pushes in multi-GPU training
+- Errors don't stop training
 
 ## Performance Tips
 
