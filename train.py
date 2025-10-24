@@ -754,7 +754,8 @@ def train(args):
                 })
 
         # Validation (using next batches from same data loader)
-        if step % args.eval_interval == 0 and step > 0 and master_process:
+        # Skip validation at the exact resume step to avoid immediate validation after loading
+        if step % args.eval_interval == 0 and step > start_step and master_process:
             model.eval()
             val_loss = 0.0
             val_steps = 50
