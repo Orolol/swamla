@@ -6,9 +6,6 @@ lion-pytorch>=0.1.2
 bitsandbytes>=0.41.0
 huggingface_hub>=0.16.0
 
-# Optional but recommended for better performance
-flash-attn>=2.3.0; platform_machine == "x86_64"
-xformers>=0.0.20; platform_machine == "x86_64"
 
 # For FP8 training with TorchAO
 torchao>=0.1.0
