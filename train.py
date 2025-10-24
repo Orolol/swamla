@@ -76,7 +76,8 @@ def configure_tf32(enable_tf32=True, verbose=True):
     """Configure TensorFloat-32 (TF32) precision for Ampere+ GPUs.
 
     TF32 provides ~7x speedup on A100/H100 with minimal accuracy loss.
-    Uses the new PyTorch 2.9+ API for fine-grained control.
+    IMPORTANT: Uses new API (fp32_precision) if available, otherwise legacy API.
+    NEVER mixes both APIs to avoid conflicts.
 
     Args:
         enable_tf32: Whether to enable TF32 (default: True for speed)
@@ -89,31 +90,37 @@ def configure_tf32(enable_tf32=True, verbose=True):
     device_capability = torch.cuda.get_device_capability()
     supports_tf32 = device_capability[0] >= 8
 
+    # Detect which API is available (new fp32_precision or legacy allow_tf32)
+    # Try to access fp32_precision to check if new API exists
+    has_new_api = False
+    try:
+        # Just try to read the attribute to see if it exists
+        _ = torch.backends.cuda.matmul.fp32_precision
+        has_new_api = True
+    except AttributeError:
+        has_new_api = False
+
     if enable_tf32 and supports_tf32:
-        # New PyTorch 2.9+ API - recommended for fine-grained control
-        try:
-            # Enable TF32 for matmul operations (includes attention, linear layers)
+        if has_new_api:
+            # Use ONLY new PyTorch 2.9+ API
+            # DO NOT touch allow_tf32 (legacy API) to avoid mixing
             torch.backends.cuda.matmul.fp32_precision = "tf32"
-
-            # Enable TF32 for cuDNN operations (includes convolutions)
             torch.backends.cudnn.fp32_precision = "tf32"
-
-            if verbose:
-                print("✓ TF32 enabled for FP32 operations")
-                print("  - Matmul operations: TF32 (includes attention, linear layers)")
-                print("  - cuDNN operations: TF32 (includes convolutions)")
-                print("  - Expected speedup: ~3-7x on A100/H100 for FP32 operations")
-                print("  - Note: TF32 reduces mantissa from 23 to 10 bits (minimal accuracy loss)")
-
-        except AttributeError:
-            # Fallback to old API if new API not available
-            if verbose:
-                print("Using legacy TF32 API (PyTorch < 2.9)")
+            api_used = "new API (fp32_precision)"
+            
+        else:
+            # Use ONLY legacy API for PyTorch < 2.9
+            # DO NOT touch fp32_precision to avoid mixing
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            api_used = "legacy API (allow_tf32)"
 
-            if verbose:
-                print("✓ TF32 enabled (legacy API)")
+        if verbose:
+            print(f"✓ TF32 enabled for FP32 operations ({api_used})")
+            print("  - Matmul operations: TF32 (includes attention, linear layers)")
+            print("  - cuDNN operations: TF32 (includes convolutions)")
+            print("  - Expected speedup: ~3-7x on A100/H100 for FP32 operations")
+            print("  - Note: TF32 reduces mantissa from 23 to 10 bits (minimal accuracy loss)")
 
     elif enable_tf32 and not supports_tf32:
         if verbose:
@@ -122,20 +129,19 @@ def configure_tf32(enable_tf32=True, verbose=True):
 
     else:
         # Disable TF32 for full IEEE FP32 precision
-        try:
+        if has_new_api:
+            # Use ONLY new API
             torch.backends.cuda.matmul.fp32_precision = "ieee"
             torch.backends.cudnn.fp32_precision = "ieee"
-
-            if verbose:
-                print("✓ TF32 disabled - using full IEEE FP32 precision")
-
-        except AttributeError:
-            # Fallback to old API
+            api_used = "new API"
+        else:
+            # Use ONLY legacy API
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
+            api_used = "legacy API"
 
-            if verbose:
-                print("✓ TF32 disabled (legacy API)")
+        if verbose:
+            print(f"✓ TF32 disabled - using full IEEE FP32 precision ({api_used})")
 
 
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
@@ -351,7 +357,8 @@ def train(args):
         print(f"DDP: {is_ddp}, World size: {world_size}")
 
     # Configure TF32 precision (only on master process to avoid spam)
-    enable_tf32 = not args.disable_tf32 if hasattr(args, 'disable_tf32') else True
+    # enable_tf32 = not args.disable_tf32 if hasattr(args, 'disable_tf32') else True
+    enable_tf32 = False
     if master_process:
         print("\nConfiguring TF32 precision...")
         configure_tf32(enable_tf32=enable_tf32, verbose=True)

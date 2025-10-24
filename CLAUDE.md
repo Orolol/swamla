@@ -197,21 +197,42 @@ python train.py --size small --disable_tf32
 ```
 
 #### Implementation Details
-The `configure_tf32()` function in [train.py:75-138](train.py#L75-L138):
+The `configure_tf32()` function in [train.py:75-143](train.py#L75-L143):
+
+**IMPORTANT:** Automatically detects and uses ONLY ONE API - never mixes them.
 
 ```python
-# New PyTorch 2.9+ API (recommended)
-torch.backends.cuda.matmul.fp32_precision = "tf32"    # Enable for matmul
-torch.backends.cudnn.fp32_precision = "tf32"          # Enable for cuDNN
+# Auto-detect which API is available
+has_new_api = False
+try:
+    _ = torch.backends.cuda.matmul.fp32_precision  # Test if new API exists
+    has_new_api = True
+except AttributeError:
+    has_new_api = False
 
-# Or disable for full precision
-torch.backends.cuda.matmul.fp32_precision = "ieee"    # Full FP32
-torch.backends.cudnn.fp32_precision = "ieee"          # Full FP32
-
-# Legacy API (PyTorch < 2.9) - automatic fallback
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+if has_new_api:
+    # Use ONLY new API (PyTorch 2.9+)
+    torch.backends.cuda.matmul.fp32_precision = "tf32"  # or "ieee"
+    torch.backends.cudnn.fp32_precision = "tf32"
+else:
+    # Use ONLY legacy API (PyTorch < 2.9)
+    torch.backends.cuda.matmul.allow_tf32 = True  # or False
+    torch.backends.cudnn.allow_tf32 = True
 ```
+
+**Why only one API?**
+Mixing the new API (`fp32_precision`) with the legacy API (`allow_tf32`) causes this error:
+```
+RuntimeError: you have used mix of the legacy and new APIs to set the TF32 status
+```
+
+**Solution:** The code automatically detects which API is available and uses **exclusively** that one, preventing any conflicts with torch.compile, FP8 operations, or other PyTorch internals.
+
+| PyTorch Version | API Used | Status |
+|-----------------|----------|--------|
+| < 2.9 | `allow_tf32` (legacy) | ✅ Works |
+| 2.9+ | `fp32_precision` (new) | ✅ Preferred |
+| Any | Both (mixed) | ❌ Error |
 
 ### Performance Impact
 
