@@ -586,13 +586,22 @@ def train(args):
 
             tokens_per_sec = (args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size * args.log_interval) / dt
 
-            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f}")
+            # Format total tokens for display
+            if total_tokens_seen < 1_000_000:
+                tokens_str = f"{total_tokens_seen // 1000}K"
+            elif total_tokens_seen < 1_000_000_000:
+                tokens_str = f"{total_tokens_seen / 1_000_000:.2f}M"
+            else:
+                tokens_str = f"{total_tokens_seen / 1_000_000_000:.2f}B"
+
+            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}")
 
             if WANDB_AVAILABLE and args.wandb_project:
                 wandb.log({
                     'train/loss': lossf,
                     'train/lr': lr,
                     'train/tokens_per_sec': tokens_per_sec,
+                    'train/total_tokens': total_tokens_seen,
                     'step': step
                 })
 
