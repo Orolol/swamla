@@ -216,7 +216,89 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     return optimizer
 
 
-def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token):
+def load_latest_from_huggingface(repo_id, hf_token=None):
+    """Load the latest checkpoint from HuggingFace Hub.
+
+    Returns:
+        dict: Checkpoint data with keys 'model_state_dict', 'optimizer_state_dict', 'step', 'total_tokens', 'config', 'val_loss'
+        None: If loading fails
+    """
+    if not HF_AVAILABLE:
+        print("huggingface_hub not available - cannot load from HF")
+        return None
+
+    try:
+        from huggingface_hub import list_repo_files
+        import re
+
+        print(f"Loading latest checkpoint from {repo_id}...")
+
+        # List all files in the repo
+        files = list_repo_files(repo_id, token=hf_token)
+
+        # Find all checkpoint directories (format: checkpoint_tokens_XXX_loss_Y.YYYY)
+        checkpoint_pattern = re.compile(r'checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
+        checkpoints = []
+
+        for file in files:
+            match = checkpoint_pattern.match(file)
+            if match:
+                tokens_str = match.group(1)
+                loss_str = match.group(2)
+
+                # Parse tokens (convert k/M/B to actual number)
+                tokens_multiplier = {'k': 1000, 'K': 1000, 'm': 1_000_000, 'M': 1_000_000, 'b': 1_000_000_000, 'B': 1_000_000_000}
+                tokens_value = int(tokens_str[:-1])
+                tokens_suffix = tokens_str[-1]
+                total_tokens = tokens_value * tokens_multiplier.get(tokens_suffix, 1)
+
+                checkpoints.append({
+                    'file': file,
+                    'total_tokens': total_tokens,
+                    'loss': float(loss_str),
+                    'dir': file.rsplit('/', 1)[0]
+                })
+
+        if not checkpoints:
+            print(f"No checkpoints found in {repo_id}")
+            return None
+
+        # Sort by total tokens (most recent training)
+        checkpoints.sort(key=lambda x: x['total_tokens'], reverse=True)
+        latest = checkpoints[0]
+
+        print(f"Found {len(checkpoints)} checkpoints")
+        print(f"Loading latest: {latest['dir']} (tokens: {latest['total_tokens']:,}, loss: {latest['loss']:.4f})")
+
+        # Download the checkpoint file
+        from huggingface_hub import hf_hub_download
+        checkpoint_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=latest['file'],
+            token=hf_token
+        )
+
+        # Load checkpoint
+        # Note: Using weights_only=False because we trust our own checkpoints
+        # and they may contain optimizer states from TorchAO
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            # Fallback for older PyTorch versions that don't have weights_only parameter
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        print(f"✓ Successfully loaded checkpoint from HuggingFace")
+
+        return checkpoint
+
+    except Exception as e:
+        print(f"Error loading from HuggingFace: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token, optimizer=None, step=None):
     """Push model to Hugging Face Hub with automatic naming."""
     if not HF_AVAILABLE:
         print("huggingface_hub not available - skipping HF push")
@@ -236,12 +318,20 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
 
         # Save model state dict and config
         print(f"Saving model to {save_path}...")
-        torch.save({
+        checkpoint_data = {
             'model_state_dict': model.state_dict(),
             'config': config_args,
             'total_tokens': total_tokens,
             'val_loss': val_loss,
-        }, os.path.join(save_path, "pytorch_model.bin"))
+        }
+
+        # Add optimizer state and step if provided (for resuming)
+        if optimizer is not None:
+            checkpoint_data['optimizer_state_dict'] = optimizer.state_dict()
+        if step is not None:
+            checkpoint_data['step'] = step
+
+        torch.save(checkpoint_data, os.path.join(save_path, "pytorch_model.bin"))
 
         # Save tokenizer
         tokenizer.save_pretrained(save_path)
@@ -379,6 +469,30 @@ def train(args):
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
+    # Try to load checkpoint from HuggingFace if requested
+    resume_checkpoint = None
+    resume_step = 0
+    resume_tokens = 0
+    if args.resume_from_hf and args.hf_repo_id:
+        if master_process:
+            print("\n" + "="*80)
+            print("RESUMING FROM HUGGINGFACE")
+            print("="*80)
+
+        hf_token = os.getenv("HF_TOKEN")
+        resume_checkpoint = load_latest_from_huggingface(args.hf_repo_id, hf_token)
+
+        if resume_checkpoint:
+            resume_step = resume_checkpoint.get('step', 0)
+            resume_tokens = resume_checkpoint.get('total_tokens', 0)
+            if master_process:
+                print(f"✓ Will resume from step {resume_step:,} ({resume_tokens:,} tokens)")
+                print("="*80 + "\n")
+        else:
+            if master_process:
+                print("⚠ Failed to load checkpoint from HuggingFace, starting from scratch")
+                print("="*80 + "\n")
+
     # Create model
     if master_process:
         print(f"\nCreating {args.size} SWA-MLA model...")
@@ -402,6 +516,22 @@ def train(args):
     )
 
     model = model.to(device)
+
+    # Load model weights if resuming
+    if resume_checkpoint:
+        if master_process:
+            print("Loading model weights from checkpoint...")
+
+        # Handle state_dict from compiled models (removes _orig_mod. prefix)
+        state_dict = resume_checkpoint['model_state_dict']
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            if master_process:
+                print("Detected compiled model checkpoint, removing _orig_mod. prefix...")
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        model.load_state_dict(state_dict)
+        if master_process:
+            print("✓ Model weights loaded")
 
     # Convert model to FP8 using TorchAO if requested
     if args.use_fp8:
@@ -506,9 +636,25 @@ def train(args):
         use_fp8=args.use_fp8
     )
 
+    # Load optimizer state if resuming
+    if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
+        if master_process:
+            print("Loading optimizer state from checkpoint...")
+        try:
+            optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+            if master_process:
+                print("✓ Optimizer state loaded")
+        except Exception as e:
+            if master_process:
+                print(f"⚠ Failed to load optimizer state: {e}")
+                print("  Continuing with fresh optimizer state")
+
     # Training loop
     if master_process:
         print("\nStarting training...")
+        if resume_step > 0:
+            print(f"Resuming from step: {resume_step:,}")
+            print(f"Starting tokens: {resume_tokens:,}")
         print(f"Max iterations: {args.max_iters:,}")
         print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
@@ -522,9 +668,11 @@ def train(args):
 
     # Track best validation loss for HF push
     best_val_loss = float('inf')
-    total_tokens_seen = 0
+    total_tokens_seen = resume_tokens  # Start from resumed token count
 
-    for step in range(args.max_iters):
+    # Adjust starting step
+    start_step = resume_step
+    for step in range(start_step, args.max_iters):
         # Update learning rate
         lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
 
@@ -639,11 +787,13 @@ def train(args):
                     'step': step
                 })
 
-            # Push to HF if validation loss improved
-            if val_loss < best_val_loss and args.hf_repo_id:
+            # Track best validation loss
+            if val_loss < best_val_loss:
                 print(f"New best validation loss: {val_loss:.4f} (previous: {best_val_loss:.4f})")
                 best_val_loss = val_loss
 
+            # Push to HF at every validation if repo_id is set
+            if args.hf_repo_id:
                 # Get HF token from environment
                 hf_token = os.getenv("HF_TOKEN")
 
@@ -657,7 +807,9 @@ def train(args):
                         total_tokens=total_tokens_seen,
                         val_loss=val_loss,
                         repo_id=args.hf_repo_id,
-                        hf_token=hf_token
+                        hf_token=hf_token,
+                        optimizer=optimizer,
+                        step=step
                     )
                 else:
                     print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
@@ -739,6 +891,7 @@ def main():
 
     # Hugging Face integration
     parser.add_argument('--hf_repo_id', type=str, default=None, help='HuggingFace repo ID (e.g., "username/model-name"). Set HF_TOKEN env var for authentication.')
+    parser.add_argument('--resume_from_hf', action='store_true', help='Resume training from the latest checkpoint in HF repo (requires --hf_repo_id)')
 
     # Performance
     parser.add_argument('--compile', action='store_true')

@@ -8,7 +8,7 @@ MODEL_SIZE=${1:-small}
 BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-2048}
 OUTPUT_DIR=${4:-outputs/swa_mla}
-RESUME=${5:-false}
+RESUME_FROM_HF=${5:-false}  # Set to 'true' to resume from HuggingFace
 OPTIMIZER=${6:-adamw}  # adamw or lion
 HF_REPO_ID=${7:-}  # e.g., "Orosius/swamla"
 
@@ -27,7 +27,10 @@ echo "Output dir: $OUTPUT_DIR"
 echo "Optimizer: $OPTIMIZER"
 echo "Detected GPUs: $NUM_GPUS"
 if [ -n "$HF_REPO_ID" ]; then
-    echo "HF Repo: $HF_REPO_ID (automatic push on val loss improvement)"
+    echo "HF Repo: $HF_REPO_ID (automatic push every validation)"
+    if [ "$RESUME_FROM_HF" = "true" ]; then
+        echo "Resume: true (will load latest checkpoint from HF)"
+    fi
 fi
 echo ""
 
@@ -35,6 +38,9 @@ echo ""
 HF_REPO_ARG=""
 if [ -n "$HF_REPO_ID" ]; then
     HF_REPO_ARG="--hf_repo_id $HF_REPO_ID"
+    if [ "$RESUME_FROM_HF" = "true" ]; then
+        HF_REPO_ARG="$HF_REPO_ARG --resume_from_hf"
+    fi
 fi
 
 # Launch training with DDP if multiple GPUs detected
@@ -105,10 +111,20 @@ else
 fi
 
 # Usage examples:
-# ./train_swa_mla.sh small 16 2048                                                  # Train small model (auto-detects GPUs)
-# ./train_swa_mla.sh medium 8 2048 outputs/my_model                                 # Train medium model with custom output
-# ./train_swa_mla.sh small 16 2048 outputs/my_model false lion                      # Use Lion optimizer
-# ./train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"    # Auto-push to HuggingFace
+# ./train_swa_mla.sh small 16 2048                                                    # Train small model (auto-detects GPUs)
+# ./train_swa_mla.sh medium 8 2048 outputs/my_model                                   # Train medium model with custom output
+# ./train_swa_mla.sh small 16 2048 outputs/my_model false lion                        # Use Lion optimizer
+# ./train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"      # Auto-push to HuggingFace every validation
+# ./train_swa_mla.sh small 8 2048 outputs/my_model true adamw "Orosius/swamla"       # Resume from latest HF checkpoint
+#
+# Parameters:
+#   $1: Model size (small, base, large, xl) [default: small]
+#   $2: Batch size [default: 8]
+#   $3: Block size (context length) [default: 2048]
+#   $4: Output directory [default: outputs/swa_mla]
+#   $5: Resume from HuggingFace (true/false) [default: false]
+#   $6: Optimizer (adamw/lion) [default: adamw]
+#   $7: HuggingFace repo ID (e.g., "username/repo") [default: none]
 #
 # Note: The script automatically detects available GPUs and launches:
 #   - DDP training with torchrun if multiple GPUs are detected

@@ -12,7 +12,8 @@ A completely self-contained implementation of the SWA-MLA hybrid architecture fo
 - **Wandb Integration**: Built-in experiment tracking
 - **Multi-GPU Ready**: Full DDP support with optimized communication
 - **torch.compile Compatible**: Enhanced performance with PyTorch 2.0+ compilation
-- **Automatic HuggingFace Push**: Auto-upload checkpoints to HuggingFace Hub when validation loss improves
+- **Automatic HuggingFace Push**: Auto-upload checkpoints to HuggingFace Hub at every validation
+- **Resume from HuggingFace**: Seamlessly resume training from the latest checkpoint on HuggingFace Hub
 
 ## Architecture Overview
 
@@ -58,7 +59,12 @@ pip install -r requirements.txt
 # Train with automatic HuggingFace push (set HF_TOKEN env var first)
 export HF_TOKEN="your_hf_token_here"
 ./scripts/train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"
+
+# Resume training from latest HuggingFace checkpoint
+./scripts/train_swa_mla.sh small 8 2048 outputs/my_model true adamw "Orosius/swamla"
 ```
+
+**Note:** See [RESUME_TRAINING.md](RESUME_TRAINING.md) for detailed guide on resuming training from HuggingFace.
 
 ### Advanced Training
 
