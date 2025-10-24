@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
 from data_loader_packed import PackedFinewebDataset
-from fp8_trainer import FP8AdamW, FP8Lion
+from fp8_torchao import configure_fp8_training
 
 # Try to import wandb
 try:
@@ -72,6 +72,72 @@ def setup_distributed():
     return False, 0, 0, 1
 
 
+def configure_tf32(enable_tf32=True, verbose=True):
+    """Configure TensorFloat-32 (TF32) precision for Ampere+ GPUs.
+
+    TF32 provides ~7x speedup on A100/H100 with minimal accuracy loss.
+    Uses the new PyTorch 2.9+ API for fine-grained control.
+
+    Args:
+        enable_tf32: Whether to enable TF32 (default: True for speed)
+        verbose: Whether to print configuration details
+    """
+    if not torch.cuda.is_available():
+        return
+
+    # Check if GPU supports TF32 (Ampere or later, compute capability >= 8.0)
+    device_capability = torch.cuda.get_device_capability()
+    supports_tf32 = device_capability[0] >= 8
+
+    if enable_tf32 and supports_tf32:
+        # New PyTorch 2.9+ API - recommended for fine-grained control
+        try:
+            # Enable TF32 for matmul operations (includes attention, linear layers)
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+
+            # Enable TF32 for cuDNN operations (includes convolutions)
+            torch.backends.cudnn.fp32_precision = "tf32"
+
+            if verbose:
+                print("✓ TF32 enabled for FP32 operations")
+                print("  - Matmul operations: TF32 (includes attention, linear layers)")
+                print("  - cuDNN operations: TF32 (includes convolutions)")
+                print("  - Expected speedup: ~3-7x on A100/H100 for FP32 operations")
+                print("  - Note: TF32 reduces mantissa from 23 to 10 bits (minimal accuracy loss)")
+
+        except AttributeError:
+            # Fallback to old API if new API not available
+            if verbose:
+                print("Using legacy TF32 API (PyTorch < 2.9)")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+            if verbose:
+                print("✓ TF32 enabled (legacy API)")
+
+    elif enable_tf32 and not supports_tf32:
+        if verbose:
+            print(f"⚠ TF32 requested but GPU doesn't support it (compute capability {device_capability[0]}.{device_capability[1]} < 8.0)")
+            print("  Falling back to standard FP32 precision")
+
+    else:
+        # Disable TF32 for full IEEE FP32 precision
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            torch.backends.cudnn.fp32_precision = "ieee"
+
+            if verbose:
+                print("✓ TF32 disabled - using full IEEE FP32 precision")
+
+        except AttributeError:
+            # Fallback to old API
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+
+            if verbose:
+                print("✓ TF32 disabled (legacy API)")
+
+
 def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     """Learning rate schedule with warmup and cosine decay."""
     # Linear warmup
@@ -86,7 +152,11 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
 
 
 def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', use_fp8=False):
-    """Configure optimizer with proper parameter grouping."""
+    """Configure optimizer with proper parameter grouping.
+
+    Note: When use_fp8=True on H100/H200, this will automatically use TorchAO's
+    AdamWFp8 optimizer for optimal FP8 training performance.
+    """
     # Separate parameters into decay and no_decay groups
     decay_params = []
     no_decay_params = []
@@ -106,14 +176,27 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
 
-    # Choose optimizer
+    # Choose optimizer based on type and FP8 availability
     if use_fp8:
-        if optimizer_type == 'lion':
-            print("Using FP8Lion optimizer")
-            optimizer = FP8Lion(param_groups, lr=learning_rate, betas=betas)
-        else:
-            print("Using FP8AdamW optimizer")
-            optimizer = FP8AdamW(param_groups, lr=learning_rate, betas=betas)
+        # Use TorchAO FP8 optimizer
+        try:
+            from torchao.optim import AdamWFp8
+
+            optimizer = AdamWFp8(
+                param_groups,
+                lr=learning_rate,
+                betas=betas,
+                eps=1e-8,
+            )
+            print("Using TorchAO AdamWFp8 optimizer (FP8 training)")
+
+        except ImportError:
+            print("Warning: TorchAO AdamWFp8 not available, falling back to standard AdamW")
+            if device_type == 'cuda':
+                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
+            else:
+                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas)
+
     elif optimizer_type == 'lion' and LION_AVAILABLE:
         print("Using Lion optimizer")
         optimizer = Lion(param_groups, lr=learning_rate, betas=betas)
@@ -267,6 +350,13 @@ def train(args):
         print(f"Device: {device}")
         print(f"DDP: {is_ddp}, World size: {world_size}")
 
+    # Configure TF32 precision (only on master process to avoid spam)
+    enable_tf32 = not args.disable_tf32 if hasattr(args, 'disable_tf32') else True
+    if master_process:
+        print("\nConfiguring TF32 precision...")
+        configure_tf32(enable_tf32=enable_tf32, verbose=True)
+        print("")
+
     # Setup wandb (will be updated with model stats later)
     wandb_run = None
     if master_process and WANDB_AVAILABLE and args.wandb_project:
@@ -300,12 +390,43 @@ def train(args):
         qk_nope_head_dim=args.mla_qk_nope_head_dim,
         qk_rope_head_dim=args.mla_qk_rope_head_dim,
         v_head_dim=args.mla_v_head_dim,
-        use_fp8=args.use_fp8,
+        use_fp8=False,  # FP8 conversion now handled by TorchAO
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
     model = model.to(device)
 
+    # Convert model to FP8 using TorchAO if requested
+    if args.use_fp8:
+        if master_process:
+            print("\nConverting model to FP8 with TorchAO...")
+        try:
+            from fp8_torchao import convert_model_to_fp8
+
+            # Convert model, excluding lm_head to avoid dimension alignment issues
+            model = convert_model_to_fp8(model, use_compile=True)  # Compile later if requested
+
+            if master_process:
+                print("✓ Model converted to FP8 for training")
+                print("  - Attention and MLP layers converted to FP8")
+                print("  - lm_head kept in BF16 (vocab_size alignment)")
+                print("  - Automatic scaling factor management")
+                print("  - Expected speedup: ~1.45x on H100/H200")
+
+        except ImportError:
+            if master_process:
+                print("Warning: TorchAO not available for FP8 conversion")
+                print("Falling back to BF16 training")
+            args.use_fp8 = False
+
+        except Exception as e:
+            if master_process:
+                print(f"Warning: Failed to convert model to FP8: {e}")
+                print("Falling back to BF16 training")
+            args.use_fp8 = False
+
+
+               
     # Print model info and log to wandb
     if master_process:
         total_params = sum(p.numel() for p in model.parameters())
@@ -334,7 +455,18 @@ def train(args):
     if args.compile:
         if master_process:
             print("Compiling model with torch.compile()...")
-        model = torch.compile(model, mode='max-autotune')
+
+        # Use different compilation mode for FP8 to avoid FlexibleLayout issues
+        if args.use_fp8:
+            # 'reduce-overhead' mode works better with FP8 dynamic scaling
+            model = torch.compile(model, mode='reduce-overhead')
+            if master_process:
+                print("  Using 'reduce-overhead' mode (optimized for FP8)")
+        else:
+            # 'max-autotune' for non-FP8 training
+            model = torch.compile(model, mode='max-autotune')
+            if master_process:
+                print("  Using 'max-autotune' mode")
 
     # Wrap with DDP
     if is_ddp:
@@ -375,7 +507,8 @@ def train(args):
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
 
     data_iter = iter(data_loader)
-    scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
+    # Note: TorchAO FP8 doesn't need GradScaler, it handles scaling internally
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     running_loss = 0.0
     t0 = time.time()
@@ -387,8 +520,15 @@ def train(args):
     for step in range(args.max_iters):
         # Update learning rate
         lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
+
+        # TorchAO optimizers require .fill_() for lr updates
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            if isinstance(param_group['lr'], torch.Tensor):
+                # TorchAO optimizer: use .fill_()
+                param_group['lr'].fill_(lr)
+            else:
+                # Standard optimizer: direct assignment
+                param_group['lr'] = lr
 
         # Training step with gradient accumulation
         model.train()
@@ -562,6 +702,12 @@ def main():
     # Optimizer
     parser.add_argument('--optimizer_type', type=str, default='adamw', choices=['adamw', 'lion'])
     parser.add_argument('--use_fp8', action='store_true')
+
+    # TF32 precision control (Ampere+ GPUs)
+    parser.add_argument('--enable_tf32', action='store_true', default=True,
+                        help='Enable TF32 for ~3-7x speedup on A100/H100 (default: True)')
+    parser.add_argument('--disable_tf32', action='store_true',
+                        help='Disable TF32 for full IEEE FP32 precision')
 
     # Data parameters
     parser.add_argument('--tokenizer_name', type=str, default='openai-community/gpt2')
