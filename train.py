@@ -744,7 +744,7 @@ def train(args):
 
             print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}")
 
-            if WANDB_AVAILABLE and args.wandb_project:
+            if wandb_run is not None:
                 wandb.log({
                     'train/loss': lossf,
                     'train/lr': lr,
@@ -781,7 +781,7 @@ def train(args):
 
             print(f"\nValidation | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}\n")
 
-            if WANDB_AVAILABLE and args.wandb_project:
+            if wandb_run is not None:
                 wandb.log({
                     'val/loss': val_loss,
                     'val/perplexity': perplexity,
@@ -794,7 +794,8 @@ def train(args):
                 best_val_loss = val_loss
 
             # Push to HF at every validation if repo_id is set
-            if args.hf_repo_id:
+            # IMPORTANT: Only master process should upload to avoid NCCL timeout in multi-GPU training
+            if args.hf_repo_id and master_process:
                 # Get HF token from environment
                 hf_token = os.getenv("HF_TOKEN")
 

@@ -71,7 +71,7 @@ if [ $NUM_GPUS -gt 1 ]; then
     --mla_v_head_dim 128 \
     --tokenizer_name "openai-community/gpt2" \
     --log_interval 10 \
-    --eval_interval 5000 \
+    --eval_interval 1000 \
     --save_interval 50000 \
     --use_fp8 \
     --gradient_checkpointing \
@@ -103,7 +103,7 @@ else
     --mla_v_head_dim 128 \
     --tokenizer_name "openai-community/gpt2" \
     --log_interval 10 \
-    --eval_interval 1000 \
+    --eval_interval 5000 \
     --save_interval 20000 \
     --use_fp8 \
     --gradient_checkpointing \
