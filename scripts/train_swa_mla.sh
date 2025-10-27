@@ -104,7 +104,7 @@ else
     --tokenizer_name "openai-community/gpt2" \
     --log_interval 10 \
     --eval_interval 1000 \
-    --save_interval 5000 \
+    --save_interval 20000 \
     --use_fp8 \
     --gradient_checkpointing \
     $HF_REPO_ARG
