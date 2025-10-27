@@ -240,7 +240,9 @@ class MLA(nn.Module):
             attn_mask = None
             if mask is not None:
                 attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
-            
+                # Ensure mask has the same dtype as query tensor for SDPA compatibility
+                attn_mask = attn_mask.to(q_sdpa.dtype)
+
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=attn_mask,
@@ -290,13 +292,15 @@ class MLA(nn.Module):
             k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
             k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
             v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
-            
+
             # Use SDPA for attention computation
             # Expand mask if provided from [S, T] to [B, H, S, T]
             attn_mask = None
             if mask is not None:
                 attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
-            
+                # Ensure mask has the same dtype as query tensor for SDPA compatibility
+                attn_mask = attn_mask.to(q_sdpa.dtype)
+
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=attn_mask,

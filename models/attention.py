@@ -119,11 +119,13 @@ class CausalSelfAttention(nn.Module):
         Wrapper pour l'attention memory efficient avec gestion des erreurs
         """
         try:
-            # Ensure all tensors have the same dtype
-            working_dtype = torch.float16 if q.device.type == 'cuda' else torch.float32
-            q = q.to(working_dtype)
-            k = k.to(working_dtype)
-            v = v.to(working_dtype)
+            # Ensure all tensors have the same dtype - use the dtype from the model weights
+            # This ensures compatibility with bfloat16, float16, or float32 models
+            working_dtype = q.dtype  # Use the existing dtype of the input tensors
+            # No need to convert q, k, v as they should already be in the correct dtype
+            # q = q.to(working_dtype)  # Commented out - already in correct dtype
+            # k = k.to(working_dtype)  # Commented out - already in correct dtype
+            # v = v.to(working_dtype)  # Commented out - already in correct dtype
             
             # Préparer les tenseurs avec memory pinning pour un transfert plus rapide
             q = q.contiguous()
@@ -353,9 +355,10 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
-        
-        # Ensure consistent dtype for all tensors
-        working_dtype = torch.float16 if x.device.type == 'cuda' else torch.float32
+
+        # Ensure consistent dtype for all tensors - use the model's weight dtype
+        # Get the dtype from the model's weight parameters (e.g., q_proj)
+        working_dtype = self.q_proj.weight.dtype
         x = x.to(working_dtype)
         
         try:

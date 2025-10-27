@@ -1,0 +1,4 @@
+Hello! How are you today?
+/temp 0.7
+Tell me a short story about a robot.
+/quit
