@@ -816,6 +816,12 @@ def train(args):
                 else:
                     print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
 
+            # Synchronize all ranks after HF upload to prevent desynchronization
+            # Without this barrier, rank 0 uploads (slow) while rank 1 continues training,
+            # causing NCCL timeout when rank 1 tries collective ops without rank 0
+            if is_ddp and args.hf_repo_id:
+                dist.barrier()
+
         # Checkpointing
         if step % args.save_interval == 0 and step > 0 and master_process:
             checkpoint = {
