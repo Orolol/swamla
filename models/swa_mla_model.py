@@ -304,7 +304,7 @@ class SWAMLAModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, return_all_logits: bool = False):
         device = idx.device
         b, t = idx.size()
         if t > self.config.block_size:
@@ -356,7 +356,12 @@ class SWAMLAModel(nn.Module):
                     targets.view(-1),
                     ignore_index=-100,
                 )
+        elif return_all_logits:
+            # Training mode: return logits for all positions without computing loss
+            logits = self.lm_head(x)
+            loss = None
         else:
+            # Inference mode: return logits only for last position
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 

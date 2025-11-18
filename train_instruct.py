@@ -1,6 +1,7 @@
 """
-Standalone training script for SWA-MLA model.
-Supports FP8, Lion optimizer, wandb logging, and packed data loading.
+Instruction fine-tuning script for SWA-MLA model.
+Uses SlimOrca dataset with ChatML format and loss masking on prompts.
+Supports FP8, Lion optimizer, wandb logging, and packed conversation loading.
 """
 
 import os
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'data'))
 sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
-from data_loader_packed import PackedFinewebDataset
+from data_loader_instruct import PackedInstructDataset  # Changed from data_loader_packed
 from fp8_torchao import configure_fp8_training
 
 # Try to import wandb
@@ -217,7 +218,7 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
 
 
 def load_latest_from_huggingface(repo_id, hf_token=None):
-    """Load the latest checkpoint from HuggingFace Hub.
+    """Load the latest checkpoint from HuggingFace Hub instruct/ subdirectory.
 
     Returns:
         dict: Checkpoint data with keys 'model_state_dict', 'optimizer_state_dict', 'step', 'total_tokens', 'config', 'val_loss'
@@ -231,13 +232,14 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
         from huggingface_hub import list_repo_files
         import re
 
-        print(f"Loading latest checkpoint from {repo_id}...")
+        print(f"Loading latest checkpoint from {repo_id} (instruct/ subdirectory only)...")
 
         # List all files in the repo
         files = list_repo_files(repo_id, token=hf_token)
 
-        # Find all checkpoint directories (format: checkpoint_tokens_XXX_loss_Y.YYYY)
-        checkpoint_pattern = re.compile(r'checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
+        # Find all checkpoint directories in instruct/ subdirectory ONLY
+        # Pattern: instruct/checkpoint_tokens_XXX_loss_Y.YYYY/pytorch_model.bin
+        checkpoint_pattern = re.compile(r'instruct/checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
         checkpoints = []
 
         for file in files:
@@ -260,7 +262,8 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
                 })
 
         if not checkpoints:
-            print(f"No checkpoints found in {repo_id}")
+            print(f"No instruction fine-tuning checkpoints found in {repo_id}/instruct/")
+            print(f"  Looking for pattern: instruct/checkpoint_tokens_XXX_loss_Y.YYYY/")
             return None
 
         # Sort by total tokens (most recent training)
@@ -299,7 +302,7 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
 
 
 def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token, optimizer=None, step=None):
-    """Push model to Hugging Face Hub with automatic naming."""
+    """Push instruction-tuned model to Hugging Face Hub in instruct/ subdirectory."""
     if not HF_AVAILABLE:
         print("huggingface_hub not available - skipping HF push")
         return
@@ -310,9 +313,9 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
 
     try:
         # Create temporary save directory with informative name
-        # Format: tokens_XXXk_loss_Y.YYYY
+        # Format: instruct/checkpoint_tokens_XXXk_loss_Y.YYYY (in instruct/ subfolder)
         tokens_str = f"{total_tokens // 1000}k" if total_tokens < 1_000_000 else f"{total_tokens // 1_000_000}M"
-        model_name = f"checkpoint_tokens_{tokens_str}_loss_{val_loss:.4f}"
+        model_name = f"instruct/checkpoint_tokens_{tokens_str}_loss_{val_loss:.4f}"
         save_path = os.path.join(output_dir, "hf_upload", model_name)
         os.makedirs(save_path, exist_ok=True)
 
@@ -357,19 +360,25 @@ tags:
 - causal-lm
 ---
 
-# SWA-MLA Model Checkpoint
+# SWA-MLA Model Checkpoint (Instruction Fine-Tuned)
 
 **Training Progress:**
-- Total tokens processed: {total_tokens:,}
+- Total instruction tokens processed: {total_tokens:,}
 - Validation loss: {val_loss:.4f}
 - Perplexity: {math.exp(val_loss):.2f}
 
-This is an automatic checkpoint uploaded during training when validation loss improved.
+This is an instruction fine-tuned checkpoint trained on SlimOrca dataset with ChatML format.
+The model has been fine-tuned to follow instructions and engage in helpful conversations.
 
 ## Model Architecture
 Hybrid architecture combining:
 - **Sliding Window Attention (SWA)** blocks for efficient local context
 - **Multi-head Latent Attention (MLA)** blocks for global context with KV compression
+
+## Fine-Tuning Details
+- Dataset: Open-Orca/SlimOrca
+- Format: ChatML with special tokens (`<|im_start|>`, `<|im_end|>`)
+- Loss masking: Loss calculated only on assistant responses (not on system/user prompts)
 
 ## Model Configuration
 - Size: {config_args.get('size', 'unknown')}
@@ -460,17 +469,28 @@ def train(args):
         wandb.login()
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name or f"swa_mla_{args.size}",
+            name=args.wandb_run_name or f"swa_mla_instruct_{args.size}",
             config=vars(args)
         )
 
-    # Load tokenizer
+    # Load tokenizer and add ChatML special tokens
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
-    # Configure tokenizer to support longer sequences (suppress warning)
-    # GPT-2 tokenizer defaults to 1024, but our model supports longer sequences
+
+    # Configure tokenizer to support longer sequences BEFORE adding tokens
+    # This suppresses the warning about sequence length
     tokenizer.model_max_length = args.block_size
+
+    # Add ChatML special tokens if not already present
+    special_tokens = {"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]}
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    if master_process and num_added > 0:
+        print(f"Added {num_added} ChatML special tokens to tokenizer")
+
     vocab_size = len(tokenizer)
+
+    if master_process:
+        print(f"Tokenizer vocabulary size: {vocab_size} (includes {num_added} new tokens)")
 
     # Try to load checkpoint from HuggingFace if requested
     resume_checkpoint = None
@@ -479,18 +499,23 @@ def train(args):
     if args.resume_from_hf and args.hf_repo_id:
         if master_process:
             print("\n" + "="*80)
-            print("RESUMING FROM HUGGINGFACE")
+            print("LOADING PRE-TRAINED CHECKPOINT FROM HUGGINGFACE")
             print("="*80)
 
         hf_token = os.getenv("HF_TOKEN")
         resume_checkpoint = load_latest_from_huggingface(args.hf_repo_id, hf_token)
 
         if resume_checkpoint:
-            resume_step = resume_checkpoint.get('step', 0)
-            resume_tokens = resume_checkpoint.get('total_tokens', 0)
+            # Get pre-training stats for logging
+            pretrain_step = resume_checkpoint.get('step', 0)
+            pretrain_tokens = resume_checkpoint.get('total_tokens', 0)
             if master_process:
-                print(f"✓ Will resume from step {resume_step:,} ({resume_tokens:,} tokens)")
+                print(f"✓ Loaded pre-trained checkpoint (step {pretrain_step:,}, {pretrain_tokens:,} tokens)")
+                print(f"✓ Starting instruction fine-tuning from step 0")
                 print("="*80 + "\n")
+            # DON'T set resume_step - we're starting fresh for instruction fine-tuning
+            resume_step = 0
+            resume_tokens = 0
         else:
             if master_process:
                 print("⚠ Failed to load checkpoint from HuggingFace, starting from scratch")
@@ -500,9 +525,18 @@ def train(args):
     if master_process:
         print(f"\nCreating {args.size} SWA-MLA model...")
 
+    # IMPORTANT: If resuming from checkpoint, create model with ORIGINAL vocab_size
+    # We'll resize embeddings AFTER loading the checkpoint
+    model_vocab_size = vocab_size
+    if resume_checkpoint and num_added > 0:
+        # Create model with original vocab size to match checkpoint
+        model_vocab_size = vocab_size - num_added
+        if master_process:
+            print(f"Creating model with original vocab_size={model_vocab_size} (will resize after loading)")
+
     model = create_swa_mla_model(
         size=args.size,
-        vocab_size=vocab_size,
+        vocab_size=model_vocab_size,
         block_size=args.block_size,
         dropout=args.dropout,
         swa_layers_per_cycle=args.swa_layers_per_cycle,
@@ -520,7 +554,7 @@ def train(args):
 
     model = model.to(device)
 
-    # Load model weights if resuming
+    # Load model weights if resuming (BEFORE resizing embeddings!)
     if resume_checkpoint:
         if master_process:
             print("Loading model weights from checkpoint...")
@@ -532,9 +566,40 @@ def train(args):
                 print("Detected compiled model checkpoint, removing _orig_mod. prefix...")
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict)  # Should match exactly now
         if master_process:
             print("✓ Model weights loaded")
+
+    # Resize token embeddings if ChatML tokens were added (AFTER loading checkpoint!)
+    if num_added > 0:
+        if master_process:
+            print(f"\nResizing model embeddings from {model.config.vocab_size} to {vocab_size} (adding {num_added} ChatML tokens)...")
+
+        # Get current embedding weights
+        old_wte_weight = model.transformer.wte.weight.data
+        old_lm_head_weight = model.lm_head.weight.data
+
+        # Create new embeddings with random initialization for new tokens
+        new_wte_weight = torch.zeros(vocab_size, model.config.n_embd, device=device, dtype=old_wte_weight.dtype)
+        new_lm_head_weight = torch.zeros(vocab_size, model.config.n_embd, device=device, dtype=old_lm_head_weight.dtype)
+
+        # Copy old weights
+        new_wte_weight[:old_wte_weight.size(0)] = old_wte_weight
+        new_lm_head_weight[:old_lm_head_weight.size(0)] = old_lm_head_weight
+
+        # Initialize new token embeddings (small random values)
+        torch.nn.init.normal_(new_wte_weight[old_wte_weight.size(0):], mean=0.0, std=0.02)
+        torch.nn.init.normal_(new_lm_head_weight[old_lm_head_weight.size(0):], mean=0.0, std=0.02)
+
+        # Replace embeddings
+        model.transformer.wte.weight = torch.nn.Parameter(new_wte_weight)
+        model.lm_head.weight = torch.nn.Parameter(new_lm_head_weight)
+
+        # Update config
+        model.config.vocab_size = vocab_size
+        if master_process:
+            print(f"✓ Model embeddings resized to {vocab_size}")
+            print(f"  - Added {num_added} new token embeddings with random initialization")
 
     # Convert model to FP8 using TorchAO if requested
     if args.use_fp8:
@@ -615,18 +680,30 @@ def train(args):
     else:
         raw_model = model
 
-    # Setup data loader (single instance for both train and val)
+    # Setup data loader for instruction fine-tuning
     if master_process:
-        print("\nSetting up data loader...")
+        print("\nSetting up instruction data loader...")
 
-    data_loader = PackedFinewebDataset(
+    # IMPORTANT: Instruction dataset is DIFFERENT from pre-training dataset
+    # Always start from offset 0 (we're not resuming from the same dataset)
+    # OPTIMIZATION: Use num_workers=1 for streaming datasets to avoid conflicts
+    optimal_workers = 1  # Streaming datasets don't benefit from multiple workers
+    data_loader = PackedInstructDataset(
         split='train',
         max_length=args.block_size,
         batch_size=args.batch_size,
+        buffer_docs=50,  # Number of conversations to buffer before building batch (reduced for faster loading)
+        prefetch_batches=4,  # Number of batches to prefetch
         tokenizer=tokenizer,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=optimal_workers,
+        start_offset=0,  # Always start from beginning for instruction fine-tuning
     )
+
+    if master_process:
+        print("✓ Using PackedInstructDataset with SlimOrca")
+        print(f"  - Format: ChatML with loss masking on prompts")
+        print(f"  - Loss calculated only on assistant responses")
 
     # Setup optimizer
     optimizer = configure_optimizer(
@@ -639,18 +716,14 @@ def train(args):
         use_fp8=args.use_fp8
     )
 
-    # Load optimizer state if resuming
-    if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
-        if master_process:
-            print("Loading optimizer state from checkpoint...")
-        try:
-            optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
-            if master_process:
-                print("✓ Optimizer state loaded")
-        except Exception as e:
-            if master_process:
-                print(f"⚠ Failed to load optimizer state: {e}")
-                print("  Continuing with fresh optimizer state")
+    # DON'T load optimizer state for instruction fine-tuning
+    # Reasons:
+    # 1. Vocabulary changed (embeddings resized)
+    # 2. Different dataset (SlimOrca vs FineWeb)
+    # 3. Fresh start is better for fine-tuning stability
+    if master_process:
+        print("Using fresh optimizer state (not loading from pre-training checkpoint)")
+        print("  - This is normal for instruction fine-tuning")
 
     # Training loop
     if master_process:
@@ -693,24 +766,92 @@ def train(args):
         optimizer.zero_grad()
         accum_loss = 0.0
 
+        # Profiling timestamps
+        if master_process and step % args.log_interval == 0:
+            step_start = time.perf_counter()
+            timings = {}
+
         for micro_step in range(args.gradient_accumulation_steps):
+            if master_process and step % args.log_interval == 0:
+                prof_t0 = time.perf_counter()
+
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(data_loader)
                 batch = next(data_iter)
 
+            if master_process and step % args.log_interval == 0:
+                timings['data_loading'] = timings.get('data_loading', 0) + (time.perf_counter() - prof_t0)
+                prof_t0 = time.perf_counter()
+
             input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            loss_mask = batch['loss_mask'].to(device)
+
+            # Create labels (shift input_ids by 1 for next token prediction)
+            labels = input_ids.clone()
+
+            if master_process and step % args.log_interval == 0:
+                timings['data_transfer'] = timings.get('data_transfer', 0) + (time.perf_counter() - prof_t0)
+                prof_t0 = time.perf_counter()
 
             # Forward pass with mixed precision
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):    
-                logits, loss = model(input_ids, targets=labels)
-                loss = loss / args.gradient_accumulation_steps
+            # IMPORTANT: Use return_all_logits=True to get logits for ALL positions without computing loss
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                logits, _ = model(input_ids, return_all_logits=True)  # Avoids redundant loss computation
 
-            # Backward pass
-            scaler.scale(loss).backward()
+                if master_process and step % args.log_interval == 0:
+                    timings['forward'] = timings.get('forward', 0) + (time.perf_counter() - prof_t0)
+                    prof_t0 = time.perf_counter()
+
+                # Compute masked loss manually
+                # Shift logits and labels for next token prediction
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                shift_mask = loss_mask[:, 1:].contiguous()
+
+                # CRITICAL: Check for valid shapes before any computation
+                # If shift_logits has batch_size=0 or seq_len=0, create zero loss and skip
+                if shift_logits.size(0) == 0 or shift_logits.size(1) == 0:
+                    loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    if master_process and step % args.log_interval == 0:
+                        print(f"  Warning: Skipping batch with invalid shape: {shift_logits.shape}")
+                else:
+                    # Check if there are any valid tokens to compute loss on
+                    num_valid_tokens = shift_mask.sum()
+
+                    if num_valid_tokens > 0:
+                        # Flatten for cross_entropy
+                        loss = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                            reduction='none'
+                        )
+
+                        # Apply mask and compute mean only over unmasked tokens
+                        loss = (loss * shift_mask.view(-1)).sum() / num_valid_tokens
+                        loss = loss / args.gradient_accumulation_steps
+                    else:
+                        # No valid tokens in this batch (all masked), skip
+                        # This can happen with very short conversations or edge cases
+                        loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                        if master_process and step % args.log_interval == 0:
+                            print(f"  Warning: Batch with no valid loss tokens (all masked), skipping...")
+
+                if master_process and step % args.log_interval == 0:
+                    timings['loss_compute'] = timings.get('loss_compute', 0) + (time.perf_counter() - prof_t0)
+                    prof_t0 = time.perf_counter()
+
+            # Backward pass (only if loss has gradients)
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
             accum_loss += loss.item()
+
+            if master_process and step % args.log_interval == 0:
+                timings['backward'] = timings.get('backward', 0) + (time.perf_counter() - prof_t0)
+
+        if master_process and step % args.log_interval == 0:
+            prof_t0 = time.perf_counter()
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -720,6 +861,10 @@ def train(args):
         # Optimizer step
         scaler.step(optimizer)
         scaler.update()
+
+        if master_process and step % args.log_interval == 0:
+            timings['optimizer'] = time.perf_counter() - prof_t0
+            timings['total'] = time.perf_counter() - step_start
 
         running_loss += accum_loss
 
@@ -747,6 +892,18 @@ def train(args):
 
             print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}")
 
+            # # Print detailed timings breakdown
+            # if 'timings' in locals():
+            #     total_time = timings.get('total', 1.0)
+            #     print(f"  Timing breakdown (ms):")
+            #     print(f"    Data loading:  {timings.get('data_loading', 0)*1000:6.2f} ({timings.get('data_loading', 0)/total_time*100:5.1f}%)")
+            #     print(f"    Data transfer: {timings.get('data_transfer', 0)*1000:6.2f} ({timings.get('data_transfer', 0)/total_time*100:5.1f}%)")
+            #     print(f"    Forward pass:  {timings.get('forward', 0)*1000:6.2f} ({timings.get('forward', 0)/total_time*100:5.1f}%)")
+            #     print(f"    Loss compute:  {timings.get('loss_compute', 0)*1000:6.2f} ({timings.get('loss_compute', 0)/total_time*100:5.1f}%)")
+            #     print(f"    Backward pass: {timings.get('backward', 0)*1000:6.2f} ({timings.get('backward', 0)/total_time*100:5.1f}%)")
+            #     print(f"    Optimizer:     {timings.get('optimizer', 0)*1000:6.2f} ({timings.get('optimizer', 0)/total_time*100:5.1f}%)")
+            #     print(f"    TOTAL:         {total_time*1000:6.2f} ms")
+
             if wandb_run is not None:
                 wandb.log({
                     'train/loss': lossf,
@@ -772,10 +929,35 @@ def train(args):
                         batch = next(data_iter)
 
                     input_ids = batch['input_ids'].to(device)
-                    labels = batch['labels'].to(device)
+                    loss_mask = batch['loss_mask'].to(device)
+                    labels = input_ids.clone()
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                        logits, loss = model(input_ids, targets=labels)
+                        # IMPORTANT: Use return_all_logits=True to avoid redundant loss computation
+                        logits, _ = model(input_ids, return_all_logits=True)
+
+                        # Compute masked loss (same as training)
+                        shift_logits = logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        shift_mask = loss_mask[:, 1:].contiguous()
+
+                        # CRITICAL: Check for valid shapes before any computation
+                        if shift_logits.size(0) == 0 or shift_logits.size(1) == 0:
+                            loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                        else:
+                            # Check if there are any valid tokens
+                            num_valid_tokens = shift_mask.sum()
+
+                            if num_valid_tokens > 0:
+                                loss = F.cross_entropy(
+                                    shift_logits.view(-1, shift_logits.size(-1)),
+                                    shift_labels.view(-1),
+                                    reduction='none'
+                                )
+                                loss = (loss * shift_mask.view(-1)).sum() / num_valid_tokens
+                            else:
+                                # Skip this batch if no valid tokens
+                                loss = torch.tensor(0.0, device=device, dtype=torch.float32)
 
                     val_loss += loss.item()
 
@@ -841,7 +1023,7 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train SWA-MLA model')
+    parser = argparse.ArgumentParser(description='Instruction fine-tune SWA-MLA model with SlimOrca')
 
     # Model parameters
     parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl'])
@@ -860,14 +1042,14 @@ def main():
     parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64)
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
 
-    # Training parameters
-    parser.add_argument('--max_iters', type=int, default=100000)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--min_lr', type=float, default=1e-5)
+    # Training parameters (adjusted for instruction fine-tuning)
+    parser.add_argument('--max_iters', type=int, default=10000)  # Fewer iterations for fine-tuning
+    parser.add_argument('--learning_rate', type=float, default=5e-5)  # Lower LR for fine-tuning
+    parser.add_argument('--min_lr', type=float, default=5e-6)  # Lower min LR
     parser.add_argument('--weight_decay', type=float, default=0.1)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.95)
-    parser.add_argument('--warmup_iters', type=int, default=400)
+    parser.add_argument('--warmup_iters', type=int, default=100)  # Less warmup for fine-tuning
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--gradient_checkpointing', action='store_true')
@@ -886,12 +1068,12 @@ def main():
     parser.add_argument('--tokenizer_name', type=str, default='openai-community/gpt2')
     parser.add_argument('--num_workers', type=int, default=8)
 
-    # Logging and checkpointing
-    parser.add_argument('--output_dir', type=str, default='outputs/swa_mla')
+    # Logging and checkpointing (more frequent for fine-tuning)
+    parser.add_argument('--output_dir', type=str, default='outputs/swa_mla_instruct')
     parser.add_argument('--log_interval', type=int, default=10)
-    parser.add_argument('--eval_interval', type=int, default=1000)
-    parser.add_argument('--save_interval', type=int, default=5000)
-    parser.add_argument('--wandb_project', type=str, default="swamla")
+    parser.add_argument('--eval_interval', type=int, default=100)  # Validate more often
+    parser.add_argument('--save_interval', type=int, default=500)  # Save more often
+    parser.add_argument('--wandb_project', type=str, default="swamla-instruct")
     parser.add_argument('--wandb_run_name', type=str, default=None)
 
     # Hugging Face integration

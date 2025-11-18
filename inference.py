@@ -3,6 +3,19 @@ Inference script for SWA-MLA model.
 Supports loading from Hugging Face and two modes:
 - Batch mode: Generate responses for pre-registered prompts
 - Chat mode: Interactive conversation with the model
+
+Examples:
+    # Load latest checkpoint from HuggingFace repo
+    python inference.py --hf_repo_id username/swamla-model --mode chat
+
+    # Load specific checkpoint from HuggingFace repo
+    python inference.py --hf_repo_id username/swamla-model --hf_checkpoint checkpoint_tokens_500k_loss_2.3456 --mode chat
+
+    # Load from local checkpoint file
+    python inference.py --checkpoint outputs/swa_mla/checkpoint_1000.pt --mode batch
+
+    # Batch mode with custom prompts file
+    python inference.py --hf_repo_id username/swamla-model --mode batch --prompts_file my_prompts.txt
 """
 
 import os
@@ -18,7 +31,7 @@ from transformers import AutoTokenizer
 # Add models directory to path
 sys.path.insert(0, str(Path(__file__).parent / 'models'))
 
-from swa_mla_model import SWAMLAModel, SWAMLAConfig
+from swa_mla_model import SWAMLAModel, SWAMLAConfig, create_swa_mla_model
 
 
 class InferenceEngine:
@@ -141,52 +154,262 @@ class InferenceEngine:
         return generated_text
 
 
+def _setup_torchao_mock():
+    """Setup mock TorchAO modules for loading checkpoints without TorchAO installed.
+
+    This allows inference without TorchAO even if the checkpoint was trained with FP8.
+    """
+    try:
+        from torchao.optim.subclass_fp8 import OptimStateFp8
+        print("TorchAO detected - using native OptimStateFp8")
+    except ImportError:
+        print("TorchAO not installed - creating mock OptimStateFp8 for checkpoint loading")
+        # Create a dummy class to allow unpickling without TorchAO
+        import sys
+        from types import ModuleType
+
+        # Create fake torchao modules
+        if 'torchao' not in sys.modules:
+            torchao_module = ModuleType('torchao')
+            sys.modules['torchao'] = torchao_module
+
+            optim_module = ModuleType('torchao.optim')
+            sys.modules['torchao.optim'] = optim_module
+
+            subclass_fp8_module = ModuleType('torchao.optim.subclass_fp8')
+            sys.modules['torchao.optim.subclass_fp8'] = subclass_fp8_module
+
+            # Create dummy OptimStateFp8 class that mimics torch.Tensor subclass
+            class OptimStateFp8(torch.Tensor):
+                """Mock OptimStateFp8 for loading checkpoints without TorchAO."""
+
+                @staticmethod
+                def __new__(cls, data, *args, **kwargs):
+                    if isinstance(data, torch.Tensor):
+                        return data.as_subclass(cls)
+                    return torch.as_tensor(data).as_subclass(cls)
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                @classmethod
+                def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                    """Required for torch.Tensor subclasses."""
+                    kwargs = kwargs or {}
+
+                    def unwrap(x):
+                        if isinstance(x, OptimStateFp8):
+                            return x.as_subclass(torch.Tensor)
+                        return x
+
+                    def unwrap_args(a):
+                        if isinstance(a, (list, tuple)):
+                            return type(a)(unwrap_args(x) for x in a)
+                        return unwrap(a)
+
+                    args = unwrap_args(args)
+                    kwargs = {k: unwrap_args(v) for k, v in kwargs.items()}
+
+                    result = func(*args, **kwargs)
+                    return result
+
+            subclass_fp8_module.OptimStateFp8 = OptimStateFp8
+
+
 def load_model_from_hf(
-    model_name_or_path: str,
+    repo_id: str,
+    checkpoint_name: Optional[str] = None,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
+    hf_token: Optional[str] = None,
 ) -> tuple[SWAMLAModel, AutoTokenizer]:
     """Load SWA-MLA model and tokenizer from Hugging Face.
 
     Args:
-        model_name_or_path: HF model repo ID or local path
+        repo_id: HF model repo ID (e.g., "username/swamla-model")
+        checkpoint_name: Optional specific checkpoint folder name (e.g., "checkpoint_tokens_500k_loss_2.3456")
+                        If None, loads the latest checkpoint automatically
         device: Device to load model on
         torch_dtype: Data type for model weights
+        hf_token: Optional HuggingFace token for private repos
 
     Returns:
         Tuple of (model, tokenizer)
     """
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, list_repo_files
     import json
+    import re
 
-    print(f"Loading model from {model_name_or_path}...")
+    # Setup TorchAO mock if needed (for loading checkpoints with FP8 optimizer states)
+    _setup_torchao_mock()
 
-    # Download config
-    config_path = hf_hub_download(repo_id=model_name_or_path, filename="config.json")
+    # If no checkpoint specified, find the latest one
+    if checkpoint_name is None:
+        print(f"Finding latest checkpoint in {repo_id}...")
+
+        # List all files in the repo
+        files = list_repo_files(repo_id, token=hf_token)
+
+        # Find all checkpoint directories (format: checkpoint_tokens_XXX_loss_Y.YYYY)
+        checkpoint_pattern = re.compile(r'checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
+        checkpoints = []
+
+        for file in files:
+            match = checkpoint_pattern.match(file)
+            if match:
+                tokens_str = match.group(1)
+                loss_str = match.group(2)
+
+                # Parse tokens (convert k/M/B to actual number)
+                tokens_multiplier = {'k': 1000, 'K': 1000, 'm': 1_000_000, 'M': 1_000_000, 'b': 1_000_000_000, 'B': 1_000_000_000}
+                tokens_value = int(tokens_str[:-1])
+                tokens_suffix = tokens_str[-1]
+                total_tokens = tokens_value * tokens_multiplier.get(tokens_suffix, 1)
+
+                checkpoints.append({
+                    'name': file.rsplit('/', 1)[0],
+                    'total_tokens': total_tokens,
+                    'loss': float(loss_str),
+                })
+
+        if not checkpoints:
+            raise ValueError(f"No checkpoints found in {repo_id}")
+
+        # Sort by total tokens (most recent training)
+        checkpoints.sort(key=lambda x: x['total_tokens'], reverse=True)
+        checkpoint_name = checkpoints[0]['name']
+
+        print(f"Found {len(checkpoints)} checkpoints")
+        print(f"Loading latest: {checkpoint_name} (tokens: {checkpoints[0]['total_tokens']:,}, loss: {checkpoints[0]['loss']:.4f})")
+    else:
+        print(f"Loading checkpoint {checkpoint_name} from {repo_id}...")
+
+    # Download config from checkpoint subfolder
+    config_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{checkpoint_name}/config.json",
+        token=hf_token
+    )
     with open(config_path, 'r') as f:
         config_dict = json.load(f)
 
-    # Create model config
-    config = SWAMLAConfig(**config_dict)
+    # Download and load weights FIRST to extract vocab_size
+    weights_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{checkpoint_name}/pytorch_model.bin",
+        token=hf_token
+    )
 
-    # Create model
-    model = SWAMLAModel(config)
+    checkpoint_data = torch.load(weights_path, map_location="cpu", weights_only=False)
 
-    # Download and load weights
-    weights_path = hf_hub_download(repo_id=model_name_or_path, filename="pytorch_model.bin")
-    state_dict = torch.load(weights_path, map_location="cpu")
+    # Extract state_dict (could be directly in checkpoint or under 'model_state_dict' key)
+    if 'model_state_dict' in checkpoint_data:
+        state_dict = checkpoint_data['model_state_dict']
+    else:
+        state_dict = checkpoint_data
 
     # Remove DDP wrapper prefix if present
     if any(key.startswith("module.") for key in state_dict.keys()):
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
+    # Remove torch.compile wrapper prefix if present
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    # Extract vocab_size from state_dict BEFORE creating model
+    vocab_size = None
+    block_size = None
+    if "transformer.wte.weight" in state_dict:
+        vocab_size = state_dict["transformer.wte.weight"].shape[0]
+        print(f"Extracted vocab_size={vocab_size} from checkpoint")
+    if "transformer.wpe.weight" in state_dict:
+        block_size = state_dict["transformer.wpe.weight"].shape[0]
+        print(f"Extracted block_size={block_size} from checkpoint")
+
+    # Extract training_config if it exists (new format from train.py)
+    if 'training_config' in config_dict:
+        training_config = config_dict['training_config'].copy()
+
+        # Check if 'size' preset is specified (small, base, large, xl)
+        model_size = training_config.get('size', None)
+
+        # Map training config parameter names to model config parameter names
+        param_mapping = {
+            'mla_q_lora_rank': 'q_lora_rank',
+            'mla_kv_lora_rank': 'kv_lora_rank',
+            'mla_qk_nope_head_dim': 'qk_nope_head_dim',
+            'mla_qk_rope_head_dim': 'qk_rope_head_dim',
+            'mla_v_head_dim': 'v_head_dim',
+        }
+
+        # Apply mapping
+        for old_name, new_name in param_mapping.items():
+            if old_name in training_config:
+                training_config[new_name] = training_config[old_name]
+
+        # Remove training-specific parameters (but keep model architecture params)
+        training_only_params = [
+            'batch_size', 'max_iters', 'learning_rate', 'min_lr',
+            'weight_decay', 'beta1', 'beta2', 'warmup_iters', 'grad_clip',
+            'gradient_accumulation_steps', 'optimizer_type', 'enable_tf32',
+            'disable_tf32', 'tokenizer_name', 'num_workers', 'output_dir',
+            'log_interval', 'eval_interval', 'save_interval', 'wandb_project',
+            'wandb_run_name', 'hf_repo_id', 'resume_from_hf', 'compile',
+            'mla_q_lora_rank', 'mla_kv_lora_rank', 'mla_qk_nope_head_dim',
+            'mla_qk_rope_head_dim', 'mla_v_head_dim',
+        ]
+
+        for param in training_only_params:
+            training_config.pop(param, None)
+
+        # Rename gradient_checkpointing to use_gradient_checkpointing if needed
+        if 'gradient_checkpointing' in training_config:
+            training_config['use_gradient_checkpointing'] = training_config.pop('gradient_checkpointing')
+
+        # Force use_fp8 to False for inference
+        training_config['use_fp8'] = False
+
+        # Override vocab_size and block_size from checkpoint if extracted
+        if vocab_size is not None:
+            training_config['vocab_size'] = vocab_size
+        if block_size is not None:
+            training_config['block_size'] = block_size
+
+        # Create model using the appropriate method
+        if model_size:
+            # Use create_swa_mla_model() with size preset
+            # Remove 'size' from training_config as it's passed separately
+            training_config.pop('size', None)
+            model = create_swa_mla_model(size=model_size, **training_config)
+        else:
+            # Direct config creation (fallback)
+            config = SWAMLAConfig(**training_config)
+            model = SWAMLAModel(config)
+    else:
+        # Fallback to old format (direct config)
+        if vocab_size is not None:
+            config_dict['vocab_size'] = vocab_size
+        if block_size is not None:
+            config_dict['block_size'] = block_size
+        config = SWAMLAConfig(**config_dict)
+        model = SWAMLAModel(config)
+
     model.load_state_dict(state_dict)
     model = model.to(device=device, dtype=torch_dtype)
     model.eval()
 
-    # Load tokenizer
+    # Load tokenizer from checkpoint subfolder
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            repo_id,
+            subfolder=checkpoint_name,
+            token=hf_token
+        )
+    except Exception as e:
+        print(f"Failed to load tokenizer from checkpoint: {e}")
+        print("Falling back to default GPT-2 tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     # Ensure pad token is set
     if tokenizer.pad_token is None:
@@ -213,80 +436,18 @@ def load_model_from_checkpoint(
     """
     print(f"Loading checkpoint from {checkpoint_path}...")
 
-    # Allow TorchAO optimizer states in checkpoint
-    # In PyTorch 2.6+, weights_only=True by default, but training checkpoints
-    # contain optimizer states that need weights_only=False
-
-    # Create a mock OptimStateFp8 class if TorchAO is not installed
-    # This allows loading checkpoints without needing TorchAO for inference
-    try:
-        from torchao.optim.subclass_fp8 import OptimStateFp8
-        print("TorchAO detected - using native OptimStateFp8")
-    except ImportError:
-        print("TorchAO not installed - creating mock OptimStateFp8 for checkpoint loading")
-        # Create a dummy class to allow unpickling without TorchAO
-        import sys
-        from types import ModuleType
-
-        # Create fake torchao modules
-        if 'torchao' not in sys.modules:
-            torchao_module = ModuleType('torchao')
-            sys.modules['torchao'] = torchao_module
-
-            optim_module = ModuleType('torchao.optim')
-            sys.modules['torchao.optim'] = optim_module
-
-            subclass_fp8_module = ModuleType('torchao.optim.subclass_fp8')
-            sys.modules['torchao.optim.subclass_fp8'] = subclass_fp8_module
-
-            # Create dummy OptimStateFp8 class that mimics torch.Tensor subclass
-            # This is required because pickle will try to reconstruct the optimizer state
-            class OptimStateFp8(torch.Tensor):
-                """Mock OptimStateFp8 for loading checkpoints without TorchAO."""
-
-                @staticmethod
-                def __new__(cls, data, *args, **kwargs):
-                    # Create a tensor and wrap it as this subclass
-                    if isinstance(data, torch.Tensor):
-                        return data.as_subclass(cls)
-                    return torch.as_tensor(data).as_subclass(cls)
-
-                def __init__(self, *args, **kwargs):
-                    # Initialization is handled by __new__
-                    pass
-
-                @classmethod
-                def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-                    """Required for torch.Tensor subclasses."""
-                    kwargs = kwargs or {}
-
-                    # Unwrap all OptimStateFp8 tensors to regular tensors
-                    def unwrap(x):
-                        if isinstance(x, OptimStateFp8):
-                            return x.as_subclass(torch.Tensor)
-                        return x
-
-                    # Recursively unwrap args
-                    def unwrap_args(a):
-                        if isinstance(a, (list, tuple)):
-                            return type(a)(unwrap_args(x) for x in a)
-                        return unwrap(a)
-
-                    args = unwrap_args(args)
-                    kwargs = {k: unwrap_args(v) for k, v in kwargs.items()}
-
-                    # Call the original function
-                    result = func(*args, **kwargs)
-                    return result
-
-            subclass_fp8_module.OptimStateFp8 = OptimStateFp8
+    # Setup TorchAO mock if needed (for loading checkpoints with FP8 optimizer states)
+    _setup_torchao_mock()
 
     # Load checkpoint with weights_only=False to allow optimizer states
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Extract config
     if "config" in checkpoint:
-        config_dict = checkpoint["config"]
+        config_dict = checkpoint["config"].copy()
+
+        # Check if 'size' preset is specified (small, base, large, xl)
+        model_size = config_dict.get('size', None)
 
         # Map training config parameter names to model config parameter names
         # Training config uses 'mla_' prefix, model config doesn't
@@ -305,7 +466,7 @@ def load_model_from_checkpoint(
 
         # Remove training-specific parameters that don't exist in SWAMLAConfig
         training_only_params = [
-            'size', 'batch_size', 'max_iters', 'learning_rate', 'min_lr',
+            'batch_size', 'max_iters', 'learning_rate', 'min_lr',
             'weight_decay', 'beta1', 'beta2', 'warmup_iters', 'grad_clip',
             'gradient_accumulation_steps', 'optimizer_type', 'enable_tf32',
             'disable_tf32', 'tokenizer_name', 'num_workers', 'output_dir',
@@ -326,42 +487,48 @@ def load_model_from_checkpoint(
             config_dict['use_fp8'] = False
             print("Forcing use_fp8=False for inference (FP8 is training-only)")
 
-        # Extract model size from checkpoint if available
-        # We need to infer n_layer and n_embd from the actual checkpoint
-        if "model" in checkpoint:
-            # Try to infer n_layer from state dict keys
-            layer_keys = [k for k in checkpoint["model"].keys() if k.startswith("_orig_mod.transformer.h.")]
-            if layer_keys:
-                # Extract layer indices
-                layer_indices = set()
-                for key in layer_keys:
-                    parts = key.split(".")
-                    if len(parts) > 3 and parts[2] == "h":
-                        try:
-                            layer_indices.add(int(parts[3]))
-                        except ValueError:
-                            pass
-                if layer_indices:
-                    n_layer = max(layer_indices) + 1
-                    config_dict['n_layer'] = n_layer
-                    print(f"Inferred n_layer={n_layer} from checkpoint")
+        # Create model using the appropriate method
+        if model_size:
+            # Use create_swa_mla_model() with size preset
+            # Remove 'size' from config_dict as it's passed separately
+            config_dict.pop('size', None)
+            print(f"Creating model with size preset: {model_size}")
+            model = create_swa_mla_model(size=model_size, **config_dict)
+        else:
+            # Direct config creation (fallback)
+            # Need to infer n_layer and n_embd from the actual checkpoint
+            if "model" in checkpoint:
+                # Try to infer n_layer from state dict keys
+                layer_keys = [k for k in checkpoint["model"].keys() if k.startswith("_orig_mod.transformer.h.")]
+                if layer_keys:
+                    # Extract layer indices
+                    layer_indices = set()
+                    for key in layer_keys:
+                        parts = key.split(".")
+                        if len(parts) > 3 and parts[2] == "h":
+                            try:
+                                layer_indices.add(int(parts[3]))
+                            except ValueError:
+                                pass
+                    if layer_indices:
+                        n_layer = max(layer_indices) + 1
+                        config_dict['n_layer'] = n_layer
+                        print(f"Inferred n_layer={n_layer} from checkpoint")
 
-            # Try to infer n_embd from embedding weights
-            wte_key = "_orig_mod.transformer.wte.weight"
-            if wte_key in checkpoint["model"]:
-                n_embd = checkpoint["model"][wte_key].shape[1]
-                vocab_size = checkpoint["model"][wte_key].shape[0]
-                config_dict['n_embd'] = n_embd
-                config_dict['vocab_size'] = vocab_size
-                print(f"Inferred n_embd={n_embd}, vocab_size={vocab_size} from checkpoint")
+                # Try to infer n_embd from embedding weights
+                wte_key = "_orig_mod.transformer.wte.weight"
+                if wte_key in checkpoint["model"]:
+                    n_embd = checkpoint["model"][wte_key].shape[1]
+                    vocab_size = checkpoint["model"][wte_key].shape[0]
+                    config_dict['n_embd'] = n_embd
+                    config_dict['vocab_size'] = vocab_size
+                    print(f"Inferred n_embd={n_embd}, vocab_size={vocab_size} from checkpoint")
 
-        print(f"Creating model with config: {list(config_dict.keys())}")
-        config = SWAMLAConfig(**config_dict)
+            print(f"Creating model with config: {list(config_dict.keys())}")
+            config = SWAMLAConfig(**config_dict)
+            model = SWAMLAModel(config)
     else:
         raise ValueError("Checkpoint must contain 'config' key")
-
-    # Create model
-    model = SWAMLAModel(config)
 
     # Load state dict
     if "model" in checkpoint:
@@ -489,6 +656,7 @@ def chat_mode(
     top_k: Optional[int] = 50,
     top_p: Optional[float] = 0.9,
     system_prompt: Optional[str] = None,
+    use_chatml: bool = False,
 ):
     """Interactive chat mode with the model.
 
@@ -499,9 +667,12 @@ def chat_mode(
         top_k: Top-k sampling parameter
         top_p: Top-p (nucleus) sampling parameter
         system_prompt: Optional system prompt to prepend to conversation
+        use_chatml: Whether to use ChatML format (for instruction-tuned models)
     """
     print("\n" + "="*80)
     print("CHAT MODE - Interactive conversation with the model")
+    if use_chatml:
+        print("Format: ChatML (instruction-tuned model)")
     print("="*80)
     print("\nCommands:")
     print("  /quit or /exit - Exit chat mode")
@@ -514,8 +685,14 @@ def chat_mode(
 
     # Initialize conversation history
     conversation_history = ""
+    if system_prompt is None and use_chatml:
+        system_prompt = "You are a helpful assistant."
+
     if system_prompt:
-        conversation_history = system_prompt + "\n\n"
+        if use_chatml:
+            conversation_history = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        else:
+            conversation_history = system_prompt + "\n\n"
         print(f"[System prompt set: {system_prompt}]\n")
 
     # Chat loop
@@ -539,7 +716,10 @@ def chat_mode(
                 elif cmd == "/clear":
                     conversation_history = ""
                     if system_prompt:
-                        conversation_history = system_prompt + "\n\n"
+                        if use_chatml:
+                            conversation_history = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                        else:
+                            conversation_history = system_prompt + "\n\n"
                     print("[Conversation history cleared]\n")
                     continue
 
@@ -591,33 +771,55 @@ def chat_mode(
                     continue
 
             # Add user input to conversation history
-            conversation_history += f"You: {user_input}\n"
+            if use_chatml:
+                conversation_history += f"<|im_start|>user\n{user_input}<|im_end|>\n"
+                prompt = conversation_history + "<|im_start|>assistant\n"
+            else:
+                conversation_history += f"You: {user_input}\n"
+                prompt = conversation_history + "Assistant:"
+
+            # Prepare stop tokens for ChatML
+            stop_tokens_list = None
+            if use_chatml:
+                # Get <|im_end|> token ID
+                im_end_id = engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
+                if im_end_id != engine.tokenizer.unk_token_id:
+                    stop_tokens_list = [im_end_id]
 
             # Generate response
-            prompt = conversation_history + "Assistant:"
             output = engine.generate(
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                stop_tokens=stop_tokens_list,
             )
 
             # Extract assistant response
-            if "Assistant:" in output:
-                assistant_response = output.split("Assistant:")[-1].strip()
-            else:
-                # Fallback: take everything after the prompt
+            if use_chatml:
+                # Remove the prompt and extract until <|im_end|>
                 assistant_response = output[len(prompt):].strip()
+                if "<|im_end|>" in assistant_response:
+                    assistant_response = assistant_response.split("<|im_end|>")[0].strip()
+            else:
+                if "Assistant:" in output:
+                    assistant_response = output.split("Assistant:")[-1].strip()
+                else:
+                    # Fallback: take everything after the prompt
+                    assistant_response = output[len(prompt):].strip()
 
-            # Stop at next "You:" if model hallucinates continuation
-            if "\nYou:" in assistant_response:
-                assistant_response = assistant_response.split("\nYou:")[0].strip()
+                # Stop at next "You:" if model hallucinates continuation
+                if "\nYou:" in assistant_response:
+                    assistant_response = assistant_response.split("\nYou:")[0].strip()
 
             print(f"Assistant: {assistant_response}\n")
 
             # Add assistant response to history
-            conversation_history += f"Assistant: {assistant_response}\n"
+            if use_chatml:
+                conversation_history += f"<|im_start|>assistant\n{assistant_response}<|im_end|>\n"
+            else:
+                conversation_history += f"Assistant: {assistant_response}\n"
 
         except KeyboardInterrupt:
             print("\n\n[Interrupted. Type /quit to exit or continue chatting]\n")
@@ -632,8 +834,12 @@ def main():
 
     # Model loading options
     model_group = parser.add_mutually_exclusive_group(required=True)
-    model_group.add_argument("--hf_model", type=str, help="Hugging Face model repo ID")
+    model_group.add_argument("--hf_repo_id", type=str, help="Hugging Face model repo ID (e.g., 'username/swamla-model')")
     model_group.add_argument("--checkpoint", type=str, help="Path to local checkpoint file")
+
+    # HuggingFace specific options
+    parser.add_argument("--hf_checkpoint", type=str, default=None,
+                        help="Specific checkpoint folder name (e.g., 'checkpoint_tokens_500k_loss_2.3456'). If not specified, loads the latest checkpoint automatically.")
 
     # Inference mode
     parser.add_argument("--mode", type=str, choices=["batch", "chat"], default="chat",
@@ -654,6 +860,8 @@ def main():
     # Chat mode specific
     parser.add_argument("--system_prompt", type=str, default=None,
                         help="System prompt for chat mode")
+    parser.add_argument("--chatml", action="store_true",
+                        help="Use ChatML format (for instruction-tuned models)")
 
     # Batch mode specific
     parser.add_argument("--prompts_file", type=str, default=None,
@@ -686,11 +894,16 @@ def main():
             torch_dtype = torch.float32
 
     # Load model
-    if args.hf_model:
+    if args.hf_repo_id:
+        # Get HF token from environment if available
+        hf_token = os.getenv("HF_TOKEN")
+
         model, tokenizer = load_model_from_hf(
-            model_name_or_path=args.hf_model,
+            repo_id=args.hf_repo_id,
+            checkpoint_name=args.hf_checkpoint,
             device=args.device,
             torch_dtype=torch_dtype,
+            hf_token=hf_token,
         )
     else:
         model, tokenizer = load_model_from_checkpoint(
@@ -733,6 +946,7 @@ def main():
             top_k=args.top_k if args.top_k > 0 else None,
             top_p=args.top_p,
             system_prompt=args.system_prompt,
+            use_chatml=args.chatml,
         )
 
 

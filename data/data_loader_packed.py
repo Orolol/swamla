@@ -95,6 +95,7 @@ class PackedFinewebDataset(IterableDataset):
         buffer_docs: int = 4096,
         prefetch_batches: int = 16,
         shuffle: bool = True,
+        shuffle_buffer_size: int = 10000,
         tokenizer: Optional[Any] = None,
         num_workers: int = 1,
         start_offset: int = 0,
@@ -107,7 +108,9 @@ class PackedFinewebDataset(IterableDataset):
         self.buffer_docs = max(512, buffer_docs)
         self.prefetch_batches = max(4, prefetch_batches)
         self.shuffle = shuffle
+        self.shuffle_buffer_size = shuffle_buffer_size
         self.num_workers = max(1, num_workers)
+        self.start_offset = start_offset
 
         # DDP awareness: detect if we're in a distributed environment
         try:
@@ -126,12 +129,28 @@ class PackedFinewebDataset(IterableDataset):
         # For DDP: each rank skips to a different starting point to avoid data overlap
         effective_offset = start_offset + (self.rank * 1000)  # Offset each rank by 1000 examples
 
+        # Load dataset
         self.dataset = load_dataset(
             "HuggingFaceFW/fineweb-edu",
             name="CC-MAIN-2024-10",
             split=split,
             streaming=True,
-        ).skip(effective_offset)
+        )
+
+        # Apply shuffle BEFORE skip to ensure different data order on resume
+        # Use start_offset as seed so each resume gets a different shuffle order
+        if self.shuffle:
+            # Seed based on start_offset + rank to ensure:
+            # 1. Different shuffle order each time we resume training
+            # 2. Each DDP rank gets different shuffle order
+            shuffle_seed = start_offset + self.rank
+            print(f"[PackedDataset Rank {self.rank}] Shuffling dataset with seed={shuffle_seed}, buffer_size={shuffle_buffer_size}")
+            self.dataset = self.dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_size)
+
+        # Skip to starting position AFTER shuffle
+        if effective_offset > 0:
+            print(f"[PackedDataset Rank {self.rank}] Skipping to offset {effective_offset}")
+            self.dataset = self.dataset.skip(effective_offset)
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
