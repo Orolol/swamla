@@ -236,8 +236,19 @@ class SWAMLAModel(nn.Module):
         swa_per_cycle = config.swa_layers_per_cycle
 
         for layer_idx in range(config.n_layer):
+            # Calculate scaling factor for this layer: 0.5x at first layer to 2.0x at last layer
+            if config.n_layer > 1:
+                scale_factor = 0.5 + 1.5 * (layer_idx / (config.n_layer - 1))
+            else:
+                scale_factor = 1.0
+            
             position_in_cycle = layer_idx % cycle_len
             if position_in_cycle < swa_per_cycle:
+                # SWA Layer
+                scaled_window = int(config.swa_window * scale_factor)
+                # Ensure window is at least 1 and even (optional but good practice)
+                scaled_window = max(1, scaled_window)
+                
                 logit_scale_window = config.logit_scale_window if config.logit_scale_window is not None else 128
                 logit_scale_offset = config.logit_scale_offset if config.logit_scale_offset is not None else 0
                 logit_scale_min = config.logit_scale_min if config.logit_scale_min is not None else 1.0
@@ -250,7 +261,7 @@ class SWAMLAModel(nn.Module):
                     ratio_kv=config.ratio_kv,
                     attention_backend=config.attention_backend,
                     use_rope=True,
-                    attention_window=config.swa_window,
+                    attention_window=scaled_window,
                     attention_sink_size=config.swa_sink_size,
                     rope_theta=config.rope_theta,
                     logit_scale_base=config.logit_scale_base,
@@ -269,11 +280,25 @@ class SWAMLAModel(nn.Module):
                 )
                 block = SWALocalBlock(layer_config)
             else:
-                # Choose between MLA Selective or standard MLA based on config
+                # MLA Layer
+                scaled_rank = int(config.kv_lora_rank * scale_factor)
+                # Ensure rank is at least 1 and multiple of 16/32 if needed, but let's just keep it int for now
+                scaled_rank = max(1, scaled_rank)
+                
+                # Create a copy of config with modified rank
+                # We can't easily copy and modify the dataclass if it's frozen, but SWAMLAConfig is not frozen
+                # However, to avoid side effects, let's use the helper or modify a copy
+                
                 if config.use_mla_selective:
-                    block = MLASelectiveBlock(config, layer_id=layer_idx)
+                    # For MLASelective, we need to pass a config object
+                    # Let's create a proxy or modified copy
+                    import copy
+                    layer_specific_config = copy.copy(config)
+                    layer_specific_config.kv_lora_rank = scaled_rank
+                    block = MLASelectiveBlock(layer_specific_config, layer_id=layer_idx)
                 else:
                     mla_config = _create_mla_block_config(config)
+                    mla_config.kv_lora_rank = scaled_rank
                     block = MLABlock(mla_config, layer_id=layer_idx)
             block.use_checkpoint = config.use_gradient_checkpointing
             self.transformer.h.append(block)

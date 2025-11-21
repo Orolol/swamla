@@ -499,8 +499,9 @@ def train(args):
 
     # Setup wandb (will be updated with model stats later)
     wandb_run = None
-    if master_process and WANDB_AVAILABLE and args.wandb_project:
-        wandb.login()
+    if master_process and WANDB_AVAILABLE and args.wandb_project and hasattr(wandb, 'init'):
+        if hasattr(wandb, 'login'):
+            wandb.login()
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or f"swa_mla_{args.size}",
@@ -509,6 +510,7 @@ def train(args):
 
     # Setup TensorBoard
     tb_writer = None
+<<<<<<< Updated upstream
     if master_process and TENSORBOARD_AVAILABLE and args.use_tensorboard:
         tb_dir = os.path.join(args.output_dir, 'tensorboard', args.wandb_run_name or f"swa_mla_{args.size}_{time.strftime('%Y%m%d_%H%M%S')}")
         tb_writer = SummaryWriter(tb_dir)
@@ -516,6 +518,17 @@ def train(args):
 
         # Log hyperparameters
         tb_writer.add_text('config', str(vars(args)), 0)
+=======
+    if master_process:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            # Use a descriptive run name for TensorBoard
+            run_name = args.wandb_run_name or f"swa_mla_{args.size}_{int(time.time())}"
+            tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
+            print(f"TensorBoard logging enabled in runs/{run_name}")
+        except ImportError:
+            print("TensorBoard not available - logging to console only")
+>>>>>>> Stashed changes
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
@@ -820,6 +833,12 @@ def train(args):
                     'train/total_tokens': total_tokens_seen,
                     'step': step
                 })
+            
+            if tb_writer is not None:
+                tb_writer.add_scalar('train/loss', lossf, step)
+                tb_writer.add_scalar('train/lr', lr, step)
+                tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
+                tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
 
             if tb_writer is not None:
                 tb_writer.add_scalar('train/loss', lossf, step)

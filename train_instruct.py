@@ -465,13 +465,26 @@ def train(args):
 
     # Setup wandb (will be updated with model stats later)
     wandb_run = None
-    if master_process and WANDB_AVAILABLE and args.wandb_project:
-        wandb.login()
+    if master_process and WANDB_AVAILABLE and args.wandb_project and hasattr(wandb, 'init'):
+        if hasattr(wandb, 'login'):
+            wandb.login()
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or f"swa_mla_instruct_{args.size}",
             config=vars(args)
         )
+
+    # Setup TensorBoard
+    tb_writer = None
+    if master_process:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            # Use a descriptive run name for TensorBoard
+            run_name = args.wandb_run_name or f"swa_mla_instruct_{args.size}_{int(time.time())}"
+            tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
+            print(f"TensorBoard logging enabled in runs/{run_name}")
+        except ImportError:
+            print("TensorBoard not available - logging to console only")
 
     # Load tokenizer and add ChatML special tokens
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
@@ -484,8 +497,14 @@ def train(args):
     # Add ChatML special tokens if not already present
     special_tokens = {"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]}
     num_added = tokenizer.add_special_tokens(special_tokens)
-    if master_process and num_added > 0:
-        print(f"Added {num_added} ChatML special tokens to tokenizer")
+    if master_process:
+        if wandb_run is not None:
+            wandb.finish()
+        if tb_writer is not None:
+            tb_writer.close()
+        print("Training completed.")
+        if num_added > 0:
+            print(f"Added {num_added} ChatML special tokens to tokenizer")
 
     vocab_size = len(tokenizer)
 
@@ -912,6 +931,12 @@ def train(args):
                     'train/total_tokens': total_tokens_seen,
                     'step': step
                 })
+            
+            if tb_writer is not None:
+                tb_writer.add_scalar('train/loss', lossf, step)
+                tb_writer.add_scalar('train/lr', lr, step)
+                tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
+                tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
 
         # Validation (using next batches from same data loader)
         # Skip validation at the exact resume step to avoid immediate validation after loading
@@ -972,6 +997,10 @@ def train(args):
                     'val/perplexity': perplexity,
                     'step': step
                 })
+            
+            if tb_writer is not None:
+                tb_writer.add_scalar('val/loss', val_loss, step)
+                tb_writer.add_scalar('val/perplexity', perplexity, step)
 
             # Track best validation loss
             if val_loss < best_val_loss:

@@ -66,6 +66,10 @@ if [ "$USE_TENSORBOARD" = "true" ]; then
 fi
 echo ""
 
+# Launch TensorBoard
+./scripts/launch_tensorboard.sh
+echo ""
+
 # Build HF repo argument if provided
 HF_REPO_ARG=""
 if [ -n "$HF_REPO_ID" ]; then
