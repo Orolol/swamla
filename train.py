@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
 from data_loader_packed import PackedFinewebDataset
-from fp8_torchao import configure_fp8_training
+# from fp8_torchao import configure_fp8_training # Removed
 
 # Try to import wandb
 try:
@@ -31,6 +31,14 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not available - logging to console only")
+
+# Try to import tensorboard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    print("tensorboard not available - tensorboard logging disabled")
 
 # Try to import huggingface_hub
 try:
@@ -144,26 +152,82 @@ def configure_tf32(enable_tf32=True, verbose=True):
             print(f"✓ TF32 disabled - using full IEEE FP32 precision ({api_used})")
 
 
-def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
-    """Learning rate schedule with warmup and cosine decay."""
-    # Linear warmup
+def get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr, stable_ratio=0.8):
+    """
+    Warmup-Stable-Decay (WSD) scheduler.
+    
+    Phases:
+    1. Warmup: Linear increase from 0 to learning_rate
+    2. Stable: Constant learning_rate
+    3. Decay: Linear/Cosine decay to min_lr
+    """
+    # 1. Warmup
     if it < warmup_iters:
         return learning_rate * it / warmup_iters
-    # Cosine decay
-    if it > max_iters:
+    
+    # 2. Stable
+    decay_start = int(max_iters * stable_ratio)
+    if it < decay_start:
+        return learning_rate
+        
+    # 3. Decay
+    if it >= max_iters:
         return min_lr
-    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+        
+    # 1-cosine decay for the last phase
+    decay_steps = max_iters - decay_start
+    step_in_decay = it - decay_start
+    decay_ratio = step_in_decay / decay_steps
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', use_fp8=False):
-    """Configure optimizer with proper parameter grouping.
+def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
+    """Wrapper for scheduler selection."""
+    # Use WSD by default for this high-performance run
+    return get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr)
 
-    Note: When use_fp8=True on H100/H200, this will automatically use TorchAO's
-    AdamWFp8 optimizer for optimal FP8 training performance.
-    """
-    # Separate parameters into decay and no_decay groups
+
+def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', use_fp8=False):
+    """Configure optimizer with proper parameter grouping."""
+    
+    if optimizer_type == 'muon':
+        try:
+            from muon import Muon
+            print("Using Muon optimizer for 2D+ parameters, AdamW for others")
+            
+            # Muon params (>= 2D)
+            muon_params = []
+            # AdamW params (< 2D, biases, norms, embeddings if desired)
+            adamw_params = []
+            
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                    
+                # Embeddings and Head
+                # Usually Muon is good for internal layers. 
+                # Let's put embeddings/head in AdamW for stability or Muon?
+                # DeepSeek/Apple suggest Muon for all weights.
+                
+                if param.ndim >= 2:
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+            
+            optimizers = []
+            if muon_params:
+                optimizers.append(Muon(muon_params, lr=learning_rate, momentum=0.95))
+            if adamw_params:
+                optimizers.append(torch.optim.AdamW(adamw_params, lr=learning_rate, betas=betas, weight_decay=weight_decay))
+                
+            return optimizers # Return list of optimizers
+            
+        except ImportError:
+            print("Muon optimizer not found, falling back to AdamW")
+            optimizer_type = 'adamw'
+
+    # Standard AdamW/Lion configuration
     decay_params = []
     no_decay_params = []
 
@@ -171,7 +235,6 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         if not param.requires_grad:
             continue
 
-        # No weight decay for biases, norms, and embeddings
         if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe']):
             no_decay_params.append(param)
         else:
@@ -182,28 +245,8 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
 
-    # Choose optimizer based on type and FP8 availability
-    if use_fp8:
-        # Use TorchAO FP8 optimizer
-        try:
-            from torchao.optim import AdamWFp8
-
-            optimizer = AdamWFp8(
-                param_groups,
-                lr=learning_rate,
-                betas=betas,
-                eps=1e-8,
-            )
-            print("Using TorchAO AdamWFp8 optimizer (FP8 training)")
-
-        except ImportError:
-            print("Warning: TorchAO AdamWFp8 not available, falling back to standard AdamW")
-            if device_type == 'cuda':
-                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
-            else:
-                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas)
-
-    elif optimizer_type == 'lion' and LION_AVAILABLE:
+    # Choose optimizer based on type
+    if optimizer_type == 'lion' and LION_AVAILABLE:
         print("Using Lion optimizer")
         optimizer = Lion(param_groups, lr=learning_rate, betas=betas)
     else:
@@ -464,6 +507,16 @@ def train(args):
             config=vars(args)
         )
 
+    # Setup TensorBoard
+    tb_writer = None
+    if master_process and TENSORBOARD_AVAILABLE and args.use_tensorboard:
+        tb_dir = os.path.join(args.output_dir, 'tensorboard', args.wandb_run_name or f"swa_mla_{args.size}_{time.strftime('%Y%m%d_%H%M%S')}")
+        tb_writer = SummaryWriter(tb_dir)
+        print(f"TensorBoard logging enabled: {tb_dir}")
+
+        # Log hyperparameters
+        tb_writer.add_text('config', str(vars(args)), 0)
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -536,26 +589,25 @@ def train(args):
         if master_process:
             print("✓ Model weights loaded")
 
-    # Convert model to FP8 using TorchAO if requested
+    # Convert model to FP8 using Native PyTorch if requested
     if args.use_fp8:
         if master_process:
-            print("\nConverting model to FP8 with TorchAO...")
+            print("\nConverting model to FP8 with Native PyTorch...")
         try:
-            from fp8_torchao import convert_model_to_fp8
+            from fp8_native import convert_to_native_fp8
 
             # Convert model, excluding lm_head to avoid dimension alignment issues
-            model = convert_model_to_fp8(model, use_compile=True)  # Compile later if requested
+            model = convert_to_native_fp8(model)
 
             if master_process:
                 print("✓ Model converted to FP8 for training")
-                print("  - Attention and MLP layers converted to FP8")
-                print("  - lm_head kept in BF16 (vocab_size alignment)")
-                print("  - Automatic scaling factor management")
-                print("  - Expected speedup: ~1.45x on H100/H200")
+                print("  - Linear layers converted to FP8Linear")
+                print("  - Using torch._scaled_mm for acceleration")
+                print("  - Dynamic scaling enabled")
 
         except ImportError:
             if master_process:
-                print("Warning: TorchAO not available for FP8 conversion")
+                print("Warning: fp8_native module not found")
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
@@ -679,18 +731,27 @@ def train(args):
         # Update learning rate
         lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
 
-        # TorchAO optimizers require .fill_() for lr updates
-        for param_group in optimizer.param_groups:
-            if isinstance(param_group['lr'], torch.Tensor):
-                # TorchAO optimizer: use .fill_()
-                param_group['lr'].fill_(lr)
-            else:
-                # Standard optimizer: direct assignment
-                param_group['lr'] = lr
+        optimizers_list = optimizer if isinstance(optimizer, list) else [optimizer]
+        
+        for opt in optimizers_list:
+            for param_group in opt.param_groups:
+                if isinstance(param_group['lr'], torch.Tensor):
+                    # TorchAO optimizer: use .fill_()
+                    param_group['lr'].fill_(lr)
+                else:
+                    # Standard optimizer: direct assignment
+                    param_group['lr'] = lr
 
         # Training step with gradient accumulation
         model.train()
-        optimizer.zero_grad()
+        
+        # Zero grad for all optimizers
+        if isinstance(optimizer, list):
+            for opt in optimizer:
+                opt.zero_grad()
+        else:
+            optimizer.zero_grad()
+            
         accum_loss = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
@@ -714,11 +775,15 @@ def train(args):
 
         # Gradient clipping
         if args.grad_clip > 0:
-            scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer if not isinstance(optimizer, list) else optimizer[0]) # Unscale main optimizer
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
         # Optimizer step
-        scaler.step(optimizer)
+        if isinstance(optimizer, list):
+            for opt in optimizer:
+                scaler.step(opt)
+        else:
+            scaler.step(optimizer)
         scaler.update()
 
         running_loss += accum_loss
@@ -756,6 +821,13 @@ def train(args):
                     'step': step
                 })
 
+            if tb_writer is not None:
+                tb_writer.add_scalar('train/loss', lossf, step)
+                tb_writer.add_scalar('train/learning_rate', lr, step)
+                tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
+                tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
+                tb_writer.add_scalar('train/perplexity', math.exp(lossf) if lossf < 10 else float('inf'), step)
+
         # Validation (using next batches from same data loader)
         # Skip validation at the exact resume step to avoid immediate validation after loading
         if step % args.eval_interval == 0 and step > start_step and master_process:
@@ -790,6 +862,10 @@ def train(args):
                     'val/perplexity': perplexity,
                     'step': step
                 })
+
+            if tb_writer is not None:
+                tb_writer.add_scalar('val/loss', val_loss, step)
+                tb_writer.add_scalar('val/perplexity', perplexity, step)
 
             # Track best validation loss
             if val_loss < best_val_loss:
@@ -833,6 +909,9 @@ def train(args):
             print(f"Saved checkpoint to {checkpoint_path}")
 
     # Cleanup
+    if tb_writer is not None:
+        tb_writer.close()
+
     if is_ddp:
         dist.destroy_process_group()
 
@@ -900,6 +979,10 @@ def main():
 
     # Performance
     parser.add_argument('--compile', action='store_true')
+
+    # TensorBoard
+    parser.add_argument('--use_tensorboard', action='store_true', default=True,
+                        help='Enable TensorBoard logging (default: True)')
 
     args = parser.parse_args()
 

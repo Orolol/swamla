@@ -11,6 +11,8 @@ OUTPUT_DIR=${4:-outputs/swa_mla}
 RESUME_FROM_HF=${5:-false}  # Set to 'true' to resume from HuggingFace
 OPTIMIZER=${6:-adamw}  # adamw or lion
 HF_REPO_ID=${7:-}  # e.g., "Orosius/swamla"
+USE_TENSORBOARD=${8:-true}  # Enable TensorBoard by default
+TENSORBOARD_PORT=${9:-6006}  # Default TensorBoard port
 
 # Auto-detect number of GPUs
 if command -v nvidia-smi &> /dev/null; then
@@ -32,6 +34,36 @@ if [ -n "$HF_REPO_ID" ]; then
         echo "Resume: true (will load latest checkpoint from HF)"
     fi
 fi
+
+# Kill any existing TensorBoard processes on the same port
+if [ "$USE_TENSORBOARD" = "true" ]; then
+    echo ""
+    echo "Stopping any existing TensorBoard on port $TENSORBOARD_PORT..."
+    lsof -ti:$TENSORBOARD_PORT | xargs -r kill 2>/dev/null || true
+
+    # Start TensorBoard in the background
+    echo "Starting TensorBoard on port $TENSORBOARD_PORT..."
+    tensorboard --logdir=$OUTPUT_DIR/tensorboard --port=$TENSORBOARD_PORT --bind_all > /dev/null 2>&1 &
+    TB_PID=$!
+
+    # Check if TensorBoard started successfully
+    sleep 2
+    if ps -p $TB_PID > /dev/null 2>&1; then
+        echo "TensorBoard running at: http://localhost:$TENSORBOARD_PORT"
+        echo "TensorBoard PID: $TB_PID"
+
+        # Create a function to kill TensorBoard on exit
+        cleanup() {
+            echo ""
+            echo "Stopping TensorBoard (PID: $TB_PID)..."
+            kill $TB_PID 2>/dev/null || true
+        }
+        trap cleanup EXIT INT TERM
+    else
+        echo "Warning: Failed to start TensorBoard"
+        USE_TENSORBOARD="false"
+    fi
+fi
 echo ""
 
 # Build HF repo argument if provided
@@ -41,6 +73,12 @@ if [ -n "$HF_REPO_ID" ]; then
     if [ "$RESUME_FROM_HF" = "true" ]; then
         HF_REPO_ARG="$HF_REPO_ARG --resume_from_hf"
     fi
+fi
+
+# Build TensorBoard argument if enabled
+TB_ARG=""
+if [ "$USE_TENSORBOARD" = "true" ]; then
+    TB_ARG="--use_tensorboard"
 fi
 
 # Launch training with DDP if multiple GPUs detected
@@ -75,7 +113,8 @@ if [ $NUM_GPUS -gt 1 ]; then
     --save_interval 50000 \
     --use_fp8 \
     --gradient_checkpointing \
-    $HF_REPO_ARG
+    $HF_REPO_ARG \
+    $TB_ARG
 else
     echo "Launching single GPU training..."
     echo ""
@@ -107,7 +146,8 @@ else
     --save_interval 20000 \
     --use_fp8 \
     --gradient_checkpointing \
-    $HF_REPO_ARG
+    $HF_REPO_ARG \
+    $TB_ARG
 fi
 
 # Usage examples:
@@ -125,6 +165,8 @@ fi
 #   $5: Resume from HuggingFace (true/false) [default: false]
 #   $6: Optimizer (adamw/lion) [default: adamw]
 #   $7: HuggingFace repo ID (e.g., "username/repo") [default: none]
+#   $8: Use TensorBoard (true/false) [default: true]
+#   $9: TensorBoard port [default: 6006]
 #
 # Note: The script automatically detects available GPUs and launches:
 #   - DDP training with torchrun if multiple GPUs are detected

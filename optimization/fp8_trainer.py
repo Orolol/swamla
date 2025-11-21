@@ -246,103 +246,33 @@ class FP8Lion(Optimizer):
 
 class FP8MixedPrecisionTrainer:
     """
-    Training utilities for FP8 mixed precision following DeepSeek's approach.
+    Training utilities for FP8 mixed precision.
     """
     
     def __init__(self, model: nn.Module, config: Dict[str, Any]):
         self.model = model
         self.config = config
         self.use_fp8 = config.get('use_fp8', False)
-        self.fp8_tile_size = config.get('fp8_tile_size', 128)
         
-        # Track which modules should stay in high precision
-        self.high_precision_modules = self._identify_high_precision_modules()
-        
-        # Configure FP8 settings
-        if self.use_fp8:
-            self._configure_fp8_environment()
-    
-    def _identify_high_precision_modules(self) -> List[str]:
-        """
-        Identify modules that should stay in high precision.
-        
-        Following DeepSeek:
-        - Embeddings
-        - Normalization layers
-        - Output heads
-        - Attention operators
-        - MoE gating modules
-        """
-        high_precision_names = []
-        
-        for name, module in self.model.named_modules():
-            if any(pattern in name.lower() for pattern in 
-                   ['embed', 'norm', 'head', 'gate', 'router']):
-                high_precision_names.append(name)
-            elif isinstance(module, (nn.LayerNorm, nn.RMSNorm, nn.Embedding)):
-                high_precision_names.append(name)
-        
-        return high_precision_names
-    
-    def _configure_fp8_environment(self):
-        """Configure environment for FP8 training."""
-        import os
-        
-        # Use E4M3 format for better precision (mantissa over exponents)
-        os.environ["NVTE_FP8_FORMAT"] = "E4M3"
-        
-        # Enable FP8 for feed-forward networks
-        os.environ["NVTE_FP8_FFN"] = "1"
-        
-        # Disable FP8 for attention (keep in higher precision)
-        os.environ["NVTE_FP8_MHA"] = "0"
-        
-        # Enable online quantization
-        os.environ["NVTE_FP8_CALIBRATION"] = "0"
-    
     def create_optimizer(self, lr: float = 1e-4) -> Optimizer:
         """
-        Create optimizer with FP8-aware configuration.
-        
-        Returns:
-            FP8AdamW optimizer with appropriate parameter groups
+        Create optimizer.
         """
-        # Separate parameters by precision requirements
-        high_precision_params = []
-        standard_params = []
+        # Standard AdamW or Lion, no special FP8 optimizer needed for now 
+        # (unless we implement 8-bit optimizers, but standard BF16 AdamW is fine for H100)
         
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                if any(hp_name in name for hp_name in self.high_precision_modules):
-                    high_precision_params.append(param)
-                else:
-                    standard_params.append(param)
+        param_groups = [
+            {'params': [p for n, p in self.model.named_parameters() if p.requires_grad], 'lr': lr}
+        ]
         
-        # Create parameter groups
-        param_groups = []
-        
-        if high_precision_params:
-            param_groups.append({
-                'params': high_precision_params,
-                'lr': lr,
-                'name': 'high_precision'
-            })
-        
-        if standard_params:
-            param_groups.append({
-                'params': standard_params,
-                'lr': lr,
-                'name': 'standard'
-            })
-        
-        # Create optimizer with low-precision moments
-        optimizer = FP8AdamW(
+        # Use standard AdamW
+        optimizer = torch.optim.AdamW(
             param_groups,
             lr=lr,
-            betas=(0.9, 0.95),  # Typical for LLMs
+            betas=(0.9, 0.95),
             eps=1e-8,
             weight_decay=0.1,
-            use_low_precision_moments=True
+            fused=torch.cuda.is_available()
         )
         
         return optimizer
@@ -350,73 +280,24 @@ class FP8MixedPrecisionTrainer:
     @contextmanager
     def fp8_training_context(self):
         """
-        Context manager for FP8 training with mixed precision.
-        
-        Handles:
-        - FP8 autocast for supported operations
-        - Gradient scaling for stability
-        - Automatic fallback to BF16 when needed
+        Context manager for training.
+        With native FP8Linear layers, we just need standard BF16 autocast for the rest.
         """
-        if not self.use_fp8:
-            # Standard BF16 training
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                yield
-            return
-        
-        try:
-            # Try to use transformer_engine FP8 autocast
-            import transformer_engine.pytorch as te
-            
-            if hasattr(te, 'fp8_autocast'):
-                # Configure FP8 recipe following DeepSeek
-                from transformer_engine.common import recipe
-                
-                fp8_recipe = recipe.DelayedScaling(
-                    margin=0,
-                    interval=1,
-                    fp8_format=recipe.Format.E4M3,  # Mantissa over exponents
-                    amax_history_len=1,  # Online quantization
-                    amax_compute_algo='most_recent'  # No delayed scaling
-                )
-                
-                with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                    yield
-            else:
-                # Fallback to BF16
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    yield
-                    
-        except ImportError:
-            # Transformer engine not available, use BF16
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                yield
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            yield
     
     def prepare_batch_fp8(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Prepare batch for FP8 training.
-        
-        For activations that will be cached (like in MoE):
-        - Pre-quantize to FP8 for dispatch
-        - Use integral power-of-2 scales for conversions
+        Prepare batch.
         """
-        if not self.use_fp8:
-            return batch
-        
-        # Move to appropriate device and dtype
         device = next(self.model.parameters()).device
         
         prepared_batch = {}
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
-                # Move to device
                 value = value.to(device)
-                
-                # For input tokens, keep in high precision
-                if key in ['input_ids', 'labels', 'attention_mask']:
-                    prepared_batch[key] = value
-                else:
-                    # Other tensors can start in BF16
-                    prepared_batch[key] = value.to(torch.bfloat16)
+                # Keep inputs in high precision (BF16/Long), FP8 casting happens inside layers
+                prepared_batch[key] = value
             else:
                 prepared_batch[key] = value
         
@@ -424,72 +305,36 @@ class FP8MixedPrecisionTrainer:
     
     def backward_with_fp8(self, loss: torch.Tensor, retain_graph: bool = False):
         """
-        Backward pass with FP8 considerations.
-        
-        Handles:
-        - Mixed precision gradients
-        - Gradient accumulation in FP32
-        - Potential gradient scaling
+        Backward pass.
         """
-        # For FP8 training, gradients are accumulated in FP32
-        # even if computations use FP8
         loss.backward(retain_graph=retain_graph)
     
     def get_memory_stats(self) -> Dict[str, float]:
-        """Get memory statistics for FP8 training."""
+        """Get memory statistics."""
         if not torch.cuda.is_available():
             return {}
         
-        stats = {
+        return {
             'allocated_gb': torch.cuda.memory_allocated() / 1e9,
             'reserved_gb': torch.cuda.memory_reserved() / 1e9,
             'max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9,
         }
-        
-        # Estimate FP8 savings
-        if self.use_fp8:
-            # Rough estimate: FP8 uses ~50% memory for activations
-            # compared to FP16/BF16
-            estimated_bf16_memory = stats['allocated_gb'] * 1.5
-            stats['estimated_savings_gb'] = estimated_bf16_memory - stats['allocated_gb']
-            stats['savings_percent'] = (stats['estimated_savings_gb'] / estimated_bf16_memory) * 100
-        
-        return stats
 
 
 def create_fp8_training_config(base_config: Dict[str, Any], 
                               gpu_arch: str = 'hopper') -> Dict[str, Any]:
     """
-    Create FP8 training configuration based on GPU architecture.
-    
-    Args:
-        base_config: Base training configuration
-        gpu_arch: GPU architecture ('hopper', 'ada', 'ampere')
-        
-    Returns:
-        Updated configuration with FP8 settings
+    Create FP8 training configuration.
     """
     config = base_config.copy()
     
     if gpu_arch == 'hopper':  # H100, H200
         config.update({
             'use_fp8': True,
-            'fp8_tile_size': 128,
-            'fp8_mla_params': True,  # Can use FP8 for MLA params
-            'fp8_cache': True,  # Low-precision caching
-            'fp8_format': 'E4M3',  # Better precision
         })
-    elif gpu_arch == 'ada':  # RTX 4090, 6000 Ada
+    else:
         config.update({
-            'use_fp8': True,
-            'fp8_tile_size': 128,
-            'fp8_mla_params': False,  # Keep MLA params in FP16
-            'fp8_cache': True,
-            'fp8_format': 'E4M3',
-        })
-    else:  # Older architectures
-        config.update({
-            'use_fp8': False,  # Fallback to BF16/FP16
+            'use_fp8': False,
         })
     
     return config

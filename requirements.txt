@@ -2,10 +2,9 @@ torch>=2.0.0
 transformers>=4.30.0
 datasets>=2.14.0
 wandb>=0.15.0
+tensorboard>=2.13.0
 lion-pytorch>=0.1.2
 bitsandbytes>=0.41.0
 huggingface_hub>=0.16.0
 
 
-# For FP8 training with TorchAO
-torchao>=0.1.0
