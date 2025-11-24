@@ -510,7 +510,6 @@ def train(args):
 
     # Setup TensorBoard
     tb_writer = None
-<<<<<<< Updated upstream
     if master_process and TENSORBOARD_AVAILABLE and args.use_tensorboard:
         tb_dir = os.path.join(args.output_dir, 'tensorboard', args.wandb_run_name or f"swa_mla_{args.size}_{time.strftime('%Y%m%d_%H%M%S')}")
         tb_writer = SummaryWriter(tb_dir)
@@ -518,17 +517,6 @@ def train(args):
 
         # Log hyperparameters
         tb_writer.add_text('config', str(vars(args)), 0)
-=======
-    if master_process:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            # Use a descriptive run name for TensorBoard
-            run_name = args.wandb_run_name or f"swa_mla_{args.size}_{int(time.time())}"
-            tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
-            print(f"TensorBoard logging enabled in runs/{run_name}")
-        except ImportError:
-            print("TensorBoard not available - logging to console only")
->>>>>>> Stashed changes
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)

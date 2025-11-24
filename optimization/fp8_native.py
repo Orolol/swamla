@@ -43,9 +43,11 @@ class FP8LinearFunction(torch.autograd.Function):
         weight_fp8 = (weight * weight_scale).to(torch.float8_e4m3fn)
         
         # 3. Forward MM: Input @ Weight.T
-        # _scaled_mm(A, B) computes A @ B.T
-        # We pass input_fp8 (M, K) and weight_fp8 (N, K)
-        # Result is (M, N)
+        # _scaled_mm(A, B) computes A @ B
+        # We pass input_fp8 (M, K) and weight_fp8.t() (K, N)
+        # weight_fp8 is (N, K) Row-Major.
+        # weight_fp8.t() is (K, N) Column-Major.
+        # So we have Row-Major @ Column-Major. This is supported by cuBLASLt.
         
         # Scales for dequantization (inverse of quantization scales)
         scale_a_inv = 1.0 / input_scale
@@ -53,7 +55,7 @@ class FP8LinearFunction(torch.autograd.Function):
         
         output = torch._scaled_mm(
             input_fp8,
-            weight_fp8, 
+            weight_fp8.t(), 
             scale_a=scale_a_inv,
             scale_b=scale_b_inv,
             out_dtype=input.dtype,
@@ -97,9 +99,20 @@ class FP8LinearFunction(torch.autograd.Function):
         # _scaled_mm(grad_fp8, W_fp8.T) -> grad_fp8 @ (W_fp8.T).T = grad_fp8 @ W_fp8.
         # Correct.
         
+        # 2. Compute Grad Input: dY @ W
+        # dY: (M, N), W: (N, K) -> (M, K)
+        # _scaled_mm(A, B) -> A @ B
+        # We want dY @ W.
+        # dY is (M, N) Row-Major.
+        # W is (N, K) Row-Major.
+        # We need B to be Column-Major.
+        # W_col = W.t().contiguous().t() -> (N, K) Column-Major.
+        
+        weight_col = weight_fp8.t().contiguous().t()
+        
         grad_input = torch._scaled_mm(
             grad_fp8,
-            weight_fp8.t(),
+            weight_col,
             scale_a=scale_grad_inv,
             scale_b=scale_weight_inv,
             out_dtype=ctx.input_dtype
@@ -128,9 +141,23 @@ class FP8LinearFunction(torch.autograd.Function):
         # = grad_fp8.t() @ input_fp8.
         # Correct.
         
+        # 3. Compute Grad Weight: dY.T @ X
+        # dY: (M, N), X: (M, K) -> (N, K)
+        # dW = dY.T @ X
+        # _scaled_mm(A, B) -> A @ B
+        # We want dY.T @ X.
+        
+        # dY.T is (N, M) Column-Major.
+        # We need A to be Row-Major.
+        grad_fp8_t_row = grad_fp8.t().contiguous()
+        
+        # X is (M, K) Row-Major.
+        # We need B to be Column-Major.
+        input_fp8_col = input_fp8.t().contiguous().t()
+        
         grad_weight = torch._scaled_mm(
-            grad_fp8.t(),
-            input_fp8.t(),
+            grad_fp8_t_row,
+            input_fp8_col,
             scale_a=scale_grad_inv,
             scale_b=scale_input_inv,
             out_dtype=ctx.weight_dtype
