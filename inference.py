@@ -155,15 +155,17 @@ class InferenceEngine:
 
 
 def _setup_torchao_mock():
-    """Setup mock TorchAO modules for loading checkpoints without TorchAO installed.
+    """Setup mock TorchAO modules for loading old checkpoints.
 
-    This allows inference without TorchAO even if the checkpoint was trained with FP8.
+    Legacy function for backward compatibility with checkpoints that may have been
+    trained with TorchAO optimizers. Now that we use native FP8, this is mainly
+    for loading historical checkpoints.
     """
     try:
         from torchao.optim.subclass_fp8 import OptimStateFp8
         print("TorchAO detected - using native OptimStateFp8")
     except ImportError:
-        print("TorchAO not installed - creating mock OptimStateFp8 for checkpoint loading")
+        print("Creating mock OptimStateFp8 for legacy checkpoint loading")
         # Create a dummy class to allow unpickling without TorchAO
         import sys
         from types import ModuleType
@@ -181,7 +183,7 @@ def _setup_torchao_mock():
 
             # Create dummy OptimStateFp8 class that mimics torch.Tensor subclass
             class OptimStateFp8(torch.Tensor):
-                """Mock OptimStateFp8 for loading checkpoints without TorchAO."""
+                """Mock OptimStateFp8 for loading legacy checkpoints."""
 
                 @staticmethod
                 def __new__(cls, data, *args, **kwargs):
@@ -240,7 +242,7 @@ def load_model_from_hf(
     import json
     import re
 
-    # Setup TorchAO mock if needed (for loading checkpoints with FP8 optimizer states)
+    # Setup mock for legacy checkpoint compatibility (old FP8 optimizer states)
     _setup_torchao_mock()
 
     # If no checkpoint specified, find the latest one
@@ -436,7 +438,7 @@ def load_model_from_checkpoint(
     """
     print(f"Loading checkpoint from {checkpoint_path}...")
 
-    # Setup TorchAO mock if needed (for loading checkpoints with FP8 optimizer states)
+    # Setup mock for legacy checkpoint compatibility (old FP8 optimizer states)
     _setup_torchao_mock()
 
     # Load checkpoint with weights_only=False to allow optimizer states

@@ -237,10 +237,10 @@ class SWAMLAModel(nn.Module):
 
         for layer_idx in range(config.n_layer):
             # Calculate scaling factor for this layer: 0.5x at first layer to 2.0x at last layer
-            # if config.n_layer > 1:
-            #     scale_factor = 0.5 + 1.5 * (layer_idx / (config.n_layer - 1))
-            # else:
-            scale_factor = 1.0
+            if config.n_layer > 1:
+                scale_factor = 0.5 + 1.5 * (layer_idx / (config.n_layer - 1))
+            else:
+                scale_factor = 1.0
             
             position_in_cycle = layer_idx % cycle_len
             if position_in_cycle < swa_per_cycle:

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
 from data_loader_instruct import PackedInstructDataset  # Changed from data_loader_packed
-from fp8_torchao import configure_fp8_training
+from fp8_native import convert_to_native_fp8
 
 # Try to import wandb
 try:
@@ -161,8 +161,7 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
 def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', use_fp8=False):
     """Configure optimizer with proper parameter grouping.
 
-    Note: When use_fp8=True on H100/H200, this will automatically use TorchAO's
-    AdamWFp8 optimizer for optimal FP8 training performance.
+    Note: FP8 training uses standard optimizers with GradScaler for gradient scaling.
     """
     # Separate parameters into decay and no_decay groups
     decay_params = []
@@ -183,28 +182,8 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
 
-    # Choose optimizer based on type and FP8 availability
-    if use_fp8:
-        # Use TorchAO FP8 optimizer
-        try:
-            from torchao.optim import AdamWFp8
-
-            optimizer = AdamWFp8(
-                param_groups,
-                lr=learning_rate,
-                betas=betas,
-                eps=1e-8,
-            )
-            print("Using TorchAO AdamWFp8 optimizer (FP8 training)")
-
-        except ImportError:
-            print("Warning: TorchAO AdamWFp8 not available, falling back to standard AdamW")
-            if device_type == 'cuda':
-                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
-            else:
-                optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas)
-
-    elif optimizer_type == 'lion' and LION_AVAILABLE:
+    # Choose optimizer based on type
+    if optimizer_type == 'lion' and LION_AVAILABLE:
         print("Using Lion optimizer")
         optimizer = Lion(param_groups, lr=learning_rate, betas=betas)
     else:
@@ -283,7 +262,7 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
 
         # Load checkpoint
         # Note: Using weights_only=False because we trust our own checkpoints
-        # and they may contain optimizer states from TorchAO
+        # and they may contain custom optimizer states
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except TypeError:
@@ -567,7 +546,7 @@ def train(args):
         qk_nope_head_dim=args.mla_qk_nope_head_dim,
         qk_rope_head_dim=args.mla_qk_rope_head_dim,
         v_head_dim=args.mla_v_head_dim,
-        use_fp8=False,  # FP8 conversion now handled by TorchAO
+        use_fp8=False,  # FP8 conversion handled separately via fp8_native
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
@@ -620,26 +599,23 @@ def train(args):
             print(f"✓ Model embeddings resized to {vocab_size}")
             print(f"  - Added {num_added} new token embeddings with random initialization")
 
-    # Convert model to FP8 using TorchAO if requested
+    # Convert model to FP8 using native implementation if requested
     if args.use_fp8:
         if master_process:
-            print("\nConverting model to FP8 with TorchAO...")
+            print("\nConverting model to FP8 with Native PyTorch...")
         try:
-            from fp8_torchao import convert_model_to_fp8
-
             # Convert model, excluding lm_head to avoid dimension alignment issues
-            model = convert_model_to_fp8(model, use_compile=True)  # Compile later if requested
+            model = convert_to_native_fp8(model)
 
             if master_process:
                 print("✓ Model converted to FP8 for training")
-                print("  - Attention and MLP layers converted to FP8")
-                print("  - lm_head kept in BF16 (vocab_size alignment)")
-                print("  - Automatic scaling factor management")
-                print("  - Expected speedup: ~1.45x on H100/H200")
+                print("  - Linear layers converted to FP8Linear")
+                print("  - Using torch._scaled_mm for acceleration")
+                print("  - Dynamic scaling enabled")
 
         except ImportError:
             if master_process:
-                print("Warning: TorchAO not available for FP8 conversion")
+                print("Warning: fp8_native module not found")
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
@@ -755,8 +731,9 @@ def train(args):
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
 
     data_iter = iter(data_loader)
-    # Note: TorchAO FP8 doesn't need GradScaler, it handles scaling internally
-    scaler = torch.amp.GradScaler('cuda', enabled=False)
+    # Native FP8 implementation needs GradScaler for proper gradient scaling
+    # BF16 training doesn't need it (enabled=False)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
 
     running_loss = 0.0
     t0 = time.time()
@@ -771,10 +748,10 @@ def train(args):
         # Update learning rate
         lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
 
-        # TorchAO optimizers require .fill_() for lr updates
+        # Update learning rate (handle both tensor and float lr)
         for param_group in optimizer.param_groups:
             if isinstance(param_group['lr'], torch.Tensor):
-                # TorchAO optimizer: use .fill_()
+                # Tensor lr (some optimizers): use .fill_()
                 param_group['lr'].fill_(lr)
             else:
                 # Standard optimizer: direct assignment

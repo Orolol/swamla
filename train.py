@@ -323,7 +323,7 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
 
         # Load checkpoint
         # Note: Using weights_only=False because we trust our own checkpoints
-        # and they may contain optimizer states from TorchAO
+        # and they may contain custom optimizer states
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except TypeError:
@@ -568,7 +568,7 @@ def train(args):
         qk_nope_head_dim=args.mla_qk_nope_head_dim,
         qk_rope_head_dim=args.mla_qk_rope_head_dim,
         v_head_dim=args.mla_v_head_dim,
-        use_fp8=False,  # FP8 conversion now handled by TorchAO
+        use_fp8=False,  # FP8 conversion handled separately via fp8_native
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
@@ -590,25 +590,43 @@ def train(args):
         if master_process:
             print("✓ Model weights loaded")
 
-    # Convert model to FP8 using Native PyTorch if requested
+    # Convert model to FP8 using Transformer Engine if requested
+    fp8_recipe = None
     if args.use_fp8:
-        if master_process:
-            print("\nConverting model to FP8 with Native PyTorch...")
         try:
-            from fp8_native import convert_to_native_fp8
+            from fp8_te import convert_to_te_fp8, create_fp8_recipe, HAS_TE
 
-            # Convert model, excluding lm_head to avoid dimension alignment issues
-            model = convert_to_native_fp8(model)
+            if HAS_TE:
+                if master_process:
+                    print("\nConverting model to FP8 with Transformer Engine...")
 
+                # Create FP8 recipe with delayed scaling
+                fp8_recipe = create_fp8_recipe(
+                    fp8_format="HYBRID",  # E4M3 forward, E5M2 backward
+                    margin=0,
+                    interval=1,
+                    amax_history_len=1024,
+                    amax_compute_algo="max"
+                )
+
+                # Convert model to TE FP8
+                model = convert_to_te_fp8(model)
+
+                if master_process:
+                    print("✓ Model converted to Transformer Engine FP8")
+                    print("  - Using HYBRID format (E4M3 fwd, E5M2 bwd)")
+                    print("  - Automatic scaling with delayed scaling")
+                    print("  - torch.compile compatible")
+            else:
+                if master_process:
+                    print("Warning: Transformer Engine not installed")
+                    print("Install with: pip install transformer-engine[pytorch]")
+                    print("Falling back to BF16 training")
+                args.use_fp8 = False
+
+        except ImportError as e:
             if master_process:
-                print("✓ Model converted to FP8 for training")
-                print("  - Linear layers converted to FP8Linear")
-                print("  - Using torch._scaled_mm for acceleration")
-                print("  - Dynamic scaling enabled")
-
-        except ImportError:
-            if master_process:
-                print("Warning: fp8_native module not found")
+                print(f"Warning: Failed to import Transformer Engine: {e}")
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
@@ -651,10 +669,14 @@ def train(args):
 
         # Use different compilation mode for FP8 to avoid FlexibleLayout issues
         if args.use_fp8:
-            # 'reduce-overhead' mode works better with FP8 dynamic scaling
-            model = torch.compile(model, mode='reduce-overhead')
+            # Enable scalar capture for FP8 dynamic scaling
+            torch._dynamo.config.capture_scalar_outputs = True
+            # Compilation seems to be unstable on RTX 5090 with FP8 (sm_120 issue)
+            # Disabling compilation for FP8 to ensure stability and lower VRAM usage
+            # model = torch.compile(model) 
             if master_process:
-                print("  Using 'reduce-overhead' mode (optimized for FP8)")
+                print("  Skipping compilation for FP8 (disabled for stability on RTX 5090)")
+                print("  Enabled scalar output capture for FP8 dynamic scaling")
         else:
             # 'max-autotune' for non-FP8 training
             model = torch.compile(model, mode='max-autotune')
@@ -716,7 +738,8 @@ def train(args):
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
 
     data_iter = iter(data_loader)
-    # Note: TorchAO FP8 doesn't need GradScaler, it handles scaling internally
+    # Transformer Engine FP8 handles scaling internally, no GradScaler needed
+    # Only enable GradScaler for non-FP8 training if needed
     scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     running_loss = 0.0
@@ -737,7 +760,7 @@ def train(args):
         for opt in optimizers_list:
             for param_group in opt.param_groups:
                 if isinstance(param_group['lr'], torch.Tensor):
-                    # TorchAO optimizer: use .fill_()
+                    # Tensor lr (some optimizers): use .fill_()
                     param_group['lr'].fill_(lr)
                 else:
                     # Standard optimizer: direct assignment
@@ -766,9 +789,17 @@ def train(args):
             labels = batch['labels'].to(device)
 
             # Forward pass with mixed precision
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):    
-                logits, loss = model(input_ids, targets=labels)
-                loss = loss / args.gradient_accumulation_steps
+            # For Transformer Engine FP8, we need to wrap with fp8_autocast
+            if args.use_fp8 and fp8_recipe is not None:
+                import transformer_engine.pytorch as te
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                        logits, loss = model(input_ids, targets=labels)
+                        loss = loss / args.gradient_accumulation_steps
+            else:
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                    logits, loss = model(input_ids, targets=labels)
+                    loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(loss).backward()
@@ -777,7 +808,11 @@ def train(args):
         # Gradient clipping
         if args.grad_clip > 0:
             scaler.unscale_(optimizer if not isinstance(optimizer, list) else optimizer[0]) # Unscale main optimizer
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            # Log gradient norms for debugging (only on master process and occasionally)
+            if master_process and step % 100 == 0 and args.use_fp8:
+                print(f"  [FP8 Debug] Grad norm: {grad_norm:.4f}")
 
         # Optimizer step
         if isinstance(optimizer, list):

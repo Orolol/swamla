@@ -91,21 +91,15 @@ Example: With defaults (2 SWA + 1 MLA), a 12-layer model has the pattern:
 - DDP-compatible with automatic sharding
 
 ### Optimization
-**FP8 Training with TorchAO** ([optimization/fp8_torchao.py](optimization/fp8_torchao.py)):
-- **Native PyTorch FP8 training** using TorchAO library
-- Automatic FP8 conversion with `convert_to_float8_training()` on H100/H200
-- **1.5x speedup** on up to 512 GPUs (tested on Llama-3 scale models)
-- Compatible with `torch.compile` and FSDP2
-- Automatic scaling factor management (no manual tuning required)
-
-**TorchAO AdamWFp8 Optimizer**:
-- Native FP8 optimizer from PyTorch AO library
-- BF16 optimizer moments, FP32 master weights
-- Automatically selected with `--use_fp8` flag on H100/H200
-- Seamless integration with distributed training (DDP, FSDP2)
+**FP8 Training with Native PyTorch** ([optimization/fp8_native.py](optimization/fp8_native.py)):
+- **Custom FP8 implementation** using PyTorch's `float8_e4m3fn` and `_scaled_mm`
+- Dynamic per-tensor scaling with clamping for numerical stability
+- Compatible with `torch.compile` and DDP
+- Requires `GradScaler` for proper gradient scaling
+- Targets H100/H200 GPUs with CUDA >= 12.6
 
 **Supported Optimizers**:
-- `adamw`: Standard AdamW (fused on CUDA) - automatically upgrades to AdamWFp8 with `--use_fp8`
+- `adamw`: Standard AdamW (fused on CUDA)
 - `lion`: Lion optimizer (50% less memory than AdamW)
 - Alternative quantized optimizers: `AdamW8bit` (2x memory reduction), `AdamW4bit` (4x memory reduction)
 
@@ -126,7 +120,7 @@ swamla/
 ├── data/
 │   └── data_loader_packed.py          # Packed sequence data loader
 ├── optimization/
-│   ├── fp8_torchao.py                 # TorchAO FP8 integration
+│   ├── fp8_native.py                  # Native PyTorch FP8 implementation
 │   └── fp8_trainer.py                 # Legacy FP8 optimizers (deprecated)
 └── scripts/
     └── train_swa_mla.sh               # Training launch script
@@ -426,33 +420,33 @@ Applied at block level with `use_reentrant=False`:
 - Separate checkpointing for attention and MLP sub-blocks
 - Controlled by `use_gradient_checkpointing` config flag
 
-### FP8 Integration with TorchAO
-Native PyTorch FP8 training via TorchAO library:
+### FP8 Integration with Native PyTorch
+Custom FP8 implementation using PyTorch's native FP8 support:
 - **Automatic GPU detection**: Checks for H100/H200 via compute capability
-- **Model conversion**: Uses `convert_to_float8_training()` to convert linear layers to FP8
-- **Optimizer**: Automatically uses `AdamWFp8` from TorchAO when `--use_fp8` is enabled
-- **Scaling**: TorchAO handles all scaling factors automatically (E4M3/E5M2 formats)
-- **Compatibility**: Works seamlessly with `torch.compile` and DDP
+- **Model conversion**: Uses `convert_to_native_fp8()` to replace Linear layers with FP8Linear
+- **Dynamic scaling**: Per-tensor scaling with clamping for numerical stability
+- **GradScaler required**: Must enable GradScaler for proper gradient scaling
+- **Compatibility**: Works with `torch.compile` and DDP
 
 Key implementation details:
 - FP8 conversion happens after model creation but before DDP wrapping
-- No need for `GradScaler` - TorchAO handles scaling internally
-- Linear layers in attention and MLP are converted to FP8
+- **Requires GradScaler** - Custom autograd needs external gradient scaling
+- Linear layers in attention and MLP are converted to FP8Linear
 - Normalization layers and embeddings remain in higher precision
+- Scale factors clamped to [1.0, 1e4] to prevent overflow/underflow
 - Expected memory reduction: ~25-30% compared to BF16
-- Expected speedup: ~1.5x on H100/H200 (tested up to 512 GPUs)
 
-## TorchAO FP8 Training Guide
+## Native FP8 Training Guide
 
 ### Overview
-The SWA-MLA model now uses **TorchAO** (PyTorch Architecture Optimization) for native FP8 training. This provides better performance, easier maintenance, and proven scalability compared to custom FP8 implementations.
+The SWA-MLA model uses a **custom native FP8 implementation** built on PyTorch's `float8_e4m3fn` type and `_scaled_mm` function. This provides fine-grained control over FP8 quantization while maintaining compatibility with standard PyTorch training workflows.
 
-### Key Benefits
-- **1.5x faster training** on H100/H200 GPUs (proven at 512 GPU scale)
-- **25-30% VRAM reduction** compared to BF16
-- **Native PyTorch integration** - maintained by PyTorch team
-- **Works with torch.compile** for additional 10-20% speedup
-- **FSDP2 compatible** for large-scale distributed training
+### Key Features
+- **Custom autograd**: FP8LinearFunction with manual forward/backward passes
+- **Dynamic per-tensor scaling**: Computed on-the-fly for inputs, weights, and gradients
+- **Numerical stability**: Scale factor clamping to prevent overflow/underflow
+- **GradScaler integration**: Required for proper gradient scaling across iterations
+- **Standard optimizers**: Works with AdamW, Lion, and quantized variants
 
 ### Usage
 
@@ -464,108 +458,111 @@ python train.py --size small --batch_size 8 --block_size 2048 --use_fp8
 # Multi-GPU with DDP
 torchrun --nproc_per_node=4 train.py --size medium --batch_size 4 --use_fp8
 
-# With torch.compile for maximum speed
+# With torch.compile for additional speedup
 python train.py --size small --use_fp8 --compile
 ```
 
 #### How It Works
-1. **GPU Detection**: Automatically detects H100/H200 GPUs via compute capability check
-2. **Model Conversion**: Calls `convert_to_float8_training(model)` to convert linear layers
-3. **Optimizer Selection**: Uses `AdamWFp8` from TorchAO instead of standard AdamW
-4. **Automatic Scaling**: TorchAO manages all FP8 scaling factors internally
+1. **GPU Detection**: Checks for native FP8 support (H100/H200, CUDA >= 12.6)
+2. **Model Conversion**: Replaces `nn.Linear` layers with `FP8Linear` via `convert_to_native_fp8()`
+3. **GradScaler Enabled**: `GradScaler('cuda', enabled=True)` for FP8 gradient scaling
+4. **Training Loop**: Standard PyTorch training with autocast and GradScaler
 
 #### Code Flow
 ```python
 # In train.py
-model = create_swa_mla_model(...)  # Create model normally
+model = create_swa_mla_model(..., use_fp8=False)  # Create in BF16
 model = model.to(device)
 
-if args.use_fp8 and is_fp8_supported():
-    from torchao.float8 import convert_to_float8_training
-    model = convert_to_float8_training(model)  # Convert to FP8
+if args.use_fp8:
+    from fp8_native import convert_to_native_fp8
+    model = convert_to_native_fp8(model)  # Replace Linear with FP8Linear
 
-# Optimizer automatically uses AdamWFp8 when use_fp8=True
-optimizer = configure_optimizer(model, ..., use_fp8=args.use_fp8)
+# GradScaler MUST be enabled for FP8
+scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
+
+# Training loop with scaling
+with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+    loss = model(...)
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)  # Critical for correct grad magnitudes
+torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+scaler.step(optimizer)
+scaler.update()
 ```
 
 #### What Gets Converted to FP8
 - ✅ Linear layers in SWA attention (Q, K, V, output projections)
-- ✅ Linear layers in MLA attention (Q, K, V projections with LoRA)
-- ✅ MLP feed-forward layers (up and down projections)
-- ❌ **lm_head** (output projection) - **kept in BF16 due to vocab_size alignment**
-- ❌ Embeddings (wte, wpe) - remain in BF16
-- ❌ Normalization layers (RMSNorm, LayerNorm) - remain in BF16
+- ✅ Linear layers in MLA attention (Q, K, V, LoRA projections)
+- ✅ MLP feed-forward layers (gate_up_proj, down_proj)
+- ❌ **lm_head** - Excluded (vocab_size not divisible by 16)
+- ❌ **Embeddings** (wte, wpe) - Excluded
+- ❌ **Normalization layers** - Excluded
 
-**Important Note:** The `lm_head` is excluded from FP8 conversion because the vocabulary size
-(50257 for GPT-2) is not divisible by 16, which is required by TorchAO's `_scaled_mm` kernel.
-This has minimal performance impact (<5%) as it's only one layer and represents ~10% of compute.
-The critical layers (attention, MLP) remain in FP8, providing **~1.45x speedup** vs 1.5x theoretical.
+**Note**: Layers with dimensions not divisible by 16 are automatically skipped.
+
+### Critical Implementation Details
+
+#### GradScaler is Required
+Unlike some FP8 implementations, this custom approach **requires GradScaler** because:
+- FP8 quantization affects gradient magnitudes
+- Dynamic scaling varies between forward/backward passes
+- No built-in overflow detection or scale management
+- Gradient clipping needs correctly unscaled gradients
+
+**Bug fixed in this implementation**: The initial code incorrectly disabled GradScaler (`enabled=False`), causing loss to not converge. Always use `enabled=args.use_fp8`.
+
+#### Scale Factor Clamping
+The implementation clamps scale factors to prevent numerical issues:
+```python
+# Clamp abs_max to prevent extreme scales
+abs_max = tensor.abs().max().clamp(min=1e-4)
+scale = (448.0 / (abs_max + 1e-6)).clamp(min=1.0, max=1e4)
+```
+
+This prevents:
+- **Overflow**: When abs_max is tiny → scale becomes huge
+- **Underflow**: When abs_max is large → scale becomes tiny
 
 ### Troubleshooting FP8 Training
 
-**FP8 not enabled on H100/H200:**
-- Check TorchAO is installed: `pip list | grep torchao`
-- Verify GPU detected: Check training logs for "✓ Model converted to FP8"
-- Install if missing: `pip install torchao`
+**Loss not decreasing (stuck at ~11.0):**
+- **CRITICAL**: Verify GradScaler is enabled: `scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)`
+- Check gradient norms are non-zero (training script logs this every 100 steps with `--use_fp8`)
+- Ensure `scaler.unscale_()` is called before gradient clipping
 
 **Out of memory with FP8:**
-- FP8 uses ~25-30% less memory than BF16, but may still OOM on small GPUs
+- FP8 uses ~25-30% less memory than BF16, but may still OOM
 - Try reducing `--batch_size` or `--block_size`
-- Enable `--gradient_checkpointing` for additional memory savings
+- Enable `--gradient_checkpointing` for additional savings
 
 **NaN loss with FP8:**
-- FP8 is generally stable, but can be sensitive to learning rate
-- Try reducing `--learning_rate` (e.g., from 1e-4 to 5e-5)
+- Reduce `--learning_rate` (e.g., from 1e-4 to 5e-5)
 - Increase `--warmup_iters` (e.g., from 400 to 1000)
 - Verify `--grad_clip 1.0` is set (critical for stability)
+- Check GradScaler scale factor isn't growing unbounded
 
 **Slower than expected:**
 - Ensure `--compile` is enabled for maximum speedup
 - Check GPU utilization with `nvidia-smi`
 - FP8 benefits are most visible with larger models (base/large/xl)
-- Small models may not see full speedup due to overhead
+- Small models may have overhead that reduces gains
 
 **torch.compile errors with FP8:**
-- The training script automatically uses `mode='reduce-overhead'` for FP8 (instead of `max-autotune`)
-- This avoids `FlexibleLayout` errors with FP8 dynamic scaling operations
-- `reduce-overhead` mode still provides significant speedup (~10-20%)
-- Combined FP8 + compile speedup: **~1.6-1.8x** vs BF16 baseline
+- The training script uses `mode='reduce-overhead'` for FP8 (instead of `max-autotune`)
+- This avoids layout errors with dynamic scaling operations
+- Still provides significant speedup (~10-20%)
 
-**Learning rate updates with TorchAO optimizers:**
-- TorchAO optimizers (AdamWFp8, AdamW8bit) store `lr` as a Tensor instead of float
-- Use `param_group['lr'].fill_(new_lr)` instead of `param_group['lr'] = new_lr`
-- The training script handles this automatically by detecting Tensor lr:
-  ```python
-  if isinstance(param_group['lr'], torch.Tensor):
-      param_group['lr'].fill_(lr)  # TorchAO optimizer
-  else:
-      param_group['lr'] = lr  # Standard optimizer
-  ```
+### Performance Expectations
+- **Memory**: ~25-30% reduction vs BF16
+- **Speed**: Depends on model size and GPU
+- **Convergence**: Should match BF16 within 5-10% final loss
 
-### Migration from Legacy FP8 Implementation
-
-The old custom FP8 implementation in `optimization/fp8_trainer.py` is now deprecated. To migrate:
-
-**Old way (deprecated):**
-```python
-from fp8_trainer import FP8AdamW
-model = create_swa_mla_model(..., use_fp8=True)  # FP8 flag in model creation
-optimizer = FP8AdamW(...)  # Manual optimizer selection
-```
-
-**New way (recommended):**
-```python
-from fp8_torchao import configure_fp8_training
-model = create_swa_mla_model(..., use_fp8=False)  # No FP8 in model
-model = convert_to_float8_training(model)  # TorchAO handles conversion
-# Optimizer automatically selected based on --use_fp8 flag
-```
-
-### References
-- TorchAO GitHub: https://github.com/pytorch/ao
-- TorchAO Docs: https://docs.pytorch.org/ao/
-- FP8 Training Guide: https://pytorch.org/blog/training-using-float8-fsdp2/
-- Paper: https://arxiv.org/abs/2209.05433
+### Implementation Reference
+See [optimization/fp8_native.py](optimization/fp8_native.py) for the full implementation:
+- `FP8LinearFunction`: Custom autograd function
+- `FP8Linear`: nn.Module wrapper
+- `convert_to_native_fp8()`: Recursive model conversion
 
 ## Debugging and Troubleshooting
 

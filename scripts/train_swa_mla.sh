@@ -116,7 +116,6 @@ if [ $NUM_GPUS -gt 1 ]; then
     --eval_interval 1000 \
     --save_interval 50000 \
     --use_fp8 \
-    --gradient_checkpointing \
     $HF_REPO_ARG \
     $TB_ARG
 else
@@ -148,7 +147,8 @@ else
     --log_interval 10 \
     --eval_interval 5000 \
     --save_interval 20000 \
-    --gradient_checkpointing \
+    --use_fp8 \
+    --compile \
     $HF_REPO_ARG \
     $TB_ARG
 fi

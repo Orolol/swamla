@@ -34,12 +34,12 @@ class FP8LinearFunction(torch.autograd.Function):
         # Dynamic scaling: scale = max_fp8 / max_val
         # E4M3 max value is 448.0
         input_abs_max = input_flat.abs().max()
-        input_scale = torch.tensor(448.0, device=input.device) / (input_abs_max + 1e-6)
+        input_scale = torch.tensor(448.0, device=input.device) / (input_abs_max + 1e-12)
         input_fp8 = (input_flat * input_scale).to(torch.float8_e4m3fn)
         
         # 2. Quantize Weight
         weight_abs_max = weight.abs().max()
-        weight_scale = torch.tensor(448.0, device=input.device) / (weight_abs_max + 1e-6)
+        weight_scale = torch.tensor(448.0, device=input.device) / (weight_abs_max + 1e-12)
         weight_fp8 = (weight * weight_scale).to(torch.float8_e4m3fn)
         
         # 3. Forward MM: Input @ Weight.T
@@ -50,12 +50,13 @@ class FP8LinearFunction(torch.autograd.Function):
         # So we have Row-Major @ Column-Major. This is supported by cuBLASLt.
         
         # Scales for dequantization (inverse of quantization scales)
+        # Keep as tensors for _scaled_mm (requires Tensor arguments)
         scale_a_inv = 1.0 / input_scale
         scale_b_inv = 1.0 / weight_scale
-        
+
         output = torch._scaled_mm(
             input_fp8,
-            weight_fp8.t(), 
+            weight_fp8.t(),
             scale_a=scale_a_inv,
             scale_b=scale_b_inv,
             out_dtype=input.dtype,
@@ -74,10 +75,10 @@ class FP8LinearFunction(torch.autograd.Function):
         input_fp8, weight_fp8, input_scale, weight_scale = ctx.saved_tensors
         
         grad_output_flat = grad_output.view(-1, grad_output.shape[-1])
-        
+
         # 1. Quantize Grad Output
         grad_abs_max = grad_output_flat.abs().max()
-        grad_scale = torch.tensor(448.0, device=grad_output.device) / (grad_abs_max + 1e-6)
+        grad_scale = torch.tensor(448.0, device=grad_output.device) / (grad_abs_max + 1e-12)
         grad_fp8 = (grad_output_flat * grad_scale).to(torch.float8_e4m3fn)
         
         grad_input = None
@@ -85,6 +86,7 @@ class FP8LinearFunction(torch.autograd.Function):
         grad_bias = None
         
         # Scales for dequantization
+        # Keep as tensors for _scaled_mm (requires Tensor arguments)
         scale_grad_inv = 1.0 / grad_scale
         scale_input_inv = 1.0 / input_scale
         scale_weight_inv = 1.0 / weight_scale
@@ -207,7 +209,7 @@ class FP8Linear(nn.Module):
         # If native FP8 is not available or disabled, fall back to standard linear
         if not HAS_NATIVE_FP8 or not x.is_cuda:
             return F.linear(x, self.weight, self.bias)
-            
+
         return FP8LinearFunction.apply(x, self.weight, self.bias)
 
     @classmethod

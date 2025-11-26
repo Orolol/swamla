@@ -42,10 +42,13 @@ class MLP(nn.Module):
             self.using_fp8 = False
 
         self.dropout = nn.Dropout(config.dropout)
-        
+
         # Activation function setup
         self.act_fn = self._get_optimized_activation()
-        
+
+        # Gradient checkpointing control
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', True)
+
         # Initialize weights with a special scale for better gradient flow
         self._init_weights()
 
@@ -116,11 +119,13 @@ class MLP(nn.Module):
         if torch.jit.is_scripting() or not self.training:
             # Mode inference ou JIT: utiliser l'implémentation fusionnée
             return self._fuse_operations(x)
-        
-        # Mode training: utiliser la version avec checkpointing si la séquence est longue
-        if x.shape[1] > 1024:  # Seuil arbitraire, peut être ajusté
+
+        # Mode training: utiliser la version avec checkpointing si:
+        # - checkpointing est activé dans la config
+        # - la séquence est longue (> 1024 tokens)
+        if self.use_gradient_checkpointing and x.shape[1] > 1024:
             return checkpoint.checkpoint(self._fuse_operations, x, use_reentrant=False)
-        
+
         return self._fuse_operations(x)
 
 class Block(nn.Module):
@@ -133,7 +138,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
-        self.use_checkpoint = True
+        # Respect config for gradient checkpointing
+        self.use_checkpoint = getattr(config, 'use_gradient_checkpointing', True)
 
     def _attn_block(self, x, key_value=None):
         ln_out = self.ln_1(x)
