@@ -11,21 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Type
 
-# Check for Transformer Engine availability
-try:
-    import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import DelayedScaling, Format
-    HAS_TE = True
-    # Check for quantized_model_init (newer API) or fp8_model_init (older API)
-    if hasattr(te, 'quantized_model_init'):
-        te_model_init = te.quantized_model_init
-    elif hasattr(te, 'fp8_model_init'):
-        te_model_init = te.fp8_model_init
-    else:
-        te_model_init = None
-except ImportError:
-    HAS_TE = False
-    te = None
+
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import DelayedScaling, Format
+HAS_TE = True
+# Check for quantized_model_init (newer API) or fp8_model_init (older API)
+if hasattr(te, 'quantized_model_init'):
+    te_model_init = te.quantized_model_init
+elif hasattr(te, 'fp8_model_init'):
+    te_model_init = te.fp8_model_init
+else:
     te_model_init = None
 
 
