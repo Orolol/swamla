@@ -554,25 +554,82 @@ def train(args):
     if master_process:
         print(f"\nCreating {args.size} SWA-MLA model...")
 
-    model = create_swa_mla_model(
-        size=args.size,
-        vocab_size=vocab_size,
-        block_size=args.block_size,
-        dropout=args.dropout,
-        swa_layers_per_cycle=args.swa_layers_per_cycle,
-        mla_layers_per_cycle=args.mla_layers_per_cycle,
-        swa_window=args.swa_window,
-        swa_sink_size=args.swa_sink_size,
-        q_lora_rank=args.mla_q_lora_rank,
-        kv_lora_rank=args.mla_kv_lora_rank,
-        qk_nope_head_dim=args.mla_qk_nope_head_dim,
-        qk_rope_head_dim=args.mla_qk_rope_head_dim,
-        v_head_dim=args.mla_v_head_dim,
-        use_fp8=False,  # FP8 conversion handled separately via fp8_native
-        use_gradient_checkpointing=args.gradient_checkpointing,
-    )
+    # Check TE FP8 availability before model creation
+    use_te_fp8 = False
+    fp8_init_context = None
+    if args.use_fp8:
+        try:
+            from fp8_te import get_fp8_init_context, HAS_TE
+            if HAS_TE:
+                use_te_fp8 = True
+                # Get FP8 initialization context
+                # Note: fp8_model_init uses Float8CurrentScaling by default
+                # We must NOT use a custom recipe in fp8_autocast to avoid mismatch
+                fp8_init_context = get_fp8_init_context(
+                    enabled=True,
+                    preserve_high_precision=False
+                )
+                if master_process:
+                    print("\nUsing Transformer Engine native FP8 Linear layers")
+                    print("  - Using quantized_model_init with preserve_high_precision=False")
+                    print("  - Using default Float8CurrentScaling recipe")
+            else:
+                if master_process:
+                    print("Warning: Transformer Engine not installed")
+                    print("Install with: pip install transformer-engine[pytorch]")
+                    print("Falling back to BF16 training")
+                args.use_fp8 = False
+        except ImportError as e:
+            if master_process:
+                print(f"Warning: Failed to import Transformer Engine: {e}")
+                print("Falling back to BF16 training")
+            args.use_fp8 = False
+
+    # Create model inside FP8 init context if available
+    if fp8_init_context is not None:
+        with fp8_init_context:
+            model = create_swa_mla_model(
+                size=args.size,
+                vocab_size=vocab_size,
+                block_size=args.block_size,
+                dropout=args.dropout,
+                swa_layers_per_cycle=args.swa_layers_per_cycle,
+                mla_layers_per_cycle=args.mla_layers_per_cycle,
+                swa_window=args.swa_window,
+                swa_sink_size=args.swa_sink_size,
+                q_lora_rank=args.mla_q_lora_rank,
+                kv_lora_rank=args.mla_kv_lora_rank,
+                qk_nope_head_dim=args.mla_qk_nope_head_dim,
+                qk_rope_head_dim=args.mla_qk_rope_head_dim,
+                v_head_dim=args.mla_v_head_dim,
+                use_gradient_checkpointing=args.gradient_checkpointing,
+                use_te_fp8=use_te_fp8,
+            )
+    else:
+        model = create_swa_mla_model(
+            size=args.size,
+            vocab_size=vocab_size,
+            block_size=args.block_size,
+            dropout=args.dropout,
+            swa_layers_per_cycle=args.swa_layers_per_cycle,
+            mla_layers_per_cycle=args.mla_layers_per_cycle,
+            swa_window=args.swa_window,
+            swa_sink_size=args.swa_sink_size,
+            q_lora_rank=args.mla_q_lora_rank,
+            kv_lora_rank=args.mla_kv_lora_rank,
+            qk_nope_head_dim=args.mla_qk_nope_head_dim,
+            qk_rope_head_dim=args.mla_qk_rope_head_dim,
+            v_head_dim=args.mla_v_head_dim,
+            use_gradient_checkpointing=args.gradient_checkpointing,
+            use_te_fp8=use_te_fp8,
+        )
 
     model = model.to(device)
+
+    if use_te_fp8 and master_process:
+        print("✓ Model created with Transformer Engine FP8 Linear layers")
+        print("  - Using HYBRID format (E4M3 fwd, E5M2 bwd)")
+        print("  - No high-precision weight copies (memory efficient)")
 
     # Load model weights if resuming
     if resume_checkpoint:
@@ -589,52 +646,6 @@ def train(args):
         model.load_state_dict(state_dict)
         if master_process:
             print("✓ Model weights loaded")
-
-    # Convert model to FP8 using Transformer Engine if requested
-    fp8_recipe = None
-    if args.use_fp8:
-        try:
-            from fp8_te import convert_to_te_fp8, create_fp8_recipe, HAS_TE
-
-            if HAS_TE:
-                if master_process:
-                    print("\nConverting model to FP8 with Transformer Engine...")
-
-                # Create FP8 recipe with delayed scaling
-                fp8_recipe = create_fp8_recipe(
-                    fp8_format="HYBRID",  # E4M3 forward, E5M2 backward
-                    margin=0,
-                    interval=1,
-                    amax_history_len=1024,
-                    amax_compute_algo="max"
-                )
-
-                # Convert model to TE FP8
-                model = convert_to_te_fp8(model)
-
-                if master_process:
-                    print("✓ Model converted to Transformer Engine FP8")
-                    print("  - Using HYBRID format (E4M3 fwd, E5M2 bwd)")
-                    print("  - Automatic scaling with delayed scaling")
-                    print("  - torch.compile compatible")
-            else:
-                if master_process:
-                    print("Warning: Transformer Engine not installed")
-                    print("Install with: pip install transformer-engine[pytorch]")
-                    print("Falling back to BF16 training")
-                args.use_fp8 = False
-
-        except ImportError as e:
-            if master_process:
-                print(f"Warning: Failed to import Transformer Engine: {e}")
-                print("Falling back to BF16 training")
-            args.use_fp8 = False
-
-        except Exception as e:
-            if master_process:
-                print(f"Warning: Failed to convert model to FP8: {e}")
-                print("Falling back to BF16 training")
-            args.use_fp8 = False
 
 
                
@@ -669,14 +680,8 @@ def train(args):
 
         # Use different compilation mode for FP8 to avoid FlexibleLayout issues
         if args.use_fp8:
-            # Enable scalar capture for FP8 dynamic scaling
-            torch._dynamo.config.capture_scalar_outputs = True
-            # Compilation seems to be unstable on RTX 5090 with FP8 (sm_120 issue)
-            # Disabling compilation for FP8 to ensure stability and lower VRAM usage
-            # model = torch.compile(model) 
-            if master_process:
-                print("  Skipping compilation for FP8 (disabled for stability on RTX 5090)")
-                print("  Enabled scalar output capture for FP8 dynamic scaling")
+            model = torch.compile(model, mode='reduce-overhead') 
+
         else:
             # 'max-autotune' for non-FP8 training
             model = torch.compile(model, mode='max-autotune')
@@ -790,10 +795,11 @@ def train(args):
 
             # Forward pass with mixed precision
             # For Transformer Engine FP8, we need to wrap with fp8_autocast
-            if args.use_fp8 and fp8_recipe is not None:
+            if args.use_fp8 and use_te_fp8:
                 import transformer_engine.pytorch as te
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                    # Use default recipe (no fp8_recipe) to match fp8_model_init's Float8CurrentScaling
+                    with te.fp8_autocast(enabled=True):
                         logits, loss = model(input_ids, targets=labels)
                         loss = loss / args.gradient_accumulation_steps
             else:

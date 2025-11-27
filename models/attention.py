@@ -27,6 +27,14 @@ except ImportError as e:
     print(f"Xformers not available: {e}")
     XFORMERS_AVAILABLE = False
 
+# Import TE FP8 helper
+try:
+    from optimization.fp8_te import get_te_linear, HAS_TE
+except ImportError:
+    HAS_TE = False
+    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
+        return nn.Linear(in_features, out_features, bias=bias)
+
 ATTENTION_BACKENDS = {
     'flash_attn_2': FLASH_ATTENTION_AVAILABLE,
     'xformers': XFORMERS_AVAILABLE,
@@ -48,18 +56,21 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        
+
         # Grouped-Query Attention (GQA)
         self.n_head = config.n_head
         self.n_head_kv = config.n_head // config.ratio_kv
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        
-        # Projections
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
-        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
-        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Check if TE FP8 should be used
+        use_te_fp8 = getattr(config, 'use_te_fp8', False)
+
+        # Projections - use TE Linear if FP8 enabled
+        self.q_proj = get_te_linear(config.n_embd, config.n_embd, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.k_proj = get_te_linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.v_proj = get_te_linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.o_proj = get_te_linear(config.n_embd, config.n_embd, bias=config.bias, use_te_fp8=use_te_fp8)
         
         # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)

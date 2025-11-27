@@ -4,6 +4,12 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
+# Import TE checkpoint for FP8-aware gradient checkpointing
+try:
+    from optimization.fp8_te import te_checkpoint
+except ImportError:
+    te_checkpoint = None
+
 from normalization import RMSNorm, DynamicTanh
 from mla import MLA
 # from mla_fp8 import MLA_FP8
@@ -13,10 +19,10 @@ from mlp import MLP
 class MLABlock(nn.Module):
     """
     Transformer block with Multi-Head Latent Attention (MLA) and MLP
-    
+
     This block implements the architecture used in DeepSeek models with MLA for
     efficient memory usage through latent attention mechanisms.
-    
+
     Attributes:
         layer_id (int): Identifier for this layer (used for debugging)
         attn_norm (nn.Module): Layer normalization for attention input
@@ -24,12 +30,13 @@ class MLABlock(nn.Module):
         ffn_norm (nn.Module): Layer normalization for feed-forward input
         ffn (nn.Module): MLP feed-forward network
         use_checkpoint (bool): Whether to use gradient checkpointing
+        use_te_fp8 (bool): Whether using TE FP8 (for FP8-aware checkpointing)
     """
     def __init__(self, config, layer_id=None):
         super().__init__()
         # Layer identifier (for debugging)
         self.layer_id = layer_id
-        
+
         # RMSNorm for attention and feed-forward
         if config.use_dyt:
             self.attn_norm = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
@@ -40,12 +47,13 @@ class MLABlock(nn.Module):
 
         # MLA attention - FP8 version not included in standalone build
         self.attn = MLA(config)
-        
+
         # Always use standard MLP (no MoE)
         self.ffn = MLP(config)
-        
+
         # Gradient checkpointing
         self.use_checkpoint = config.use_gradient_checkpointing if hasattr(config, 'use_gradient_checkpointing') else True
+        self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
     def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None):
         """Attention portion of the block with appropriate normalization"""
@@ -60,40 +68,55 @@ class MLABlock(nn.Module):
     def forward(self, x, start_pos=0, freqs_cis=None, mask=None):
         """
         Forward pass for the MLABlock.
-        
+
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim)
             start_pos (int, optional): Starting position for attention caching. Defaults to 0.
             freqs_cis (torch.Tensor, optional): Precomputed position embeddings. Defaults to None.
             mask (torch.Tensor, optional): Attention mask tensor. Defaults to None.
-            
+
         Returns:
             torch.Tensor: Processed tensor with same shape as input
         """
         # Disable gradient checkpointing when using compiled model
         if hasattr(self, '_compiled_forward'):
             self.use_checkpoint = False
-            
+
+        use_ckpt = self.use_checkpoint and self.training
+
         # Standard residual transformer block implementation
-        if self.use_checkpoint and self.training:
-            # Gradient checkpointing for memory efficiency
-            attn_out = checkpoint.checkpoint(
-                self._attn_block, 
-                x, 
-                start_pos,
-                freqs_cis,
-                mask,
-                use_reentrant=False
-            )
+        if use_ckpt:
+            # Use TE checkpoint for FP8-aware checkpointing (handles FP8 states properly)
+            if self.use_te_fp8 and te_checkpoint is not None:
+                attn_out = te_checkpoint(
+                    self._attn_block,
+                    x,
+                    start_pos,
+                    freqs_cis,
+                    mask,
+                    use_te_fp8=True
+                )
+            else:
+                attn_out = checkpoint.checkpoint(
+                    self._attn_block,
+                    x,
+                    start_pos,
+                    freqs_cis,
+                    mask,
+                    use_reentrant=False
+                )
             # First residual connection
             x = x + attn_out
-            
+
             # FFN with checkpoint
-            ffn_output = checkpoint.checkpoint(
-                self._ffn_block, 
-                x,
-                use_reentrant=False
-            )
+            if self.use_te_fp8 and te_checkpoint is not None:
+                ffn_output = te_checkpoint(self._ffn_block, x, use_te_fp8=True)
+            else:
+                ffn_output = checkpoint.checkpoint(
+                    self._ffn_block,
+                    x,
+                    use_reentrant=False
+                )
             # Second residual connection
             x = x + ffn_output
         else:
@@ -102,5 +125,5 @@ class MLABlock(nn.Module):
             x = x + self._attn_block(x, start_pos, freqs_cis, mask)
             # Second residual connection
             x = x + self._ffn_block(x)
-        
+
         return x

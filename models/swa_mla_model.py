@@ -10,6 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
+# Import TE checkpoint for FP8-aware gradient checkpointing
+try:
+    from optimization.fp8_te import te_checkpoint
+except ImportError:
+    te_checkpoint = None
+
 from normalization import RMSNorm, DynamicTanh
 from attention import CausalSelfAttention
 from mlp import MLP
@@ -50,6 +56,7 @@ class SWALayerConfig:
     use_fp8: bool = False
     fp8_mla_params: bool = False
     fp8_tile_size: int = 128
+    use_te_fp8: bool = False  # Use Transformer Engine native FP8 Linear layers
 
 
 class SWALocalBlock(nn.Module):
@@ -66,6 +73,7 @@ class SWALocalBlock(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
         self.use_checkpoint = config.use_gradient_checkpointing
+        self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
     def _attn_block(self, x: torch.Tensor) -> torch.Tensor:
         return self.attn(self.norm1(x))
@@ -74,15 +82,22 @@ class SWALocalBlock(nn.Module):
         return self.mlp(self.norm2(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        use_checkpoint = self.use_checkpoint and self.training
-        if use_checkpoint:
-            attn_out = checkpoint.checkpoint(self._attn_block, x, use_reentrant=False)
+        use_ckpt = self.use_checkpoint and self.training
+        if use_ckpt:
+            # Use TE checkpoint for FP8-aware checkpointing (handles FP8 states properly)
+            if self.use_te_fp8 and te_checkpoint is not None:
+                attn_out = te_checkpoint(self._attn_block, x, use_te_fp8=True)
+            else:
+                attn_out = checkpoint.checkpoint(self._attn_block, x, use_reentrant=False)
         else:
             attn_out = self._attn_block(x)
         x = x + attn_out
 
-        if use_checkpoint:
-            mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
+        if use_ckpt:
+            if self.use_te_fp8 and te_checkpoint is not None:
+                mlp_out = te_checkpoint(self._mlp_block, x, use_te_fp8=True)
+            else:
+                mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
         else:
             mlp_out = self._mlp_block(x)
         x = x + mlp_out
@@ -133,6 +148,7 @@ class SWAMLAConfig:
     use_fp8: bool = False
     fp8_mla_params: bool = False
     fp8_tile_size: int = 128
+    use_te_fp8: bool = False  # Use Transformer Engine native FP8 Linear layers
 
     # MLA Selective specific parameters
     use_mla_selective: bool = False  # Use MLA Selective instead of standard MLA
@@ -167,6 +183,7 @@ class MLASelectiveBlock(nn.Module):
         self.attn = MLA(config)
         self.mlp = MLP(config)
         self.use_checkpoint = config.use_gradient_checkpointing
+        self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
     def _attn_block(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
         return self.attn(self.norm1(x), start_pos, freqs_cis, mask)
@@ -175,16 +192,23 @@ class MLASelectiveBlock(nn.Module):
         return self.mlp(self.norm2(x))
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        use_checkpoint = self.use_checkpoint and self.training
+        use_ckpt = self.use_checkpoint and self.training
 
-        if use_checkpoint:
-            attn_out = checkpoint.checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_reentrant=False)
+        if use_ckpt:
+            # Use TE checkpoint for FP8-aware checkpointing
+            if self.use_te_fp8 and te_checkpoint is not None:
+                attn_out = te_checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_te_fp8=True)
+            else:
+                attn_out = checkpoint.checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_reentrant=False)
         else:
             attn_out = self._attn_block(x, start_pos, freqs_cis, mask)
         x = x + attn_out
 
-        if use_checkpoint:
-            mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
+        if use_ckpt:
+            if self.use_te_fp8 and te_checkpoint is not None:
+                mlp_out = te_checkpoint(self._mlp_block, x, use_te_fp8=True)
+            else:
+                mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
         else:
             mlp_out = self._mlp_block(x)
         x = x + mlp_out
@@ -277,6 +301,7 @@ class SWAMLAModel(nn.Module):
                     use_fp8=config.use_fp8,
                     fp8_mla_params=config.fp8_mla_params,
                     fp8_tile_size=config.fp8_tile_size,
+                    use_te_fp8=config.use_te_fp8,
                 )
                 block = SWALocalBlock(layer_config)
             else:
@@ -471,6 +496,7 @@ def _create_mla_block_config(config: SWAMLAConfig):
         use_fp8: bool = config.use_fp8
         fp8_mla_params: bool = config.fp8_mla_params
         fp8_tile_size: int = config.fp8_tile_size
+        use_te_fp8: bool = config.use_te_fp8
 
     return _Config()
 

@@ -9,15 +9,75 @@ and proven performance at scale.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Type
 
 # Check for Transformer Engine availability
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import DelayedScaling, Format
     HAS_TE = True
+    # Check for quantized_model_init (newer API) or fp8_model_init (older API)
+    if hasattr(te, 'quantized_model_init'):
+        te_model_init = te.quantized_model_init
+    elif hasattr(te, 'fp8_model_init'):
+        te_model_init = te.fp8_model_init
+    else:
+        te_model_init = None
 except ImportError:
     HAS_TE = False
+    te = None
+    te_model_init = None
+
+
+def get_fp8_init_context(enabled: bool = True, preserve_high_precision: bool = False):
+    """
+    Get the appropriate FP8 model initialization context manager.
+
+    Note: fp8_model_init/quantized_model_init does NOT accept a recipe parameter.
+    The recipe is only used in fp8_autocast. When using this init context,
+    fp8_autocast should NOT specify a recipe (use defaults) to avoid mismatch.
+
+    Args:
+        enabled: Whether FP8 initialization is enabled
+        preserve_high_precision: Whether to keep high precision copies of weights.
+                                 Set to False to minimize memory usage.
+
+    Returns:
+        Context manager for FP8 model initialization
+    """
+    if enabled and HAS_TE and te_model_init is not None:
+        return te_model_init(enabled=True, preserve_high_precision_init_val=preserve_high_precision)
+    else:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+def get_te_linear(in_features: int, out_features: int, bias: bool = True, use_te_fp8: bool = False) -> nn.Module:
+    """
+    Get appropriate Linear layer class based on FP8 configuration and dimension compatibility.
+
+    Args:
+        in_features: Input dimension
+        out_features: Output dimension
+        bias: Whether to include bias
+        use_te_fp8: Whether to use TE FP8 Linear
+
+    Returns:
+        nn.Linear or te.Linear instance
+    """
+    # Check if TE FP8 should be used and dimensions are compatible
+    if use_te_fp8 and HAS_TE:
+        # TE requires dimensions divisible by 16
+        if in_features % 16 == 0 and out_features % 16 == 0:
+            return te.Linear(in_features, out_features, bias=bias)
+
+    # Fallback to standard nn.Linear
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def is_te_compatible(in_features: int, out_features: int) -> bool:
+    """Check if dimensions are compatible with TE FP8 (divisible by 16)."""
+    return in_features % 16 == 0 and out_features % 16 == 0
 
 
 class PaddedTELinear(nn.Module):
@@ -248,3 +308,31 @@ def get_fp8_stats(model: nn.Module) -> dict:
             stats['fp8_enabled_layers'].append(name)
 
     return stats
+
+
+def te_checkpoint(function, *args, use_te_fp8: bool = False, **kwargs):
+    """
+    FP8-aware gradient checkpointing wrapper.
+
+    Uses Transformer Engine's checkpoint when FP8 is enabled (handles FP8 states like
+    RNG states, amax history properly), otherwise falls back to torch.utils.checkpoint.
+
+    This is critical for memory efficiency with FP8: standard torch checkpoint doesn't
+    handle TE's internal FP8 states, leading to higher memory usage.
+
+    Args:
+        function: The function to checkpoint
+        *args: Arguments to pass to the function
+        use_te_fp8: Whether TE FP8 is being used
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        Output of the function
+    """
+    if use_te_fp8 and HAS_TE:
+        # Use TE checkpoint which is FP8-aware
+        return te.checkpoint(function, *args, **kwargs)
+    else:
+        # Fall back to standard PyTorch checkpoint
+        import torch.utils.checkpoint as torch_checkpoint
+        return torch_checkpoint.checkpoint(function, *args, use_reentrant=False, **kwargs)

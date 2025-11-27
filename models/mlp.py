@@ -8,12 +8,14 @@ import torch.utils.checkpoint as checkpoint
 from normalization import RMSNorm
 from attention import CausalSelfAttention
 
-# Import FP8 utilities for mixed precision support
+# Import TE FP8 helper
 try:
-    from optimization.fp8_mla import FP8LinearMLA
-    FP8_AVAILABLE = True
+    from optimization.fp8_te import get_te_linear, HAS_TE
 except ImportError:
-    FP8_AVAILABLE = False
+    HAS_TE = False
+    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
+        return nn.Linear(in_features, out_features, bias=bias)
+
 
 class MLP(nn.Module):
     """
@@ -26,20 +28,14 @@ class MLP(nn.Module):
         # Utiliser 4 * n_embd comme dimension cachée par défaut
         hidden_dim = 4 * config.n_embd
 
-        # Check if FP8 should be used for MLP
-        use_fp8 = getattr(config, 'use_fp8', False)
-        fp8_mla_params = getattr(config, 'fp8_mla_params', False)
+        # Check if TE FP8 should be used
+        use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
         # Projections combinées pour réduire le nombre d'opérations
-        # Use FP8 linear layers if enabled and available
-        if use_fp8 and fp8_mla_params and FP8_AVAILABLE:
-            self.gate_up_proj = FP8LinearMLA(config.n_embd, 2 * hidden_dim, bias=config.bias)
-            self.down_proj = FP8LinearMLA(hidden_dim, config.n_embd, bias=config.bias)
-            self.using_fp8 = True
-        else:
-            self.gate_up_proj = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
-            self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
-            self.using_fp8 = False
+        # Use TE FP8 linear layers if enabled
+        self.gate_up_proj = get_te_linear(config.n_embd, 2 * hidden_dim, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.down_proj = get_te_linear(hidden_dim, config.n_embd, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.using_te_fp8 = use_te_fp8 and HAS_TE
 
         self.dropout = nn.Dropout(config.dropout)
 
@@ -59,8 +55,8 @@ class MLP(nn.Module):
         # Scaled initialization for better gradient flow
         scale = 2 / (self.config.n_embd ** 0.5)
 
-        # FP8LinearMLA has its own reset_parameters, so only init if not using FP8
-        if not self.using_fp8:
+        # TE Linear has its own init, so only init if not using TE FP8
+        if not self.using_te_fp8:
             nn.init.normal_(self.gate_up_proj.weight, mean=0.0, std=scale)
             if self.gate_up_proj.bias is not None:
                 nn.init.zeros_(self.gate_up_proj.bias)

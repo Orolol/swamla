@@ -7,6 +7,15 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from positional_encoding import RoPE
 
+# Import TE FP8 helper
+try:
+    from optimization.fp8_te import get_te_linear, HAS_TE
+except ImportError:
+    HAS_TE = False
+    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
+        return nn.Linear(in_features, out_features, bias=bias)
+
+
 class MLA(nn.Module):
     """
     Multi-Head Latent Attention (MLA) Layer.
@@ -48,24 +57,29 @@ class MLA(nn.Module):
         
         # Optional values from config
         self.dropout = getattr(config, 'dropout', 0.0)
-        
-        # Linear projections
+
+        # Check if TE FP8 should be used
+        use_te_fp8 = getattr(config, 'use_te_fp8', False)
+        bias = config.bias if hasattr(config, 'bias') else False
+
+        # Linear projections - use TE Linear where dimensions are compatible
         if self.q_lora_rank == 0:
             # Direct projection for queries
-            self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=config.bias if hasattr(config, 'bias') else False)
+            self.wq = get_te_linear(self.dim, self.n_heads * self.qk_head_dim, bias=bias, use_te_fp8=use_te_fp8)
         else:
             # Low-rank projection for queries
-            self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=config.bias if hasattr(config, 'bias') else False)
+            self.wq_a = get_te_linear(self.dim, self.q_lora_rank, bias=bias, use_te_fp8=use_te_fp8)
             self.q_norm = nn.LayerNorm(self.q_lora_rank)
-            self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=config.bias if hasattr(config, 'bias') else False)
-        
+            self.wq_b = get_te_linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=bias, use_te_fp8=use_te_fp8)
+
         # Low-rank projection for keys and values
-        self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=config.bias if hasattr(config, 'bias') else False)
+        # Note: These dimensions may not be divisible by 16, get_te_linear handles fallback
+        self.wkv_a = get_te_linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias, use_te_fp8=use_te_fp8)
         self.kv_norm = nn.LayerNorm(self.kv_lora_rank)
-        self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=config.bias if hasattr(config, 'bias') else False)
-        
+        self.wkv_b = get_te_linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=bias, use_te_fp8=use_te_fp8)
+
         # Output projection
-        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=config.bias if hasattr(config, 'bias') else False)
+        self.wo = get_te_linear(self.n_heads * self.v_head_dim, self.dim, bias=bias, use_te_fp8=use_te_fp8)
         
         # Dropout layers
         self.attn_dropout = nn.Dropout(self.dropout)
