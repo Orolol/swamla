@@ -1,0 +1,8 @@
+pyenv: tensorboard: command not found
+
+The `tensorboard' command exists in these Python versions:
+  3.12.2/envs/5090
+  5090
+
+Note: See 'pyenv help global' for tips on allowing both
+      python2 and python3 to be found.

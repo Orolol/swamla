@@ -585,6 +585,24 @@ def train(args):
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
+    # Prepare MoE kwargs
+    moe_kwargs = {}
+    if args.use_moe:
+        moe_kwargs = {
+            'use_moe': True,
+            'n_experts': args.n_experts,
+            'n_shared_experts': args.n_shared_experts,
+            'n_activated': args.n_activated,
+            'router_z_loss_coef': args.router_z_loss_coef,
+        }
+        if args.expert_dim is not None:
+            moe_kwargs['expert_dim'] = args.expert_dim
+        if master_process:
+            print(f"\nMoE Configuration:")
+            print(f"  Experts: {args.n_experts} routed + {args.n_shared_experts} shared")
+            print(f"  Activated per token: {args.n_activated} routed + {args.n_shared_experts} shared = {args.n_activated + args.n_shared_experts} total")
+            print(f"  Expert dim: {args.expert_dim or 'same as n_embd'}")
+
     # Create model inside FP8 init context if available
     if fp8_init_context is not None:
         with fp8_init_context:
@@ -604,6 +622,7 @@ def train(args):
                 v_head_dim=args.mla_v_head_dim,
                 use_gradient_checkpointing=args.gradient_checkpointing,
                 use_te_fp8=use_te_fp8,
+                **moe_kwargs,
             )
     else:
         model = create_swa_mla_model(
@@ -622,6 +641,7 @@ def train(args):
             v_head_dim=args.mla_v_head_dim,
             use_gradient_checkpointing=args.gradient_checkpointing,
             use_te_fp8=use_te_fp8,
+            **moe_kwargs,
         )
 
     model = model.to(device)
@@ -801,15 +821,27 @@ def train(args):
                     # Use default recipe (no fp8_recipe) to match fp8_model_init's Float8CurrentScaling
                     with te.fp8_autocast(enabled=True):
                         logits, loss = model(input_ids, targets=labels)
+                        # Add MoE auxiliary loss if model has MoE layers
+                        if hasattr(raw_model, 'get_moe_aux_loss'):
+                            moe_aux_loss = raw_model.get_moe_aux_loss()
+                            loss = loss + moe_aux_loss
                         loss = loss / args.gradient_accumulation_steps
             else:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                     logits, loss = model(input_ids, targets=labels)
+                    # Add MoE auxiliary loss if model has MoE layers
+                    if hasattr(raw_model, 'get_moe_aux_loss'):
+                        moe_aux_loss = raw_model.get_moe_aux_loss()
+                        loss = loss + moe_aux_loss
                     loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(loss).backward()
             accum_loss += loss.item()
+
+        # Update MoE router biases after backward (must be after backward for checkpoint compatibility)
+        if hasattr(raw_model, 'update_moe_bias'):
+            raw_model.update_moe_bias()
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -971,7 +1003,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train SWA-MLA model')
 
     # Model parameters
-    parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl'])
+    parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b'])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--block_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -986,6 +1018,14 @@ def main():
     parser.add_argument('--mla_qk_nope_head_dim', type=int, default=128)
     parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64)
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
+
+    # MoE parameters (only applied to MLA blocks)
+    parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
+    parser.add_argument('--n_experts', type=int, default=32, help='Number of routed experts')
+    parser.add_argument('--n_shared_experts', type=int, default=1, help='Number of shared experts (always active)')
+    parser.add_argument('--n_activated', type=int, default=3, help='Number of routed experts activated per token')
+    parser.add_argument('--expert_dim', type=int, default=None, help='Expert hidden dimension (default: n_embd)')
+    parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router Z-loss coefficient')
 
     # Training parameters
     parser.add_argument('--max_iters', type=int, default=100000)
