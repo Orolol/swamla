@@ -1,5 +1,6 @@
 """
-Benchmark script to compare training speed between PackedFinewebDataset and FastFinewebDataset.
+Benchmark script to compare training speed between PackedFinewebDataset, FastFinewebDataset,
+and fast_loader (external package).
 """
 
 import os
@@ -19,6 +20,14 @@ from swa_mla_model import create_swa_mla_model
 from data_loader_packed import PackedFinewebDataset
 from data_loader_fast import FastFinewebDataset
 from transformers import AutoTokenizer
+
+# Try to import external fast_loader
+try:
+    from fast_loader import FastFinewebDataset as ExternalFastLoader
+    EXTERNAL_FAST_LOADER_AVAILABLE = True
+except ImportError:
+    EXTERNAL_FAST_LOADER_AVAILABLE = False
+    print("Note: fast_loader not installed. Install with: pip install git+https://github.com/Orolol/data-loader-fast.git")
 
 
 def create_model_and_optimizer(size, vocab_size, block_size, device):
@@ -66,7 +75,7 @@ def benchmark_dataloader(
             num_workers=1,
             start_offset=0,
         )
-    else:  # FastFinewebDataset
+    elif dataloader_class == FastFinewebDataset:
         dataset = dataloader_class(
             split="train",
             max_length=block_size,
@@ -78,6 +87,16 @@ def benchmark_dataloader(
             num_workers=1,
             start_offset=0,
         )
+    elif EXTERNAL_FAST_LOADER_AVAILABLE and dataloader_class == ExternalFastLoader:
+        # External fast_loader from github.com/Orolol/data-loader-fast
+        dataset = dataloader_class(
+            split="train",
+            max_length=block_size,
+            batch_size=batch_size,
+            tokenizer=tokenizer,
+        )
+    else:
+        raise ValueError(f"Unknown dataloader class: {dataloader_class}")
 
     # Create fresh model and optimizer for this benchmark
     print(f"Creating fresh model ({size})...")
@@ -169,8 +188,9 @@ def benchmark_dataloader(
     end_time = time.perf_counter()
     total_time = end_time - start_time
 
-    # Close dataset
-    dataset.close()
+    # Close dataset (if method exists)
+    if hasattr(dataset, 'close'):
+        dataset.close()
 
     # Calculate stats
     avg_step_time = sum(step_times) / len(step_times)
@@ -180,9 +200,12 @@ def benchmark_dataloader(
     tokens_per_sec = total_tokens / total_time
     avg_loss = total_loss / num_steps
 
-    # Get padding stats
-    stats = dataset.get_stats()
-    padding_ratio = stats.get('avg_padding_ratio', stats.get('total_padding', 0) / max(stats.get('total_tokens', 1), 1))
+    # Get padding stats (if method exists)
+    if hasattr(dataset, 'get_stats'):
+        stats = dataset.get_stats()
+        padding_ratio = stats.get('avg_padding_ratio', stats.get('total_padding', 0) / max(stats.get('total_tokens', 1), 1))
+    else:
+        padding_ratio = 0.0  # Unknown for external loader
 
     results = {
         'name': dataloader_name,
@@ -268,7 +291,7 @@ def main():
     torch.cuda.empty_cache()
     time.sleep(2)
 
-    # 2. Fast dataloader
+    # 2. Fast dataloader (local)
     results.append(benchmark_dataloader(
         FastFinewebDataset,
         "FastFinewebDataset",
@@ -281,33 +304,77 @@ def main():
         tokenizer=tokenizer,
     ))
 
+    # 3. External fast_loader (if available)
+    if EXTERNAL_FAST_LOADER_AVAILABLE:
+        torch.cuda.empty_cache()
+        time.sleep(2)
+
+        results.append(benchmark_dataloader(
+            ExternalFastLoader,
+            "ExternalFastLoader",
+            size=args.size,
+            vocab_size=vocab_size,
+            device=device,
+            num_steps=args.num_steps,
+            batch_size=args.batch_size,
+            block_size=args.block_size,
+            tokenizer=tokenizer,
+        ))
+
     # Summary
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
-    print(f"\n{'Metric':<25} {'Packed':<20} {'Fast':<20} {'Diff':<15}")
-    print("-" * 80)
 
-    packed = results[0]
-    fast = results[1]
+    # Dynamic column headers based on results
+    headers = [r['name'] for r in results]
+    col_width = 18
 
-    def fmt_diff(packed_val, fast_val, higher_better=True):
-        diff = (fast_val - packed_val) / packed_val * 100
-        sign = "+" if diff > 0 else ""
-        better = (diff > 0) == higher_better
-        indicator = "✓" if better else "✗"
-        return f"{sign}{diff:.1f}% {indicator}"
+    # Header row
+    print(f"\n{'Metric':<22}", end="")
+    for h in headers:
+        # Shorten names for display
+        short_name = h.replace("FinewebDataset", "").replace("Dataset", "")
+        print(f"{short_name:>{col_width}}", end="")
+    print()
+    print("-" * (22 + col_width * len(results)))
 
-    print(f"{'Tokens/sec':<25} {packed['tokens_per_sec']:>15,.0f} {fast['tokens_per_sec']:>15,.0f} {fmt_diff(packed['tokens_per_sec'], fast['tokens_per_sec'], True):>15}")
-    print(f"{'Avg step time (ms)':<25} {packed['avg_step_time_ms']:>15.2f} {fast['avg_step_time_ms']:>15.2f} {fmt_diff(packed['avg_step_time_ms'], fast['avg_step_time_ms'], False):>15}")
-    print(f"{'Avg data time (ms)':<25} {packed['avg_data_time_ms']:>15.2f} {fast['avg_data_time_ms']:>15.2f} {fmt_diff(packed['avg_data_time_ms'], fast['avg_data_time_ms'], False):>15}")
-    print(f"{'Padding ratio':<25} {packed['padding_ratio']:>15.2%} {fast['padding_ratio']:>15.2%} {fmt_diff(packed['padding_ratio'], fast['padding_ratio'], False):>15}")
-    print(f"{'Avg loss':<25} {packed['avg_loss']:>15.4f} {fast['avg_loss']:>15.4f}")
+    # Tokens/sec
+    print(f"{'Tokens/sec':<22}", end="")
+    for r in results:
+        print(f"{r['tokens_per_sec']:>{col_width},.0f}", end="")
+    print()
 
+    # Avg step time
+    print(f"{'Avg step time (ms)':<22}", end="")
+    for r in results:
+        print(f"{r['avg_step_time_ms']:>{col_width}.2f}", end="")
+    print()
+
+    # Avg data time
+    print(f"{'Avg data time (ms)':<22}", end="")
+    for r in results:
+        print(f"{r['avg_data_time_ms']:>{col_width}.2f}", end="")
+    print()
+
+    # Padding ratio
+    print(f"{'Padding ratio':<22}", end="")
+    for r in results:
+        print(f"{r['padding_ratio']*100:>{col_width-1}.2f}%", end="")
+    print()
+
+    # Avg loss
+    print(f"{'Avg loss':<22}", end="")
+    for r in results:
+        print(f"{r['avg_loss']:>{col_width}.4f}", end="")
+    print()
+
+    # Find winner
     print(f"\n{'='*60}")
-    winner = "PackedFinewebDataset" if packed['tokens_per_sec'] > fast['tokens_per_sec'] else "FastFinewebDataset"
-    speed_diff = abs(packed['tokens_per_sec'] - fast['tokens_per_sec']) / min(packed['tokens_per_sec'], fast['tokens_per_sec']) * 100
-    print(f"Winner: {winner} ({speed_diff:.1f}% faster)")
+    best = max(results, key=lambda x: x['tokens_per_sec'])
+    worst = min(results, key=lambda x: x['tokens_per_sec'])
+    speed_diff = (best['tokens_per_sec'] - worst['tokens_per_sec']) / worst['tokens_per_sec'] * 100
+    print(f"Winner: {best['name']} ({speed_diff:.1f}% faster than {worst['name']})")
     print(f"{'='*60}\n")
 
 
