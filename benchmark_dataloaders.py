@@ -21,11 +21,24 @@ from data_loader_fast import FastFinewebDataset
 from transformers import AutoTokenizer
 
 
+def create_model_and_optimizer(size, vocab_size, block_size, device):
+    """Create a fresh model and optimizer."""
+    model = create_swa_mla_model(
+        size=size,
+        vocab_size=vocab_size,
+        block_size=block_size,
+    )
+    model = model.to(device)
+    model = torch.compile(model, mode='reduce-overhead')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
+    return model, optimizer
+
+
 def benchmark_dataloader(
     dataloader_class,
     dataloader_name: str,
-    model,
-    optimizer,
+    size: str,
+    vocab_size: int,
     device,
     num_steps: int = 100,
     batch_size: int = 4,
@@ -66,12 +79,13 @@ def benchmark_dataloader(
             start_offset=0,
         )
 
+    # Create fresh model and optimizer for this benchmark
+    print(f"Creating fresh model ({size})...")
+    model, optimizer = create_model_and_optimizer(size, vocab_size, block_size, device)
+
     # Warmup: wait for prefetch buffer to fill
     print("Waiting for prefetch buffer to fill...")
     time.sleep(3)
-
-    # Reset model gradients
-    optimizer.zero_grad()
 
     # Benchmark
     total_tokens = 0
@@ -234,32 +248,16 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
-    # Create model
-    print(f"\nCreating {args.size} model...")
-    model = create_swa_mla_model(
-        size=args.size,
-        vocab_size=vocab_size,
-        block_size=args.block_size,
-    )
-    model = model.to(device)
-    model = torch.compile(model, mode='reduce-overhead')
-
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {num_params/1e6:.1f}M")
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
-
-    # Benchmark both dataloaders
+    # Benchmark both dataloaders (each with fresh model)
     results = []
 
     # 1. Packed dataloader
     results.append(benchmark_dataloader(
         PackedFinewebDataset,
         "PackedFinewebDataset",
-        model,
-        optimizer,
-        device,
+        size=args.size,
+        vocab_size=vocab_size,
+        device=device,
         num_steps=args.num_steps,
         batch_size=args.batch_size,
         block_size=args.block_size,
@@ -274,9 +272,9 @@ def main():
     results.append(benchmark_dataloader(
         FastFinewebDataset,
         "FastFinewebDataset",
-        model,
-        optimizer,
-        device,
+        size=args.size,
+        vocab_size=vocab_size,
+        device=device,
         num_steps=args.num_steps,
         batch_size=args.batch_size,
         block_size=args.block_size,
