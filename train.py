@@ -585,44 +585,35 @@ def train(args):
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
+    # Common model kwargs
+    model_kwargs = dict(
+        size=args.size,
+        vocab_size=vocab_size,
+        block_size=args.block_size,
+        dropout=args.dropout,
+        swa_layers_per_cycle=args.swa_layers_per_cycle,
+        mla_layers_per_cycle=args.mla_layers_per_cycle,
+        swa_window=args.swa_window,
+        swa_sink_size=args.swa_sink_size,
+        q_lora_rank=args.mla_q_lora_rank,
+        kv_lora_rank=args.mla_kv_lora_rank,
+        qk_nope_head_dim=args.mla_qk_nope_head_dim,
+        qk_rope_head_dim=args.mla_qk_rope_head_dim,
+        v_head_dim=args.mla_v_head_dim,
+        use_gradient_checkpointing=args.gradient_checkpointing,
+        use_te_fp8=use_te_fp8,
+        # Neural Memory parameters
+        use_neural_memory=args.use_neural_memory,
+        memory_dim=args.memory_dim,
+        memory_depth=args.memory_depth,
+    )
+
     # Create model inside FP8 init context if available
     if fp8_init_context is not None:
         with fp8_init_context:
-            model = create_swa_mla_model(
-                size=args.size,
-                vocab_size=vocab_size,
-                block_size=args.block_size,
-                dropout=args.dropout,
-                swa_layers_per_cycle=args.swa_layers_per_cycle,
-                mla_layers_per_cycle=args.mla_layers_per_cycle,
-                swa_window=args.swa_window,
-                swa_sink_size=args.swa_sink_size,
-                q_lora_rank=args.mla_q_lora_rank,
-                kv_lora_rank=args.mla_kv_lora_rank,
-                qk_nope_head_dim=args.mla_qk_nope_head_dim,
-                qk_rope_head_dim=args.mla_qk_rope_head_dim,
-                v_head_dim=args.mla_v_head_dim,
-                use_gradient_checkpointing=args.gradient_checkpointing,
-                use_te_fp8=use_te_fp8,
-            )
+            model = create_swa_mla_model(**model_kwargs)
     else:
-        model = create_swa_mla_model(
-            size=args.size,
-            vocab_size=vocab_size,
-            block_size=args.block_size,
-            dropout=args.dropout,
-            swa_layers_per_cycle=args.swa_layers_per_cycle,
-            mla_layers_per_cycle=args.mla_layers_per_cycle,
-            swa_window=args.swa_window,
-            swa_sink_size=args.swa_sink_size,
-            q_lora_rank=args.mla_q_lora_rank,
-            kv_lora_rank=args.mla_kv_lora_rank,
-            qk_nope_head_dim=args.mla_qk_nope_head_dim,
-            qk_rope_head_dim=args.mla_qk_rope_head_dim,
-            v_head_dim=args.mla_v_head_dim,
-            use_gradient_checkpointing=args.gradient_checkpointing,
-            use_te_fp8=use_te_fp8,
-        )
+        model = create_swa_mla_model(**model_kwargs)
 
     model = model.to(device)
 
@@ -754,6 +745,10 @@ def train(args):
     best_val_loss = float('inf')
     total_tokens_seen = resume_tokens  # Start from resumed token count
 
+    # Initialize memory states for truncated BPTT (if using neural memory)
+    memory_states = None
+    use_neural_memory = args.use_neural_memory
+
     # Adjust starting step
     start_step = resume_step
     for step in range(start_step, args.max_iters):
@@ -800,16 +795,34 @@ def train(args):
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                     # Use default recipe (no fp8_recipe) to match fp8_model_init's Float8CurrentScaling
                     with te.fp8_autocast(enabled=True):
-                        logits, loss = model(input_ids, targets=labels)
+                        if use_neural_memory:
+                            logits, loss, memory_states = model(
+                                input_ids, targets=labels,
+                                memory_states=memory_states,
+                                return_memory_states=True
+                            )
+                        else:
+                            logits, loss = model(input_ids, targets=labels)
                         loss = loss / args.gradient_accumulation_steps
             else:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                    logits, loss = model(input_ids, targets=labels)
+                    if use_neural_memory:
+                        logits, loss, memory_states = model(
+                            input_ids, targets=labels,
+                            memory_states=memory_states,
+                            return_memory_states=True
+                        )
+                    else:
+                        logits, loss = model(input_ids, targets=labels)
                     loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(loss).backward()
             accum_loss += loss.item()
+
+            # Truncated BPTT: detach memory states to prevent gradient flow across batches
+            if use_neural_memory and memory_states is not None:
+                memory_states = [s.detach() for s in memory_states]
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -829,6 +842,13 @@ def train(args):
         scaler.update()
 
         running_loss += accum_loss
+
+        # Periodic memory state reset (prevents unbounded state growth)
+        if use_neural_memory and args.memory_reset_interval > 0:
+            if step > 0 and step % args.memory_reset_interval == 0:
+                memory_states = None
+                if master_process:
+                    print(f"  [Memory] Reset memory states at step {step}")
 
         # Track total tokens processed
         total_tokens_seen += args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size
@@ -986,6 +1006,16 @@ def main():
     parser.add_argument('--mla_qk_nope_head_dim', type=int, default=128)
     parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64)
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
+
+    # Neural Memory parameters (Titans paper)
+    parser.add_argument('--use_neural_memory', action='store_true',
+                        help='Enable Neural Long-term Memory for MLA blocks')
+    parser.add_argument('--memory_dim', type=int, default=256,
+                        help='Internal dimension for memory MLP')
+    parser.add_argument('--memory_depth', type=int, default=2,
+                        help='Number of layers in memory MLP')
+    parser.add_argument('--memory_reset_interval', type=int, default=0,
+                        help='Reset memory states every N steps (0=never reset)')
 
     # Training parameters
     parser.add_argument('--max_iters', type=int, default=100000)
