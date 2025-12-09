@@ -10,7 +10,6 @@ from pathlib import Path
 from datetime import datetime
 
 import torch
-import torch.nn.functional as F
 
 # Add models and data to path
 sys.path.insert(0, str(Path(__file__).parent / 'models'))
@@ -94,12 +93,8 @@ def benchmark_dataloader(
         labels = batch["labels"].to(device)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits = model(input_ids)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100
-            )
+            # Model returns (logits, loss) when targets are provided
+            _, loss = model(input_ids, targets=labels)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -124,12 +119,8 @@ def benchmark_dataloader(
         # Forward pass
         forward_start = time.perf_counter()
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits = model(input_ids)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100
-            )
+            # Model returns (logits, loss) when targets are provided
+            _, loss = model(input_ids, targets=labels)
         torch.cuda.synchronize()
         forward_end = time.perf_counter()
 
