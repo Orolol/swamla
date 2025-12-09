@@ -585,6 +585,24 @@ def train(args):
                 print("Falling back to BF16 training")
             args.use_fp8 = False
 
+    # Prepare MoE kwargs
+    moe_kwargs = {}
+    if args.use_moe:
+        moe_kwargs = {
+            'use_moe': True,
+            'n_experts': args.n_experts,
+            'n_shared_experts': args.n_shared_experts,
+            'n_activated': args.n_activated,
+            'router_z_loss_coef': args.router_z_loss_coef,
+        }
+        if args.expert_dim is not None:
+            moe_kwargs['expert_dim'] = args.expert_dim
+        if master_process:
+            print(f"\nMoE Configuration:")
+            print(f"  Experts: {args.n_experts} routed + {args.n_shared_experts} shared")
+            print(f"  Activated per token: {args.n_activated} routed + {args.n_shared_experts} shared = {args.n_activated + args.n_shared_experts} total")
+            print(f"  Expert dim: {args.expert_dim or 'same as n_embd'}")
+
     # Common model kwargs
     model_kwargs = dict(
         size=args.size,
@@ -606,6 +624,8 @@ def train(args):
         use_neural_memory=args.use_neural_memory,
         memory_dim=args.memory_dim,
         memory_depth=args.memory_depth,
+        # MoE parameters
+        **moe_kwargs,
     )
 
     # Create model inside FP8 init context if available
@@ -803,6 +823,10 @@ def train(args):
                             )
                         else:
                             logits, loss = model(input_ids, targets=labels)
+                        # Add MoE auxiliary loss if model has MoE layers
+                        if hasattr(raw_model, 'get_moe_aux_loss'):
+                            moe_aux_loss = raw_model.get_moe_aux_loss()
+                            loss = loss + moe_aux_loss
                         loss = loss / args.gradient_accumulation_steps
             else:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
@@ -814,6 +838,10 @@ def train(args):
                         )
                     else:
                         logits, loss = model(input_ids, targets=labels)
+                    # Add MoE auxiliary loss if model has MoE layers
+                    if hasattr(raw_model, 'get_moe_aux_loss'):
+                        moe_aux_loss = raw_model.get_moe_aux_loss()
+                        loss = loss + moe_aux_loss
                     loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
@@ -823,6 +851,10 @@ def train(args):
             # Truncated BPTT: detach memory states to prevent gradient flow across batches
             if use_neural_memory and memory_states is not None:
                 memory_states = [s.detach() for s in memory_states]
+
+        # Update MoE router biases after backward (must be after backward for checkpoint compatibility)
+        if hasattr(raw_model, 'update_moe_bias'):
+            raw_model.update_moe_bias()
 
         # Gradient clipping
         if args.grad_clip > 0:
@@ -886,12 +918,6 @@ def train(args):
             if tb_writer is not None:
                 tb_writer.add_scalar('train/loss', lossf, step)
                 tb_writer.add_scalar('train/lr', lr, step)
-                tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
-                tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
-
-            if tb_writer is not None:
-                tb_writer.add_scalar('train/loss', lossf, step)
-                tb_writer.add_scalar('train/learning_rate', lr, step)
                 tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
                 tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
                 tb_writer.add_scalar('train/perplexity', math.exp(lossf) if lossf < 10 else float('inf'), step)
@@ -991,7 +1017,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train SWA-MLA model')
 
     # Model parameters
-    parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl'])
+    parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b'])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--block_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -1016,6 +1042,14 @@ def main():
                         help='Number of layers in memory MLP')
     parser.add_argument('--memory_reset_interval', type=int, default=0,
                         help='Reset memory states every N steps (0=never reset)')
+
+    # MoE parameters (only applied to MLA blocks)
+    parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
+    parser.add_argument('--n_experts', type=int, default=32, help='Number of routed experts')
+    parser.add_argument('--n_shared_experts', type=int, default=1, help='Number of shared experts (always active)')
+    parser.add_argument('--n_activated', type=int, default=3, help='Number of routed experts activated per token')
+    parser.add_argument('--expert_dim', type=int, default=None, help='Expert hidden dimension (default: n_embd)')
+    parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router Z-loss coefficient')
 
     # Training parameters
     parser.add_argument('--max_iters', type=int, default=100000)

@@ -204,7 +204,18 @@ class SWAMLAConfig:
 
     label_smoothing: float = 0.0
 
+    # MoE configuration (only applied to MLA blocks)
+    use_moe: bool = False
+    n_experts: int = 32
+    n_shared_experts: int = 1
+    n_activated: int = 3  # routed experts per token (+ shared = 4 total active)
+    expert_dim: Optional[int] = None  # defaults to n_embd if None
+    router_z_loss_coef: float = 0.001
+
     def __post_init__(self) -> None:
+        # Set expert_dim to n_embd if not specified
+        if self.expert_dim is None:
+            self.expert_dim = self.n_embd
         if self.swa_layers_per_cycle < 0 or self.mla_layers_per_cycle < 0:
             raise ValueError("Layer counts per cycle must be non-negative")
         if self.swa_layers_per_cycle + self.mla_layers_per_cycle == 0:
@@ -539,6 +550,43 @@ class SWAMLAModel(nn.Module):
 
         return logits, loss
 
+    def get_moe_aux_loss(self) -> torch.Tensor:
+        """Collect auxiliary losses from all MoE layers."""
+        total_aux_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        moe_count = 0
+
+        for block in self.transformer.h:
+            # Check if block has MoE FFN
+            ffn = getattr(block, 'ffn', getattr(block, 'mlp', None))
+            if ffn is not None and hasattr(ffn, 'get_aux_loss'):
+                total_aux_loss = total_aux_loss + ffn.get_aux_loss()
+                moe_count += 1
+
+        return total_aux_loss
+
+    def get_moe_load_balance_stats(self) -> dict:
+        """Collect load balance statistics from all MoE layers."""
+        stats = {}
+        for i, block in enumerate(self.transformer.h):
+            ffn = getattr(block, 'ffn', getattr(block, 'mlp', None))
+            if ffn is not None and hasattr(ffn, 'get_load_balance_stats'):
+                stats[f'layer_{i}'] = ffn.get_load_balance_stats()
+        return stats
+
+    def update_moe_bias(self):
+        """Update MoE router biases after backward pass.
+
+        This must be called AFTER loss.backward() to maintain gradient
+        checkpointing compatibility. The bias update is deferred from
+        forward() to avoid state changes during checkpoint recomputation.
+        """
+        for block in self.transformer.h:
+            ffn = getattr(block, 'ffn', getattr(block, 'mlp', None))
+            if ffn is not None and hasattr(ffn, 'router'):
+                router = ffn.router
+                if hasattr(router, 'update_bias_from_last_forward'):
+                    router.update_bias_from_last_forward()
+
     @torch.no_grad()
     def generate(
         self,
@@ -652,6 +700,13 @@ def _create_mla_block_config(config: SWAMLAConfig):
         # Neural memory parameters (for MLAMemoryBlock)
         memory_dim: int = config.memory_dim
         memory_depth: int = config.memory_depth
+        # MoE parameters
+        use_moe: bool = config.use_moe
+        n_experts: int = config.n_experts
+        n_shared_experts: int = config.n_shared_experts
+        n_activated: int = config.n_activated
+        expert_dim: int = config.expert_dim
+        router_z_loss_coef: float = config.router_z_loss_coef
 
     return _Config()
 
@@ -669,9 +724,20 @@ def create_swa_mla_model(
         "base": dict(n_layer=24, n_embd=1536, n_head=16),    # 1536/16=96 head_dim
         "large": dict(n_layer=28, n_embd=2048, n_head=16),   # 2048/16=128 head_dim
         "xl": dict(n_layer=32, n_embd=4096, n_head=32),      # 4096/32=128 head_dim
+        # MoE presets - params are total, active params are much smaller
+        "moe-1b": dict(  # ~770M total, ~250M active
+            n_layer=12, n_embd=768, n_head=12,
+            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=768 * 3,
+        ),
+        "moe-2b": dict(  # ~1.5B total, ~400M active
+            n_layer=18, n_embd=1024, n_head=16,
+            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=1024 * 3,
+        ),
     }
     if size not in presets:
-        raise ValueError(f"Unknown SWAMLA model size: {size}")
+        raise ValueError(f"Unknown SWAMLA model size: {size}. Available: {list(presets.keys())}")
 
     cfg_kwargs = presets[size].copy()
     cfg_kwargs.update(dict(vocab_size=vocab_size, block_size=block_size, dropout=dropout))

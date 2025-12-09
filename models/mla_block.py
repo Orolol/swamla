@@ -48,8 +48,12 @@ class MLABlock(nn.Module):
         # MLA attention - FP8 version not included in standalone build
         self.attn = MLA(config)
 
-        # Always use standard MLP (no MoE)
-        self.ffn = MLP(config)
+        # FFN: MoE or standard MLP based on config
+        if getattr(config, 'use_moe', False):
+            from moe import MoELayer
+            self.ffn = MoELayer(config)
+        else:
+            self.ffn = MLP(config)
 
         # Gradient checkpointing
         self.use_checkpoint = config.use_gradient_checkpointing if hasattr(config, 'use_gradient_checkpointing') else True
@@ -62,7 +66,6 @@ class MLABlock(nn.Module):
 
     def _ffn_block(self, x):
         """Feed-forward portion of the block with appropriate normalization"""
-        # Always use regular MLP (no MoE)
         return self.ffn(self.ffn_norm(x))
 
     def forward(self, x, start_pos=0, freqs_cis=None, mask=None):
