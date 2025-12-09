@@ -99,6 +99,7 @@ class FastFinewebDataset(IterableDataset):
         tokenizer: Optional[Any] = None,
         num_workers: int = 1,
         start_offset: int = 0,
+        fixed_length: bool = True,  # Pad to max_length for torch.compile compatibility
     ):
         super().__init__()
 
@@ -109,6 +110,7 @@ class FastFinewebDataset(IterableDataset):
         self.prefetch_batches = max(4, prefetch_batches)
         self.shuffle = shuffle
         self.num_workers = max(1, num_workers)
+        self.fixed_length = fixed_length
 
         # DDP awareness
         try:
@@ -193,10 +195,14 @@ class FastFinewebDataset(IterableDataset):
         if len(batch_docs) < self.batch_size:
             return None
 
-        # Dynamic Padding: Find max length in this specific batch
-        max_len_in_batch = max(len(d) for d in batch_docs)
-        # Ensure we don't exceed global max_length (though _split_long should prevent this)
-        batch_seq_len = min(max_len_in_batch, self.max_length)
+        # Determine sequence length for this batch
+        if self.fixed_length:
+            # Fixed padding: always use max_length for torch.compile compatibility
+            batch_seq_len = self.max_length
+        else:
+            # Dynamic padding: use max length in this batch (causes recompilation)
+            max_len_in_batch = max(len(d) for d in batch_docs)
+            batch_seq_len = min(max_len_in_batch, self.max_length)
 
         input_ids = torch.full((self.batch_size, batch_seq_len), self.pad_id, dtype=torch.long)
         attention_mask = torch.zeros((self.batch_size, batch_seq_len), dtype=torch.long)
