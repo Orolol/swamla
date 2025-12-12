@@ -4,6 +4,13 @@
 # This script is a standalone version that doesn't depend on the main project
 # Auto-detects available GPUs and launches DDP training if multiple GPUs are found
 
+# Add Flash Attention 3 (Hopper) to PYTHONPATH if available
+FA3_PATH="$HOME/.local/flash-attention-3/flash-attention/hopper"
+if [ -d "$FA3_PATH" ]; then
+    export PYTHONPATH="$FA3_PATH:$PYTHONPATH"
+    echo "Flash Attention 3 path added: $FA3_PATH"
+fi
+
 BATCH_SIZE=${1:-4}
 BLOCK_SIZE=${2:-2048}
 OUTPUT_DIR=${3:-outputs/swa_mla_moe}

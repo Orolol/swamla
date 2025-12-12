@@ -1,6 +1,9 @@
 """
 FlashAttention-based CausalSelfAttention with variable-length sequence support.
 
+Supports both Flash Attention 3 (Hopper, for H100/H800) and Flash Attention 2.
+FA3 uses flash_attn_interface, FA2 uses flash_attn module.
+
 Uses flash_attn_varlen_func to skip padded tokens entirely, providing real
 compute savings when batches contain variable-length sequences.
 """
@@ -12,20 +15,41 @@ import torch
 import torch.nn as nn
 
 # Check Flash Attention availability
+# Priority: FA3 (Hopper) > FA2
 FLASH_ATTENTION_AVAILABLE = False
+FLASH_ATTENTION_VERSION = None
+flash_attn_func = None
 flash_attn_varlen_func = None
 unpad_input = None
 pad_input = None
 
+# Try Flash Attention 3 (Hopper) first - for H100/H800
 try:
-    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
-    from flash_attn.bert_padding import unpad_input as _unpad_input, pad_input as _pad_input
-    flash_attn_varlen_func = _flash_attn_varlen_func
-    unpad_input = _unpad_input
-    pad_input = _pad_input
+    from flash_attn_interface import flash_attn_func as _flash_attn_func_fa3
+    from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func_fa3
+    flash_attn_func = _flash_attn_func_fa3
+    flash_attn_varlen_func = _flash_attn_varlen_func_fa3
     FLASH_ATTENTION_AVAILABLE = True
+    FLASH_ATTENTION_VERSION = 3
+    print("Flash Attention 3 (Hopper) available!")
 except ImportError:
     pass
+
+# Fall back to Flash Attention 2 if FA3 not available
+if not FLASH_ATTENTION_AVAILABLE:
+    try:
+        from flash_attn import flash_attn_func as _flash_attn_func_fa2
+        from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func_fa2
+        from flash_attn.bert_padding import unpad_input as _unpad_input, pad_input as _pad_input
+        flash_attn_func = _flash_attn_func_fa2
+        flash_attn_varlen_func = _flash_attn_varlen_func_fa2
+        unpad_input = _unpad_input
+        pad_input = _pad_input
+        FLASH_ATTENTION_AVAILABLE = True
+        FLASH_ATTENTION_VERSION = 2
+        print("Flash Attention 2 available!")
+    except ImportError:
+        print("Flash Attention 2 not available: No module named 'flash_attn'")
 
 
 def get_seq_lengths_from_labels(labels: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
@@ -119,7 +143,8 @@ class FlashCausalSelfAttention(nn.Module):
         # Log backend
         if FLASH_ATTENTION_AVAILABLE:
             window_info = f", window={self.window_size}" if self.window_size else ""
-            print(f"FlashCausalSelfAttention: Using Flash Attention varlen (padding-aware{window_info})")
+            version_info = f"FA{FLASH_ATTENTION_VERSION}" if FLASH_ATTENTION_VERSION else "FA"
+            print(f"FlashCausalSelfAttention: Using {version_info} (padding-aware{window_info})")
         else:
             print(f"FlashCausalSelfAttention: Flash Attention unavailable, using SDPA fallback")
 
@@ -184,10 +209,11 @@ class FlashCausalSelfAttention(nn.Module):
                 v = v.to(torch.bfloat16)
 
         # Use Flash Attention with varlen if available and we have padding info
-        if FLASH_ATTENTION_AVAILABLE and attention_mask is not None:
+        if FLASH_ATTENTION_AVAILABLE and attention_mask is not None and FLASH_ATTENTION_VERSION == 2:
+            # FA2 with varlen (requires unpad_input/pad_input helpers)
             output = self._flash_attention_varlen(q, k, v, attention_mask, B, T)
-        elif FLASH_ATTENTION_AVAILABLE and attention_mask is None:
-            # No padding info - use standard flash attention path
+        elif FLASH_ATTENTION_AVAILABLE:
+            # FA3 or FA2 without varlen - use standard flash attention path
             output = self._flash_attention_standard(q, k, v)
         else:
             # Fallback to SDPA
@@ -283,6 +309,7 @@ class FlashCausalSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Standard Flash Attention (no variable length, all tokens computed).
+        Works with both FA2 and FA3.
 
         Args:
             q, k, v: Tensors of shape (B, T, n_head, head_dim)
@@ -290,8 +317,6 @@ class FlashCausalSelfAttention(nn.Module):
         Returns:
             Output tensor of shape (B, T, n_head, head_dim)
         """
-        from flash_attn import flash_attn_func
-
         # GQA: expand K, V heads if needed
         if self.n_head_kv != self.n_head:
             k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
@@ -303,13 +328,24 @@ class FlashCausalSelfAttention(nn.Module):
         else:
             window = (-1, -1)
 
-        output = flash_attn_func(
-            q, k, v,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            causal=True,
-            window_size=window,
-            softmax_scale=self.scale,
-        )
+        # Use the globally imported flash_attn_func (FA2 or FA3)
+        if FLASH_ATTENTION_VERSION == 3:
+            # FA3 API: slightly different parameter names
+            output = flash_attn_func(
+                q, k, v,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=window,
+            )
+        else:
+            # FA2 API
+            output = flash_attn_func(
+                q, k, v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                causal=True,
+                window_size=window,
+                softmax_scale=self.scale,
+            )
 
         return output
 
