@@ -194,35 +194,44 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     if optimizer_type == 'muon':
         try:
             from muon import Muon
-            print("Using Muon optimizer for 2D+ parameters, AdamW for others")
-            
-            # Muon params (>= 2D)
+
+            # Muon typically needs much higher LR than AdamW
+            # Typical: Muon LR = 0.02, AdamW LR = 1e-4
+            # Scale Muon LR relative to provided LR (assuming LR is for AdamW)
+            muon_lr = learning_rate * 200  # e.g., 1e-4 -> 0.02
+            adamw_lr = learning_rate
+
+            print(f"Using Muon optimizer for 2D+ parameters (lr={muon_lr:.4f})")
+            print(f"Using AdamW optimizer for 1D parameters (lr={adamw_lr:.6f})")
+
+            # Muon params (>= 2D, excluding embeddings for stability)
             muon_params = []
-            # AdamW params (< 2D, biases, norms, embeddings if desired)
+            # AdamW params (< 2D, biases, norms, embeddings)
             adamw_params = []
-            
+
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-                    
-                # Embeddings and Head
-                # Usually Muon is good for internal layers. 
-                # Let's put embeddings/head in AdamW for stability or Muon?
-                # DeepSeek/Apple suggest Muon for all weights.
-                
-                if param.ndim >= 2:
+
+                # Keep embeddings and lm_head in AdamW for stability
+                # These tend to be sensitive to large updates
+                if any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
+                    adamw_params.append(param)
+                elif param.ndim >= 2:
                     muon_params.append(param)
                 else:
                     adamw_params.append(param)
-            
+
             optimizers = []
             if muon_params:
-                optimizers.append(Muon(muon_params, lr=learning_rate, momentum=0.95))
+                print(f"  Muon: {len(muon_params)} parameter tensors")
+                optimizers.append(Muon(muon_params, lr=muon_lr, momentum=0.95))
             if adamw_params:
-                optimizers.append(torch.optim.AdamW(adamw_params, lr=learning_rate, betas=betas, weight_decay=weight_decay))
-                
-            return optimizers # Return list of optimizers
-            
+                print(f"  AdamW: {len(adamw_params)} parameter tensors")
+                optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay))
+
+            return optimizers  # Return list of optimizers
+
         except ImportError:
             print("Muon optimizer not found, falling back to AdamW")
             optimizer_type = 'adamw'
@@ -620,6 +629,9 @@ def train(args):
         v_head_dim=args.mla_v_head_dim,
         use_gradient_checkpointing=args.gradient_checkpointing,
         use_te_fp8=use_te_fp8,
+        # Attention backend options
+        use_flash_attention=args.use_flash_attention,
+        use_gated_deltanet=args.use_gated_deltanet,
         # Neural Memory parameters
         use_neural_memory=args.use_neural_memory,
         memory_dim=args.memory_dim,
@@ -771,20 +783,31 @@ def train(args):
 
     # Adjust starting step
     start_step = resume_step
-    for step in range(start_step, args.max_iters):
-        # Update learning rate
-        lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
 
-        optimizers_list = optimizer if isinstance(optimizer, list) else [optimizer]
-        
-        for opt in optimizers_list:
-            for param_group in opt.param_groups:
+    # Store initial LR ratios for each optimizer to maintain proportions during scheduling
+    # This is important for Muon which uses a much higher LR than AdamW
+    optimizers_list = optimizer if isinstance(optimizer, list) else [optimizer]
+    initial_lrs = []
+    for opt in optimizers_list:
+        opt_lrs = [pg['lr'] for pg in opt.param_groups]
+        initial_lrs.append(opt_lrs)
+
+    for step in range(start_step, args.max_iters):
+        # Update learning rate - compute the schedule ratio
+        scheduled_lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
+        lr_ratio = scheduled_lr / args.learning_rate if args.learning_rate > 0 else 1.0
+
+        # Apply ratio to each optimizer's initial LR to maintain proportions
+        for opt_idx, opt in enumerate(optimizers_list):
+            for pg_idx, param_group in enumerate(opt.param_groups):
+                new_lr = initial_lrs[opt_idx][pg_idx] * lr_ratio
                 if isinstance(param_group['lr'], torch.Tensor):
-                    # Tensor lr (some optimizers): use .fill_()
-                    param_group['lr'].fill_(lr)
+                    param_group['lr'].fill_(new_lr)
                 else:
-                    # Standard optimizer: direct assignment
-                    param_group['lr'] = lr
+                    param_group['lr'] = new_lr
+
+        # For logging, use the base scheduled LR
+        lr = scheduled_lr
 
         # Training step with gradient accumulation
         model.train()
@@ -1043,8 +1066,15 @@ def main():
     parser.add_argument('--memory_reset_interval', type=int, default=0,
                         help='Reset memory states every N steps (0=never reset)')
 
+    # Attention backend options
+    parser.add_argument('--use_flash_attention', action='store_true', default=False,
+                        help='Use Flash Attention for SWA and MLA blocks')
+    parser.add_argument('--use_gated_deltanet', action='store_true', default=False,
+                        help='Replace SWA blocks with GatedDeltaNet (linear O(n) attention)')
+
     # MoE parameters (only applied to MLA blocks)
-    parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
+    parser.add_argument('--use_moe', action='store_true', default=False, help='Enable MoE for MLA blocks')
+    parser.add_argument('--no_moe', action='store_true', default=False, help='Disable MoE (for compatibility)')
     parser.add_argument('--n_experts', type=int, default=32, help='Number of routed experts')
     parser.add_argument('--n_shared_experts', type=int, default=1, help='Number of shared experts (always active)')
     parser.add_argument('--n_activated', type=int, default=3, help='Number of routed experts activated per token')
@@ -1064,7 +1094,7 @@ def main():
     parser.add_argument('--gradient_checkpointing', action='store_true')
 
     # Optimizer
-    parser.add_argument('--optimizer_type', type=str, default='adamw', choices=['adamw', 'lion'])
+    parser.add_argument('--optimizer_type', type=str, default='adamw', choices=['adamw', 'lion', 'muon'])
     parser.add_argument('--use_fp8', action='store_true')
 
     # TF32 precision control (Ampere+ GPUs)

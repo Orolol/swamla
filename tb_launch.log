@@ -1,8 +1,9 @@
-pyenv: tensorboard: command not found
+/home/orolol/.pyenv/versions/3.12.2/envs/cuda13/lib/python3.12/site-packages/tensorboard/default.py:30: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+TensorFlow installation not found - running with reduced feature set.
 
-The `tensorboard' command exists in these Python versions:
-  3.12.2/envs/5090
-  5090
+NOTE: Using experimental fast data loading logic. To disable, pass
+    "--load_fast=false" and report issues on GitHub. More details:
+    https://github.com/tensorflow/tensorboard/issues/4784
 
-Note: See 'pyenv help global' for tips on allowing both
-      python2 and python3 to be found.
+TensorBoard 2.20.0 at http://Fractal.localdomain:6006/ (Press CTRL+C to quit)

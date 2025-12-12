@@ -30,12 +30,21 @@ except ImportError:
     print("Note: fast_loader not installed. Install with: pip install git+https://github.com/Orolol/data-loader-fast.git")
 
 
-def create_model_and_optimizer(size, vocab_size, block_size, device):
-    """Create a fresh model and optimizer."""
+def create_model_and_optimizer(size, vocab_size, block_size, device, use_flash_attention=False, use_varlen_masking=False, use_gated_deltanet=False):
+    """Create a fresh model and optimizer.
+
+    Args:
+        use_flash_attention: If True, use FlashCausalSelfAttention (supports sliding window natively)
+        use_varlen_masking: If True, use varlen to skip padded tokens (slower with dynamic shapes)
+        use_gated_deltanet: If True, use GatedDeltaNet (linear attention O(n)) instead of SWA
+    """
     model = create_swa_mla_model(
         size=size,
         vocab_size=vocab_size,
         block_size=block_size,
+        use_flash_attention=use_flash_attention,
+        use_varlen_masking=use_varlen_masking,
+        use_gated_deltanet=use_gated_deltanet,
     )
     model = model.to(device)
     model = torch.compile(model, mode='reduce-overhead')
@@ -53,6 +62,8 @@ def benchmark_dataloader(
     batch_size: int = 4,
     block_size: int = 512,
     tokenizer=None,
+    use_flash_attention: bool = False,
+    use_gated_deltanet: bool = False,
 ):
     """Run benchmark for a single dataloader."""
     print(f"\n{'='*60}")
@@ -61,9 +72,9 @@ def benchmark_dataloader(
 
     # Create dataloader
     print(f"Creating {dataloader_name}...")
-
-    if dataloader_class == PackedFinewebDataset:
-        dataset = dataloader_class(
+    
+    
+    dataset = dataloader_class(
             split="train",
             max_length=block_size,
             batch_size=batch_size,
@@ -75,32 +86,56 @@ def benchmark_dataloader(
             num_workers=1,
             start_offset=0,
         )
-    elif dataloader_class == FastFinewebDataset:
-        dataset = dataloader_class(
-            split="train",
-            max_length=block_size,
-            batch_size=batch_size,
-            buffer_docs=10240,
-            prefetch_batches=512,
-            shuffle=True,
-            tokenizer=tokenizer,
-            num_workers=1,
-            start_offset=0,
-        )
-    elif EXTERNAL_FAST_LOADER_AVAILABLE and dataloader_class == ExternalFastLoader:
-        # External fast_loader from github.com/Orolol/data-loader-fast
-        dataset = dataloader_class(
-            split="train",
-            max_length=block_size,
-            batch_size=batch_size,
-            tokenizer=tokenizer,
-        )
-    else:
-        raise ValueError(f"Unknown dataloader class: {dataloader_class}")
+
+    # if dataloader_class == PackedFinewebDataset:
+    #     dataset = dataloader_class(
+    #         split="train",
+    #         max_length=block_size,
+    #         batch_size=batch_size,
+    #         buffer_docs=10240,
+    #         prefetch_batches=512,
+    #         shuffle=True,
+    #         shuffle_buffer_size=5000,
+    #         tokenizer=tokenizer,
+    #         num_workers=1,
+    #         start_offset=0,
+    #     )
+    # elif dataloader_class == FastFinewebDataset:
+    #     dataset = dataloader_class(
+    #         split="train",
+    #         max_length=block_size,
+    #         batch_size=batch_size,
+    #         buffer_docs=10240,
+    #         prefetch_batches=512,
+    #         shuffle=True,
+    #         tokenizer=tokenizer,
+    #         num_workers=1,
+    #         start_offset=0,
+    #     )
+    # elif EXTERNAL_FAST_LOADER_AVAILABLE and dataloader_class == ExternalFastLoader:
+    #     # External fast_loader from github.com/Orolol/data-loader-fast
+    #     dataset = dataloader_class(
+    #         split="train",
+    #         max_length=block_size,
+    #         batch_size=batch_size,
+    #         tokenizer=tokenizer,
+    #     )
+    # else:
+    #     raise ValueError(f"Unknown dataloader class: {dataloader_class}")
 
     # Create fresh model and optimizer for this benchmark
-    print(f"Creating fresh model ({size})...")
-    model, optimizer = create_model_and_optimizer(size, vocab_size, block_size, device)
+    if use_gated_deltanet:
+        attn_type = "GatedDeltaNet"
+    elif use_flash_attention:
+        attn_type = "FlashAttention"
+    else:
+        attn_type = "SDPA"
+    print(f"Creating fresh model ({size}) with {attn_type}...")
+    model, optimizer = create_model_and_optimizer(
+        size, vocab_size, block_size, device,
+        use_flash_attention=use_flash_attention,
+        use_gated_deltanet=use_gated_deltanet
+    )
 
     # Warmup: wait for prefetch buffer to fill
     print("Waiting for prefetch buffer to fill...")
@@ -125,6 +160,9 @@ def benchmark_dataloader(
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
+        # Mark step begin for CUDAGraphs compatibility with torch.compile
+        torch.compiler.cudagraph_mark_step_begin()
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             # Model returns (logits, loss) when targets are provided
             _, loss = model(input_ids, targets=labels)
@@ -148,6 +186,9 @@ def benchmark_dataloader(
         labels = batch["labels"].to(device)
         torch.cuda.synchronize()
         data_end = time.perf_counter()
+
+        # Mark step begin for CUDAGraphs compatibility with torch.compile
+        torch.compiler.cudagraph_mark_step_begin()
 
         # Forward pass
         forward_start = time.perf_counter()
@@ -271,13 +312,33 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
-    # Benchmark both dataloaders (each with fresh model)
+    # Benchmark configurations:
+    # 1. Packed + SDPA (standard PyTorch attention, compiled)
+    # 2. Fast + FlashAttention (FlashCausalSelfAttention with native sliding window)
     results = []
 
-    # 1. Packed dataloader
+    # # 1. Packed dataloader + SDPA
+    # results.append(benchmark_dataloader(
+    #     PackedFinewebDataset,
+    #     "Packed + SDPA",
+    #     size=args.size,
+    #     vocab_size=vocab_size,
+    #     device=device,
+    #     num_steps=args.num_steps,
+    #     batch_size=args.batch_size,
+    #     block_size=args.block_size,
+    #     tokenizer=tokenizer,
+    #     use_flash_attention=False,
+    # ))
+
+    # # Clear GPU memory between tests
+    # torch.cuda.empty_cache()
+    # time.sleep(2)
+
+    # 2. Packed dataloader + FlashAttention
     results.append(benchmark_dataloader(
         PackedFinewebDataset,
-        "PackedFinewebDataset",
+        "SWA + FlashAttn",
         size=args.size,
         vocab_size=vocab_size,
         device=device,
@@ -285,16 +346,35 @@ def main():
         batch_size=args.batch_size,
         block_size=args.block_size,
         tokenizer=tokenizer,
+        use_flash_attention=True,  # Uses FlashCausalSelfAttention with native window_size
     ))
 
-    # Clear GPU memory between tests
-    torch.cuda.empty_cache()
-    time.sleep(2)
+    # # Clear GPU memory between tests
+    # torch.cuda.empty_cache()
+    # time.sleep(2)
 
-    # 2. Fast dataloader (local)
+    # # 3. Packed dataloader + GatedDeltaNet (linear O(n) attention)
+    # results.append(benchmark_dataloader(
+    #     PackedFinewebDataset,
+    #     "SPDA + DeltaNet",
+    #     size=args.size,
+    #     vocab_size=vocab_size,
+    #     device=device,
+    #     num_steps=args.num_steps,
+    #     batch_size=args.batch_size,
+    #     block_size=args.block_size,
+    #     tokenizer=tokenizer,
+    #     use_flash_attention=False,
+    #     use_gated_deltanet=True,  # Uses GatedDeltaNet linear attention
+    # ))
+    
+    # torch.cuda.empty_cache()
+    # time.sleep(2)
+
+    # 4. Flash + GatedDeltaNet (linear O(n) attention)
     results.append(benchmark_dataloader(
-        FastFinewebDataset,
-        "FastFinewebDataset",
+        PackedFinewebDataset,
+        "Flash + DeltaNet",
         size=args.size,
         vocab_size=vocab_size,
         device=device,
@@ -302,24 +382,10 @@ def main():
         batch_size=args.batch_size,
         block_size=args.block_size,
         tokenizer=tokenizer,
+        use_flash_attention=True,
+        use_gated_deltanet=True,  # Uses GatedDeltaNet linear attention
     ))
 
-    # 3. External fast_loader (if available)
-    if EXTERNAL_FAST_LOADER_AVAILABLE:
-        torch.cuda.empty_cache()
-        time.sleep(2)
-
-        results.append(benchmark_dataloader(
-            ExternalFastLoader,
-            "ExternalFastLoader",
-            size=args.size,
-            vocab_size=vocab_size,
-            device=device,
-            num_steps=args.num_steps,
-            batch_size=args.batch_size,
-            block_size=args.block_size,
-            tokenizer=tokenizer,
-        ))
 
     # Summary
     print(f"\n{'='*60}")

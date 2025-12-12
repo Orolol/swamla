@@ -469,72 +469,33 @@ class MoELayer(nn.Module):
         weights_sorted = weights_flat[sorted_indices]
 
         # 4. Compute expert outputs with contiguous batches
-        
+
         # Check if we can use Triton optimization
         # Note: BatchedExperts stores weights as [E, Out, In]
         # gate_up_weight: [E, 2*d_ff, d_model]
         # down_weight: [E, d_model, d_ff]
-        
+
         # Cumulative sum gives us end positions for each expert
         cumsum = torch.cumsum(tokens_per_expert, dim=0)
 
-        # Disable Triton for now as it proved slower than cuBLAS loop
-        use_triton = False 
-        # use_triton = TRITON_AVAILABLE and x.is_cuda and self.experts.gate_up_bias is None and self.experts.down_bias is None
-        
-        if use_triton:
-            # Prepare offsets
-            expert_offsets = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum])
-            
-            # 1. GateUp Projection
-            # We want x @ W.T
-            # W is [E, 2*d_ff, d_model]
-            # W.T is [E, d_model, 2*d_ff]
-            # moe_gemm expects B as [E, K, N]
-            # Here K=d_model, N=2*d_ff
-            # So we pass W.transpose(1, 2)
-            
-            gate_up_w_t = self.experts.gate_up_weight.transpose(1, 2)
-            
-            combined = moe_gemm(x_sorted, gate_up_w_t, expert_offsets)
-            
-            # 2. SwiGLU
-            gate, up = combined.chunk(2, dim=-1)
-            hidden = F.silu(gate) * up
-            
-            # 3. Down Projection
-            # W is [E, d_model, d_ff]
-            # W.T is [E, d_ff, d_model]
-            # moe_gemm expects B as [E, K, N]
-            # Here K=d_ff, N=d_model
-            # So we pass W.transpose(1, 2)
-            
-            down_w_t = self.experts.down_weight.transpose(1, 2)
-            
-            outputs_sorted = moe_gemm(hidden, down_w_t, expert_offsets)
-            
-            # Apply weights
-            outputs_sorted = outputs_sorted * weights_sorted
-            
+        # Use padded batched GEMM approach for better GPU utilization
+        # This eliminates the Python loop overhead by using a single batched operation
+        use_padded_bmm = True
+
+        if use_padded_bmm:
+            outputs_sorted = self._compute_experts_padded_bmm(
+                x_sorted, weights_sorted, tokens_per_expert, cumsum, B_S, K, D, device, dtype
+            )
         else:
             outputs_sorted = torch.zeros(B_S * K, D, device=device, dtype=dtype)
 
             # Start positions: [0, cumsum[0], cumsum[1], ...]
             starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
 
-            # Use tensor indexing to allow torch.compile to capture the loop
-            # starts_list = starts.tolist()
-            # cumsum_list = cumsum.tolist()
-            # counts_list = tokens_per_expert.tolist()
-
             for expert_idx in range(self.n_experts):
-                # count = counts_list[expert_idx]
-                # if count == 0:
-                #     continue
-
                 start = starts[expert_idx]
                 end = cumsum[expert_idx]
-                
+
                 # Get contiguous batch for this expert
                 expert_input = x_sorted[start:end]  # [count, D]
 
@@ -542,16 +503,16 @@ class MoELayer(nn.Module):
                 # gate_up
                 w_gate_up = self.experts.gate_up_weight[expert_idx] # [2*d_ff, d_model]
                 b_gate_up = self.experts.gate_up_bias[expert_idx] if self.experts.gate_up_bias is not None else None
-                
+
                 combined = F.linear(expert_input, w_gate_up, b_gate_up)
-                
+
                 gate, up = combined.chunk(2, dim=-1)
                 hidden = F.silu(gate) * up
-                
+
                 # down
                 w_down = self.experts.down_weight[expert_idx] # [d_model, d_ff]
                 b_down = self.experts.down_bias[expert_idx] if self.experts.down_bias is not None else None
-                
+
                 expert_output = F.linear(hidden, w_down, b_down)
 
                 # Apply weights and store
@@ -567,6 +528,98 @@ class MoELayer(nn.Module):
         output = outputs_expanded.view(B_S, K, D).sum(dim=1)
 
         return output
+
+    def _compute_experts_padded_bmm(
+        self,
+        x_sorted: torch.Tensor,
+        weights_sorted: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        cumsum: torch.Tensor,
+        B_S: int,
+        K: int,
+        D: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Compute expert outputs using padded batched matrix multiplication.
+
+        This approach pads all expert batches to the same size and uses
+        torch.bmm for a single fused operation, eliminating Python loop overhead.
+
+        Trade-off: Some wasted compute on padding, but much better GPU utilization
+        due to reduced kernel launch overhead.
+        """
+        E = self.n_experts
+        d_ff = self.expert_dim
+        total_tokens = B_S * K
+
+        # Use a safe upper bound for max_tokens to avoid index out of bounds
+        # Worst case: all tokens go to one expert = total_tokens
+        # But we cap it to avoid excessive memory usage
+        # With 32 experts and top-3, expected max is ~3x average = 3 * total_tokens / 32
+        # Use 4x average as safe bound, capped at total_tokens
+        max_tokens = min(total_tokens, (total_tokens * 4 + E - 1) // E)
+        # Round up to power of 2 for memory alignment
+        max_tokens = 1 << (max_tokens - 1).bit_length() if max_tokens > 0 else 64
+        max_tokens = max(64, max_tokens)
+
+        # Build vectorized scatter/gather indices - fully vectorized, no Python loops
+        starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
+
+        # Create expert_ids by repeating each expert index by its token count
+        # e.g., if tokens_per_expert = [3, 2, 1], expert_ids = [0, 0, 0, 1, 1, 2]
+        expert_ids = torch.repeat_interleave(
+            torch.arange(E, device=device),
+            tokens_per_expert
+        )
+
+        # Create positions within each expert batch
+        # positions[i] = i - starts[expert_ids[i]]
+        # e.g., for expert_ids = [0, 0, 0, 1, 1, 2], positions = [0, 1, 2, 0, 1, 0]
+        arange_total = torch.arange(total_tokens, device=device)
+        positions = arange_total - starts[expert_ids]
+
+        # Clamp positions to valid range to prevent out-of-bounds access
+        # This handles edge cases where routing is extremely imbalanced
+        positions = positions.clamp(0, max_tokens - 1)
+
+        # Create padded input tensor using advanced indexing
+        # x_padded[e, pos] = x_sorted[i] where expert_ids[i] == e and positions[i] == pos
+        x_padded = torch.zeros(E, max_tokens, D, device=device, dtype=dtype)
+        weights_padded = torch.zeros(E, max_tokens, 1, device=device, dtype=dtype)
+
+        # Scatter inputs into padded tensor
+        x_padded[expert_ids, positions] = x_sorted
+        weights_padded[expert_ids, positions] = weights_sorted
+
+        # Batched gate_up projection: [E, max_tokens, D] @ [E, D, 2*d_ff] -> [E, max_tokens, 2*d_ff]
+        # gate_up_weight is [E, 2*d_ff, D], need to transpose last two dims
+        combined = torch.bmm(x_padded, self.experts.gate_up_weight.transpose(1, 2))
+
+        # Add bias if present
+        if self.experts.gate_up_bias is not None:
+            combined = combined + self.experts.gate_up_bias.unsqueeze(1)  # [E, 1, 2*d_ff]
+
+        # SwiGLU activation
+        gate, up = combined.chunk(2, dim=-1)  # Each [E, max_tokens, d_ff]
+        hidden = F.silu(gate) * up
+
+        # Batched down projection: [E, max_tokens, d_ff] @ [E, d_ff, D] -> [E, max_tokens, D]
+        # down_weight is [E, D, d_ff], need to transpose last two dims
+        expert_outputs = torch.bmm(hidden, self.experts.down_weight.transpose(1, 2))
+
+        # Add bias if present
+        if self.experts.down_bias is not None:
+            expert_outputs = expert_outputs + self.experts.down_bias.unsqueeze(1)  # [E, 1, D]
+
+        # Apply gating weights
+        expert_outputs = expert_outputs * weights_padded
+
+        # Gather outputs back using the same indices
+        outputs_sorted = expert_outputs[expert_ids, positions].to(dtype)
+
+        return outputs_sorted
 
     def get_aux_loss(self) -> torch.Tensor:
         """Return auxiliary loss (z-loss from router)."""

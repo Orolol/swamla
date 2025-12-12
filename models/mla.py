@@ -15,6 +15,13 @@ except ImportError:
     def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
         return nn.Linear(in_features, out_features, bias=bias)
 
+# Import Flash Attention
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
 
 class MLA(nn.Module):
     """
@@ -101,6 +108,11 @@ class MLA(nn.Module):
         self.max_batch_size = getattr(config, 'max_batch_size', 8)
         self.max_seq_len = getattr(config, 'max_seq_len', 4096)
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
+
+        # Flash Attention support
+        self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
+        if self.use_flash_attention:
+            print(f"MLA: Using Flash Attention")
         
         # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
@@ -244,29 +256,34 @@ class MLA(nn.Module):
                 k_to_use = k
                 v_to_use = v
             
-            # Reshape for SDPA: [B, H, S, D]
-            q_sdpa = q.transpose(1, 2)  # [B, H, S, D]
-            k_sdpa = k_to_use.transpose(1, 2)  # [B, H, T, D]
-            v_sdpa = v_to_use.transpose(1, 2)  # [B, H, T, D]
-            
-            # Use SDPA for attention computation
-            # Expand mask if provided from [S, T] to [B, H, S, T]
-            attn_mask = None
-            if mask is not None:
-                attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
-                # Ensure mask has the same dtype as query tensor for SDPA compatibility
-                attn_mask = attn_mask.to(q_sdpa.dtype)
+            if self.use_flash_attention and mask is None:
+                # Use Flash Attention (expects B, T, H, D)
+                # q, k_to_use, v_to_use are already (B, T, H, D)
+                x = self._flash_attention(q, k_to_use, v_to_use, causal=seqlen > 1)
+            else:
+                # Reshape for SDPA: [B, H, S, D]
+                q_sdpa = q.transpose(1, 2)  # [B, H, S, D]
+                k_sdpa = k_to_use.transpose(1, 2)  # [B, H, T, D]
+                v_sdpa = v_to_use.transpose(1, 2)  # [B, H, T, D]
 
-            attn_output = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=mask is None and seqlen > 1,  # Use causal mask if no explicit mask provided
-                scale=self.softmax_scale
-            )
-            
-            # Transpose back to [B, S, H, D]
-            x = attn_output.transpose(1, 2)
+                # Use SDPA for attention computation
+                # Expand mask if provided from [S, T] to [B, H, S, T]
+                attn_mask = None
+                if mask is not None:
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+                    # Ensure mask has the same dtype as query tensor for SDPA compatibility
+                    attn_mask = attn_mask.to(q_sdpa.dtype)
+
+                attn_output = F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=mask is None and seqlen > 1,  # Use causal mask if no explicit mask provided
+                    scale=self.softmax_scale
+                )
+
+                # Transpose back to [B, S, H, D]
+                x = attn_output.transpose(1, 2)
         else:
             # Optimized approach: use low-rank decomposition
             # Extract weight for wkv_b
@@ -293,38 +310,45 @@ class MLA(nn.Module):
             # For the optimized approach, we need to project values through low-rank space
             # First, extract values from the low-rank representation
             v = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, -self.v_head_dim:])
-            
-            # Reshape queries for SDPA - keep q_nope and q_pe in their original dimensions
+
+            # Reshape queries - keep q_nope and q_pe in their original dimensions
             q_full = torch.cat([q_nope, q_pe], dim=-1)  # Combine q components [B, S, H, D]
-            q_sdpa = q_full.transpose(1, 2)  # [B, H, S, D]
-            
+
             # For keys, we need to reconstruct from low-rank space
             k_nope_full = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, :self.qk_nope_head_dim])
             # Properly expand pe_to_use from [B, T, D] to [B, T, H, D] where each head gets the same RoPE
             # This ensures consistent rotary positional encoding across all attention heads
             pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
             k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
-            k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
-            v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
 
-            # Use SDPA for attention computation
-            # Expand mask if provided from [S, T] to [B, H, S, T]
-            attn_mask = None
-            if mask is not None:
-                attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
-                # Ensure mask has the same dtype as query tensor for SDPA compatibility
-                attn_mask = attn_mask.to(q_sdpa.dtype)
+            if self.use_flash_attention and mask is None:
+                # Use Flash Attention (expects B, T, H, D)
+                # q_full, k_full are (B, T, H, qk_head_dim), v is (B, T, H, v_head_dim)
+                x = self._flash_attention(q_full, k_full, v, causal=seqlen > 1)
+            else:
+                # Reshape for SDPA: [B, H, S, D]
+                q_sdpa = q_full.transpose(1, 2)  # [B, H, S, D]
+                k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
+                v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
 
-            attn_output = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=mask is None and seqlen > 1,
-                scale=self.softmax_scale
-            )
-            
-            # Transpose back to [B, S, H, D]
-            x = attn_output.transpose(1, 2)
+                # Use SDPA for attention computation
+                # Expand mask if provided from [S, T] to [B, H, S, T]
+                attn_mask = None
+                if mask is not None:
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+                    # Ensure mask has the same dtype as query tensor for SDPA compatibility
+                    attn_mask = attn_mask.to(q_sdpa.dtype)
+
+                attn_output = F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=mask is None and seqlen > 1,
+                    scale=self.softmax_scale
+                )
+
+                # Transpose back to [B, S, H, D]
+                x = attn_output.transpose(1, 2)
         
         # Reshape and project to output dimension
         x = x.reshape(bsz, seqlen, -1)
@@ -339,6 +363,57 @@ class MLA(nn.Module):
         
         return x
     
+    def _flash_attention(self, q, k, v, causal=True):
+        """
+        Run Flash Attention with proper dtype and dimension handling.
+
+        Args:
+            q: (B, T, H, D_qk) queries
+            k: (B, T, H, D_qk) keys
+            v: (B, T, H, D_v) values - may have different head dim
+            causal: whether to use causal masking
+
+        Returns:
+            output: (B, T, H, D_v)
+        """
+        # Flash Attention requires bf16 or fp16
+        orig_dtype = q.dtype
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+
+        # Flash Attention requires Q, K, V to have the same head dimension
+        # If V has different dimension, pad it
+        d_qk = q.shape[-1]
+        d_v = v.shape[-1]
+
+        if d_v != d_qk:
+            # Pad V to match Q/K dimension
+            pad_size = d_qk - d_v
+            v_padded = F.pad(v, (0, pad_size), value=0.0)
+        else:
+            v_padded = v
+
+        # Run Flash Attention
+        # flash_attn_func expects (B, T, H, D)
+        attn_output = flash_attn_func(
+            q, k, v_padded,
+            dropout_p=self.dropout if self.training else 0.0,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+        )
+
+        # Remove padding from output if we padded V
+        if d_v != d_qk:
+            attn_output = attn_output[..., :d_v]
+
+        # Convert back to original dtype
+        if attn_output.dtype != orig_dtype:
+            attn_output = attn_output.to(orig_dtype)
+
+        return attn_output
+
     def clear_cache(self):
         """Explicitly clear all caches - useful for memory management during training"""
         self.k_cache = None

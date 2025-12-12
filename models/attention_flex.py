@@ -19,6 +19,7 @@ import torch.nn.functional as F
 # Check FlexAttention availability (PyTorch >= 2.5)
 FLEX_ATTENTION_AVAILABLE = False
 flex_attention = None
+flex_attention_compiled = None
 create_block_mask = None
 and_masks = None
 BlockMask = None
@@ -35,6 +36,10 @@ try:
     and_masks = _and_masks
     BlockMask = _BlockMask
     FLEX_ATTENTION_AVAILABLE = True
+
+    # Compile flex_attention to avoid dtype issues in unfused backward pass
+    # The unfused implementation has bugs with bfloat16 gradients
+    flex_attention_compiled = torch.compile(flex_attention)
 except ImportError:
     pass
 
@@ -136,6 +141,8 @@ def create_causal_padding_block_mask(
     padding_fn = create_padding_mask(seq_lengths)
     combined = and_masks(causal_mask, padding_fn)
 
+    # Use _compile=False for padding-aware masks because the closure
+    # capturing seq_lengths causes torch.compile tracing to fail
     return create_block_mask(
         combined,
         B=batch_size,
@@ -143,7 +150,7 @@ def create_causal_padding_block_mask(
         Q_LEN=max_seq_len,
         KV_LEN=max_seq_len,
         device=str(device),
-        _compile=True,
+        _compile=False,
     )
 
 
@@ -167,6 +174,8 @@ def create_sliding_window_padding_block_mask(
     sliding_fn = sliding_window_causal_mask(window_size, sink_size)
     combined = and_masks(sliding_fn, padding_fn)
 
+    # Use _compile=False for padding-aware masks because the closure
+    # capturing seq_lengths causes torch.compile tracing to fail
     return create_block_mask(
         combined,
         B=batch_size,
@@ -174,7 +183,7 @@ def create_sliding_window_padding_block_mask(
         Q_LEN=max_seq_len,
         KV_LEN=max_seq_len,
         device=str(device),
-        _compile=True,
+        _compile=False,
     )
 
 
@@ -301,6 +310,9 @@ class FlexCausalSelfAttention(nn.Module):
 
         # Create appropriate mask
         if seq_lengths is not None:
+            # Note: seq_lengths should already be cloned at the source (swa_mla_model.py)
+            # to prevent CUDAGraph overwrite issues
+
             # Padding-aware mask (per-batch, not cached)
             if self.attention_window is not None:
                 block_mask = create_sliding_window_padding_block_mask(
@@ -320,6 +332,7 @@ class FlexCausalSelfAttention(nn.Module):
                 )
         else:
             # Simple causal mask (cacheable)
+            cache_key = (batch_size, seq_len, str(device), self.attention_window)
             block_mask = create_causal_block_mask(
                 batch_size=batch_size,
                 seq_len=seq_len,
@@ -338,7 +351,8 @@ class FlexCausalSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """FlexAttention forward pass."""
         # FlexAttention expects (B, H, T, D)
-        return flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
+        # Use compiled version to avoid dtype issues in unfused backward pass
+        return flex_attention_compiled(q, k, v, block_mask=block_mask, scale=self.scale)
 
     def _sdpa_attention(
         self,
@@ -398,6 +412,14 @@ class FlexCausalSelfAttention(nn.Module):
         if self.rope is not None:
             q = self.rope(q)
             k = self.rope(k)
+
+        # Ensure all tensors have the same dtype for FlexAttention
+        # RoPE or projections might cause dtype mismatches
+        target_dtype = q.dtype
+        if k.dtype != target_dtype:
+            k = k.to(target_dtype)
+        if v.dtype != target_dtype:
+            v = v.to(target_dtype)
 
         # Attention computation
         if FLEX_ATTENTION_AVAILABLE:

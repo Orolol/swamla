@@ -44,6 +44,20 @@ except ImportError:
         seq_lengths = masked_pos.max(dim=1).values + 1
         return torch.clamp(seq_lengths, min=1)
 
+# FlashAttention varlen support (padding-aware with real speedup)
+try:
+    from attention_flash import FlashCausalSelfAttention, FLASH_ATTENTION_AVAILABLE
+except ImportError:
+    FlashCausalSelfAttention = None
+    FLASH_ATTENTION_AVAILABLE = False
+
+# Gated DeltaNet support (linear attention O(n))
+try:
+    from gated_deltanet import GatedDeltaNetBlock, GATED_DELTANET_AVAILABLE
+except ImportError:
+    GatedDeltaNetBlock = None
+    GATED_DELTANET_AVAILABLE = False
+
 
 @dataclass
 class SWALayerConfig:
@@ -76,6 +90,8 @@ class SWALayerConfig:
     use_te_fp8: bool = False  # Use Transformer Engine native FP8 Linear layers
     # FlexAttention support (padding-aware attention)
     use_flex_attention: bool = False
+    # FlashAttention varlen support (padding-aware with real speedup)
+    use_flash_attention: bool = False
 
 
 class SWALocalBlock(nn.Module):
@@ -91,11 +107,21 @@ class SWALocalBlock(nn.Module):
             self.norm2 = RMSNorm(config.n_embd)
 
         # Choose attention implementation based on config
+        # Priority: FlashAttention (varlen) > FlexAttention > Standard
+        self.use_flash_attention = getattr(config, 'use_flash_attention', False)
         self.use_flex_attention = getattr(config, 'use_flex_attention', False)
-        if self.use_flex_attention and FlexCausalSelfAttention is not None:
+
+        if self.use_flash_attention and FlashCausalSelfAttention is not None:
+            self.attn = FlashCausalSelfAttention(config)
+            self.use_flex_attention = False  # Flash takes priority
+        elif self.use_flex_attention and FlexCausalSelfAttention is not None:
             self.attn = FlexCausalSelfAttention(config)
+            self.use_flash_attention = False
         else:
             self.attn = CausalSelfAttention(config)
+            if self.use_flash_attention and FlashCausalSelfAttention is None:
+                print("Warning: FlashAttention requested but not available, falling back to standard attention")
+                self.use_flash_attention = False
             if self.use_flex_attention and FlexCausalSelfAttention is None:
                 print("Warning: FlexAttention requested but not available, falling back to standard attention")
                 self.use_flex_attention = False
@@ -105,7 +131,7 @@ class SWALocalBlock(nn.Module):
         self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
     def _attn_block(self, x: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.use_flex_attention and seq_lengths is not None:
+        if (self.use_flash_attention or self.use_flex_attention) and seq_lengths is not None:
             return self.attn(self.norm1(x), seq_lengths=seq_lengths)
         else:
             return self.attn(self.norm1(x))
@@ -191,6 +217,12 @@ class SWAMLAConfig:
 
     # FlexAttention (padding-aware attention for real FLOPs savings)
     use_flex_attention: bool = False  # Use FlexAttention with BlockMask for SWA blocks
+    # FlashAttention varlen (padding-aware with flash_attn_varlen_func)
+    use_flash_attention: bool = False  # Use FlashAttention for SWA blocks
+    # Enable varlen masking (skip padded tokens) - only works with use_flash_attention=True
+    use_varlen_masking: bool = True  # Set to False to disable padding-aware attention
+    # Gated DeltaNet (linear attention O(n) - replaces SWA blocks)
+    use_gated_deltanet: bool = False  # Use GatedDeltaNet instead of SWA for local attention
 
     # MLA Selective specific parameters
     use_mla_selective: bool = False  # Use MLA Selective instead of standard MLA
@@ -363,8 +395,14 @@ class SWAMLAModel(nn.Module):
                     use_te_fp8=config.use_te_fp8,
                     # FlexAttention for padding-aware attention
                     use_flex_attention=config.use_flex_attention,
+                    # FlashAttention varlen for padding-aware attention (recommended)
+                    use_flash_attention=config.use_flash_attention,
                 )
-                block = SWALocalBlock(layer_config)
+                # Choose between SWA and GatedDeltaNet
+                if config.use_gated_deltanet and GatedDeltaNetBlock is not None:
+                    block = GatedDeltaNetBlock(layer_config)
+                else:
+                    block = SWALocalBlock(layer_config)
             else:
                 # MLA Layer
                 scaled_rank = int(config.kv_lora_rank * scale_factor)
@@ -488,10 +526,13 @@ class SWAMLAModel(nn.Module):
         # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
         freqs_cis = self.freqs_cis[:t].to(device, non_blocking=True).detach()
 
-        # Extract sequence lengths for FlexAttention (to skip padded positions)
+        # Extract sequence lengths for FlexAttention/FlashAttention (to skip padded positions)
+        # Clone immediately to prevent CUDAGraph overwrite issues
+        # See: https://pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html
         seq_lengths = None
-        if self.config.use_flex_attention and targets is not None:
-            seq_lengths = get_seq_lengths_from_labels(targets, ignore_index=-100)
+        use_varlen = getattr(self.config, 'use_varlen_masking', True)
+        if use_varlen and (self.config.use_flex_attention or self.config.use_flash_attention) and targets is not None:
+            seq_lengths = get_seq_lengths_from_labels(targets, ignore_index=-100).clone()
 
         # Track memory states for MLAMemoryBlocks
         new_memory_states = []
@@ -707,6 +748,8 @@ def _create_mla_block_config(config: SWAMLAConfig):
         n_activated: int = config.n_activated
         expert_dim: int = config.expert_dim
         router_z_loss_coef: float = config.router_z_loss_coef
+        # Flash Attention for MLA
+        use_flash_attention: bool = config.use_flash_attention
 
     return _Config()
 
@@ -728,7 +771,7 @@ def create_swa_mla_model(
         "moe-1b": dict(  # ~770M total, ~250M active
             n_layer=12, n_embd=768, n_head=12,
             swa_layers_per_cycle=2, mla_layers_per_cycle=1,
-            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=768 * 3,
+            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=512 * 3,
         ),
         "moe-2b": dict(  # ~1.5B total, ~400M active
             n_layer=18, n_embd=1024, n_head=16,
