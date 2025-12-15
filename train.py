@@ -379,7 +379,10 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
 
         # Add optimizer state and step if provided (for resuming)
         if optimizer is not None:
-            checkpoint_data['optimizer_state_dict'] = optimizer.state_dict()
+            if isinstance(optimizer, list):
+                checkpoint_data['optimizer_state_dict'] = [opt.state_dict() for opt in optimizer]
+            else:
+                checkpoint_data['optimizer_state_dict'] = optimizer.state_dict()
         if step is not None:
             checkpoint_data['step'] = step
 
@@ -707,9 +710,9 @@ def train(args):
 
         else:
             # 'max-autotune' for non-FP8 training
-            model = torch.compile(model, mode='max-autotune')
+            model = torch.compile(model, mode='reduce-overhead')
             if master_process:
-                print("  Using 'max-autotune' mode")
+                print("  Using 'reduce-overhead' mode")
 
     # Wrap with DDP
     if is_ddp:
@@ -747,7 +750,22 @@ def train(args):
         if master_process:
             print("Loading optimizer state from checkpoint...")
         try:
-            optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+            saved_state = resume_checkpoint['optimizer_state_dict']
+            if isinstance(optimizer, list) and isinstance(saved_state, list):
+                # Multiple optimizers (e.g., Muon setup)
+                for opt, state in zip(optimizer, saved_state):
+                    opt.load_state_dict(state)
+            elif isinstance(optimizer, list):
+                # Optimizer is list but saved state is single - skip
+                if master_process:
+                    print("⚠ Optimizer structure mismatch (list vs single) - using fresh optimizer state")
+            elif isinstance(saved_state, list):
+                # Saved state is list but optimizer is single - skip
+                if master_process:
+                    print("⚠ Optimizer structure mismatch (single vs list) - using fresh optimizer state")
+            else:
+                # Both are single optimizers
+                optimizer.load_state_dict(saved_state)
             if master_process:
                 print("✓ Optimizer state loaded")
         except Exception as e:
@@ -881,7 +899,12 @@ def train(args):
 
         # Gradient clipping
         if args.grad_clip > 0:
-            scaler.unscale_(optimizer if not isinstance(optimizer, list) else optimizer[0]) # Unscale main optimizer
+            # Unscale all optimizers for gradient clipping
+            if isinstance(optimizer, list):
+                for opt in optimizer:
+                    scaler.unscale_(opt)
+            else:
+                scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             # Log gradient norms for debugging (only on master process and occasionally)
@@ -1014,9 +1037,15 @@ def train(args):
 
         # Checkpointing
         if step % args.save_interval == 0 and step > 0 and master_process:
+            # Handle list of optimizers (e.g., Muon setup)
+            if isinstance(optimizer, list):
+                optimizer_state = [opt.state_dict() for opt in optimizer]
+            else:
+                optimizer_state = optimizer.state_dict()
+
             checkpoint = {
                 'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'optimizer': optimizer_state,
                 'step': step,
                 'config': vars(args),
             }

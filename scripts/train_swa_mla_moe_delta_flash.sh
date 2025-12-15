@@ -73,7 +73,7 @@ if [ $NUM_GPUS -gt 1 ]; then
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
     --optimizer_type $OPTIMIZER \
-    --learning_rate 1e-2 \
+    --learning_rate 1e-4 \
     --weight_decay 0.1 \
     --warmup_iters 400 \
     --max_iters 100000 \
@@ -109,7 +109,7 @@ else
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
     --optimizer_type $OPTIMIZER \
-    --learning_rate 1e-2 \
+    --learning_rate 1e-4 \
     --weight_decay 0.1 \
     --warmup_iters 400 \
     --max_iters 100000 \
