@@ -48,10 +48,11 @@ class MLABlock(nn.Module):
         # MLA attention - FP8 version not included in standalone build
         self.attn = MLA(config)
 
-        # FFN: MoE or standard MLP based on config
+        # FFN: MoE (standard or latent) or standard MLP based on config
         if getattr(config, 'use_moe', False):
-            from moe import MoELayer
-            self.ffn = MoELayer(config)
+            from moe import create_moe_layer
+            use_latent = getattr(config, 'use_latent_moe', False)
+            self.ffn = create_moe_layer(config, use_latent=use_latent)
         else:
             self.ffn = MLP(config)
 

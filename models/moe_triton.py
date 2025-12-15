@@ -118,32 +118,38 @@ def moe_gemm_kernel(
     c_mask = (offs_am[:, None] < m_size) & (offs_bn[None, :] < N)
     tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
 
-def moe_gemm(a, b, expert_offsets, activation=""):
+def moe_gemm(a, b, expert_offsets, activation="", max_tokens_hint=None):
     """
     a: [Total_Tokens, K]
     b: [Num_Experts, K, N]
     expert_offsets: [Num_Experts + 1]
+    max_tokens_hint: Optional hint for max tokens per expert (avoids CPU sync)
     """
     # Checks
     assert a.ndim == 2
     assert b.ndim == 3
     assert a.shape[1] == b.shape[1]
-    
+
     total_tokens, K = a.shape
     num_experts, _, N = b.shape
-    
+
     # Output
     c = torch.empty((total_tokens, N), device=a.device, dtype=a.dtype)
-    
+
     # Grid
-    # Calculate max tokens per expert to set grid size
-    # This requires CPU sync, which causes a graph break in torch.compile.
-    # We accept this break to ensure optimal grid size (performance is much better than using a loose bound).
-    counts = expert_offsets[1:] - expert_offsets[:-1]
-    max_m = counts.max().item()
-    
+    # To avoid CPU sync (.item()) which breaks cudagraphs, we use a safe upper bound.
+    # Worst case: all tokens go to one expert = total_tokens
+    # With good load balancing: ~total_tokens / num_experts * some_factor
+    # We use total_tokens as safe upper bound (kernel early-exits for empty blocks anyway)
+    if max_tokens_hint is not None:
+        max_m = max_tokens_hint
+    else:
+        # Use total_tokens as upper bound - kernel will early-exit for out-of-bounds blocks
+        # This avoids the CPU sync that breaks cudagraphs
+        max_m = total_tokens
+
     grid = lambda META: (num_experts, triton.cdiv(max_m, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
-    
+
     moe_gemm_kernel[grid](
         a, b, c,
         expert_offsets,
@@ -153,5 +159,5 @@ def moe_gemm(a, b, expert_offsets, activation=""):
         c.stride(0), c.stride(1),
         ACTIVATION=activation
     )
-    
+
     return c

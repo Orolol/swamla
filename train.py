@@ -202,7 +202,7 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             adamw_lr = learning_rate
 
             print(f"Using Muon optimizer for 2D+ parameters (lr={muon_lr:.4f})")
-            print(f"Using AdamW optimizer for 1D parameters (lr={adamw_lr:.6f})")
+            print(f"Using AdamW optimizer fo  parameters (lr={adamw_lr:.6f})")
 
             # Muon params (>= 2D, excluding embeddings for stability)
             muon_params = []
@@ -609,10 +609,34 @@ def train(args):
         }
         if args.expert_dim is not None:
             moe_kwargs['expert_dim'] = args.expert_dim
+
+        # LatentMoE configuration
+        if args.use_latent_moe:
+            moe_kwargs['use_latent_moe'] = True
+            moe_kwargs['latent_ratio'] = args.latent_ratio
+            moe_kwargs['latent_preserve_expert_dim'] = args.latent_preserve_expert_dim
+            if args.latent_dim is not None:
+                moe_kwargs['latent_dim'] = args.latent_dim
+            if args.latent_n_experts is not None:
+                moe_kwargs['latent_n_experts'] = args.latent_n_experts
+            if args.latent_n_activated is not None:
+                moe_kwargs['latent_n_activated'] = args.latent_n_activated
+
         if master_process:
             print(f"\nMoE Configuration:")
-            print(f"  Experts: {args.n_experts} routed + {args.n_shared_experts} shared")
-            print(f"  Activated per token: {args.n_activated} routed + {args.n_shared_experts} shared = {args.n_activated + args.n_shared_experts} total")
+            if args.use_latent_moe:
+                # Calculate effective values for LatentMoE
+                eff_n_experts = args.latent_n_experts or (args.n_experts * args.latent_ratio)
+                eff_n_activated = args.latent_n_activated or (args.n_activated * args.latent_ratio)
+                print(f"  Mode: LatentMoE (NVIDIA Nemotron-3 style)")
+                print(f"  Latent ratio: {args.latent_ratio}x compression")
+                print(f"  Latent dim: {args.latent_dim or 'auto (n_embd / ' + str(args.latent_ratio) + ')'}")
+                print(f"  Experts: {eff_n_experts} routed + {args.n_shared_experts} shared (in latent space)")
+                print(f"  Activated per token: {eff_n_activated} routed + {args.n_shared_experts} shared")
+            else:
+                print(f"  Mode: Standard MoE")
+                print(f"  Experts: {args.n_experts} routed + {args.n_shared_experts} shared")
+                print(f"  Activated per token: {args.n_activated} routed + {args.n_shared_experts} shared = {args.n_activated + args.n_shared_experts} total")
             print(f"  Expert dim: {args.expert_dim or 'same as n_embd'}")
 
     # Common model kwargs
@@ -1109,6 +1133,20 @@ def main():
     parser.add_argument('--n_activated', type=int, default=3, help='Number of routed experts activated per token')
     parser.add_argument('--expert_dim', type=int, default=None, help='Expert hidden dimension (default: n_embd)')
     parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router Z-loss coefficient')
+
+    # LatentMoE parameters (NVIDIA Nemotron-3 style - better quality per FLOP)
+    parser.add_argument('--use_latent_moe', action='store_true', default=False,
+                        help='Use LatentMoE: projects to latent space before expert computation')
+    parser.add_argument('--latent_ratio', type=int, default=4,
+                        help='d_model/latent_dim ratio (default: 4, i.e., latent_dim = n_embd/4)')
+    parser.add_argument('--latent_dim', type=int, default=None,
+                        help='Explicit latent dimension (overrides latent_ratio if set)')
+    parser.add_argument('--latent_n_experts', type=int, default=None,
+                        help='Total experts for LatentMoE (default: n_experts * latent_ratio)')
+    parser.add_argument('--latent_n_activated', type=int, default=None,
+                        help='Activated experts for LatentMoE (default: n_activated * latent_ratio)')
+    parser.add_argument('--latent_preserve_expert_dim', action='store_true', default=False,
+                        help='Keep full expert_dim in LatentMoE (more params, more capacity)')
 
     # Training parameters
     parser.add_argument('--max_iters', type=int, default=100000)

@@ -468,12 +468,19 @@ def load_model_from_checkpoint(
 
         # Remove training-specific parameters that don't exist in SWAMLAConfig
         training_only_params = [
+            # Optimizer and training loop params
             'batch_size', 'max_iters', 'learning_rate', 'min_lr',
             'weight_decay', 'beta1', 'beta2', 'warmup_iters', 'grad_clip',
             'gradient_accumulation_steps', 'optimizer_type', 'enable_tf32',
             'disable_tf32', 'tokenizer_name', 'num_workers', 'output_dir',
             'log_interval', 'eval_interval', 'save_interval', 'wandb_project',
-            'wandb_run_name', 'hf_repo_id', 'resume_from_hf', 'compile'
+            'wandb_run_name', 'hf_repo_id', 'resume_from_hf', 'compile',
+            # Neural memory training params
+            'memory_reset_interval',
+            # Other training-only params
+            'use_tensorboard', 'use_te_fp8',
+            # Deprecated/removed params
+            'no_moe',
         ]
 
         for param in training_only_params:
@@ -488,6 +495,34 @@ def load_model_from_checkpoint(
         if 'use_fp8' in config_dict:
             config_dict['use_fp8'] = False
             print("Forcing use_fp8=False for inference (FP8 is training-only)")
+
+        # Extract dimensions from state_dict to override preset values
+        # This ensures the model matches the actual checkpoint shapes
+        if "model" in checkpoint:
+            state_dict_for_inspection = checkpoint["model"]
+            # Remove prefixes for easier key lookup
+            def get_key(base_key):
+                for prefix in ["_orig_mod.", "module.", ""]:
+                    key = prefix + base_key
+                    if key in state_dict_for_inspection:
+                        return key
+                return None
+
+            # Extract vocab_size from embedding
+            wte_key = get_key("transformer.wte.weight")
+            if wte_key:
+                vocab_size = state_dict_for_inspection[wte_key].shape[0]
+                config_dict['vocab_size'] = vocab_size
+                print(f"Extracted vocab_size={vocab_size} from checkpoint")
+
+            # Extract expert_dim from MoE layer if present
+            # SwiGLU: gate_up_proj has shape [expert_dim * 2, n_embd]
+            expert_key = get_key("transformer.h.2.ffn.shared_experts.0.gate_up_proj.weight")
+            if expert_key:
+                gate_up_dim = state_dict_for_inspection[expert_key].shape[0]
+                expert_dim = gate_up_dim // 2  # SwiGLU doubles the dimension
+                config_dict['expert_dim'] = expert_dim
+                print(f"Extracted expert_dim={expert_dim} from checkpoint (gate_up_dim={gate_up_dim})")
 
         # Create model using the appropriate method
         if model_size:

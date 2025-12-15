@@ -244,6 +244,18 @@ class SWAMLAConfig:
     expert_dim: Optional[int] = None  # defaults to n_embd if None
     router_z_loss_coef: float = 0.001
 
+    # LatentMoE configuration (NVIDIA Nemotron-3 style)
+    # When enabled, projects tokens to latent space before expert computation
+    # This allows more experts with same compute budget for better quality
+    use_latent_moe: bool = False
+    latent_ratio: int = 4  # d_model / latent_dim ratio (e.g., 4 means latent_dim = n_embd / 4)
+    latent_dim: Optional[int] = None  # Explicit latent dim (overrides latent_ratio if set)
+    # Note: When use_latent_moe=True, n_experts and n_activated are automatically scaled
+    # by latent_ratio unless latent_n_experts/latent_n_activated are explicitly set
+    latent_n_experts: Optional[int] = None  # Override: total experts for LatentMoE
+    latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
+    latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim (more params, more capacity)
+
     def __post_init__(self) -> None:
         # Set expert_dim to n_embd if not specified
         if self.expert_dim is None:
@@ -451,24 +463,72 @@ class SWAMLAModel(nn.Module):
         self.apply(self._init_weights)
         self.param_count = sum(p.numel() for p in self.parameters())
 
-        # Count SWA and MLA blocks
+        # Count SWA, DeltaNet, and MLA blocks
         swa_count = sum(1 for block in self.transformer.h if isinstance(block, SWALocalBlock))
+        deltanet_count = sum(1 for block in self.transformer.h if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock))
         mla_selective_count = sum(1 for block in self.transformer.h if isinstance(block, MLASelectiveBlock))
         mla_memory_count = sum(1 for block in self.transformer.h if isinstance(block, MLAMemoryBlock))
         mla_standard_count = sum(1 for block in self.transformer.h if isinstance(block, MLABlock) and not isinstance(block, MLAMemoryBlock))
+
+        # Calculate active parameters for MoE models
+        active_param_count = None
+        if config.use_moe:
+            # For MoE: count non-expert params + active expert params only
+            # Active experts = n_activated (routed) + n_shared_experts (always active)
+            # Use class name check to avoid import path issues
+            def is_moe_layer(module):
+                return module.__class__.__name__ in ('MoELayer', 'LatentMoELayer')
+
+            moe_active_params = 0
+            all_moe_params = 0
+
+            for name, module in self.named_modules():
+                if is_moe_layer(module):
+                    # Total params in this MoE layer
+                    layer_params = sum(p.numel() for p in module.parameters())
+                    all_moe_params += layer_params
+
+                    # Count shared experts (always active)
+                    for expert in module.shared_experts:
+                        moe_active_params += sum(p.numel() for p in expert.parameters())
+                    # Count only n_activated routed experts (out of n_experts total)
+                    # Each expert has the same size, so: active = total_routed * (n_activated / n_experts)
+                    total_routed_params = sum(p.numel() for p in module.experts.parameters())
+                    active_routed_params = total_routed_params * module.n_activated // module.n_experts
+                    moe_active_params += active_routed_params
+                    # Router params are always active
+                    moe_active_params += sum(p.numel() for p in module.router.parameters())
+                    # For LatentMoE: also count the latent projection layers (always active)
+                    if hasattr(module, 'down_proj'):
+                        moe_active_params += sum(p.numel() for p in module.down_proj.parameters())
+                    if hasattr(module, 'up_proj'):
+                        moe_active_params += sum(p.numel() for p in module.up_proj.parameters())
+
+            # Non-MoE params = total - all MoE layer params
+            non_moe_params = self.param_count - all_moe_params
+            active_param_count = non_moe_params + moe_active_params
 
         if config.use_mla_selective:
             model_type = "SWAMLA-Selective"
         elif config.use_neural_memory:
             model_type = "SWAMLA-Memory"
+        elif config.use_gated_deltanet:
+            model_type = "DeltaNet-MLA"
         else:
             model_type = "SWAMLA"
 
+        if config.use_moe:
+            model_type += "-MoE"
+
         print(f"{model_type} Model - Number of parameters: {self.param_count / 1e6:.2f}M")
+        if active_param_count is not None:
+            print(f"  - Active parameters per forward: {active_param_count / 1e6:.2f}M ({100 * active_param_count / self.param_count:.1f}%)")
         if config.use_mla_selective:
             print(f"  - {swa_count} SWA blocks, {mla_selective_count} MLA Selective blocks")
         elif config.use_neural_memory:
             print(f"  - {swa_count} SWA blocks, {mla_memory_count} MLA Memory blocks, {mla_standard_count} MLA blocks")
+        elif config.use_gated_deltanet:
+            print(f"  - {deltanet_count} DeltaNet blocks, {mla_standard_count} MLA blocks")
         else:
             print(f"  - {swa_count} SWA blocks, {mla_standard_count} MLA blocks")
 
@@ -748,6 +808,13 @@ def _create_mla_block_config(config: SWAMLAConfig):
         n_activated: int = config.n_activated
         expert_dim: int = config.expert_dim
         router_z_loss_coef: float = config.router_z_loss_coef
+        # LatentMoE parameters
+        use_latent_moe: bool = config.use_latent_moe
+        latent_ratio: int = config.latent_ratio
+        latent_dim: Optional[int] = config.latent_dim
+        latent_n_experts: Optional[int] = config.latent_n_experts
+        latent_n_activated: Optional[int] = config.latent_n_activated
+        latent_preserve_expert_dim: bool = config.latent_preserve_expert_dim
         # Flash Attention for MLA
         use_flash_attention: bool = config.use_flash_attention
 
@@ -769,9 +836,9 @@ def create_swa_mla_model(
         "xl": dict(n_layer=32, n_embd=4096, n_head=32),      # 4096/32=128 head_dim
         # MoE presets - params are total, active params are much smaller
         "moe-1b": dict(  # ~770M total, ~250M active
-            n_layer=12, n_embd=768, n_head=12,
+            n_layer=12, n_embd=1024, n_head=12,
             swa_layers_per_cycle=2, mla_layers_per_cycle=1,
-            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=512 * 3,
+            use_moe=True, n_experts=32, n_shared_experts=1, n_activated=2, expert_dim=512 * 2,
         ),
         "moe-2b": dict(  # ~1.5B total, ~400M active
             n_layer=18, n_embd=1024, n_head=16,
