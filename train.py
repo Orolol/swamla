@@ -1,6 +1,13 @@
 """
-Standalone training script for SWA-MLA model.
-Supports FP8, Lion optimizer, wandb logging, and packed data loading.
+Training script for DeltaNet-MLA model with LatentMoE.
+
+Supported features:
+- Muon + AdamW optimizer (PyTorch native)
+- LatentMoE (NVIDIA Nemotron-3 style)
+- GatedDeltaNet (O(n) linear attention)
+- MLA with Flash Attention
+- Gradient checkpointing
+- torch.compile with max-autotune
 """
 
 import os
@@ -18,11 +25,9 @@ import torch.distributed as dist
 # Add models and data to path
 sys.path.insert(0, str(Path(__file__).parent / 'models'))
 sys.path.insert(0, str(Path(__file__).parent / 'data'))
-sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
 from data_loader_packed import PackedFinewebDataset
-# from fp8_torchao import configure_fp8_training # Removed
 
 # Try to import wandb
 try:
@@ -47,21 +52,6 @@ try:
 except ImportError:
     HF_AVAILABLE = False
     print("huggingface_hub not available - HF push disabled")
-
-# Try to import Lion optimizer
-try:
-    from lion_pytorch import Lion
-    LION_AVAILABLE = True
-except ImportError:
-    try:
-        import torch_optimizer as extra_optim
-        if hasattr(extra_optim, 'Lion'):
-            Lion = extra_optim.Lion
-            LION_AVAILABLE = True
-        else:
-            LION_AVAILABLE = False
-    except ImportError:
-        LION_AVAILABLE = False
 
 from transformers import AutoTokenizer
 
@@ -188,36 +178,38 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     return get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr)
 
 
-def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', use_fp8=False):
+def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw'):
     """Configure optimizer with proper parameter grouping."""
     
     if optimizer_type == 'muon':
-        try:
-            from muon import Muon
+        # Use native PyTorch Muon (requires PyTorch 2.6+)
+        if not hasattr(torch.optim, 'Muon'):
+            print("PyTorch Muon not available (requires PyTorch 2.6+), falling back to AdamW")
+            optimizer_type = 'adamw'
+        else:
+            Muon = torch.optim.Muon
+            print("Using PyTorch Muon optimizer")
 
             # Muon typically needs much higher LR than AdamW
-            # Typical: Muon LR = 0.02, AdamW LR = 1e-4
-            # Scale Muon LR relative to provided LR (assuming LR is for AdamW)
             muon_lr = learning_rate * 200  # e.g., 1e-4 -> 0.02
             adamw_lr = learning_rate
 
-            print(f"Using Muon optimizer for 2D+ parameters (lr={muon_lr:.4f})")
-            print(f"Using AdamW optimizer fo  parameters (lr={adamw_lr:.6f})")
+            print(f"  Muon LR: {muon_lr:.4f}")
+            print(f"  AdamW LR: {adamw_lr:.6f}")
 
-            # Muon params (>= 2D, excluding embeddings for stability)
+            # Muon only supports exactly 2D params
             muon_params = []
-            # AdamW params (< 2D, biases, norms, embeddings)
             adamw_params = []
 
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
 
-                # Keep embeddings and lm_head in AdamW for stability
-                # These tend to be sensitive to large updates
+                # Embeddings/lm_head -> AdamW for stability
+                # Non-2D params -> AdamW (Muon only supports 2D)
                 if any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
                     adamw_params.append(param)
-                elif param.ndim >= 2:
+                elif param.ndim == 2:
                     muon_params.append(param)
                 else:
                     adamw_params.append(param)
@@ -225,18 +217,21 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             optimizers = []
             if muon_params:
                 print(f"  Muon: {len(muon_params)} parameter tensors")
-                optimizers.append(Muon(muon_params, lr=muon_lr, momentum=0.95))
+                optimizers.append(Muon(
+                    muon_params,
+                    lr=muon_lr,
+                    momentum=0.95,
+                    weight_decay=weight_decay,
+                    nesterov=True,
+                    ns_steps=5,
+                ))
             if adamw_params:
                 print(f"  AdamW: {len(adamw_params)} parameter tensors")
-                optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay))
+                optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay, fused=True))
 
-            return optimizers  # Return list of optimizers
+            return optimizers
 
-        except ImportError:
-            print("Muon optimizer not found, falling back to AdamW")
-            optimizer_type = 'adamw'
-
-    # Standard AdamW/Lion configuration
+    # Standard AdamW configuration
     decay_params = []
     no_decay_params = []
 
@@ -254,16 +249,11 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
 
-    # Choose optimizer based on type
-    if optimizer_type == 'lion' and LION_AVAILABLE:
-        print("Using Lion optimizer")
-        optimizer = Lion(param_groups, lr=learning_rate, betas=betas)
+    print("Using AdamW optimizer")
+    if device_type == 'cuda':
+        optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
     else:
-        print("Using AdamW optimizer")
-        if device_type == 'cuda':
-            optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
-        else:
-            optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas)
+        optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas)
 
     return optimizer
 
@@ -423,15 +413,15 @@ This is an automatic checkpoint uploaded during training when validation loss im
 
 ## Model Architecture
 Hybrid architecture combining:
-- **Sliding Window Attention (SWA)** blocks for efficient local context
+- **GatedDeltaNet** blocks for O(n) linear attention (local context)
 - **Multi-head Latent Attention (MLA)** blocks for global context with KV compression
+- **LatentMoE** for efficient mixture-of-experts in latent space
 
 ## Model Configuration
 - Size: {config_args.get('size', 'unknown')}
 - Block size (context length): {config_args.get('block_size', 'unknown')}
-- SWA layers per cycle: {config_args.get('swa_layers_per_cycle', 'unknown')}
+- DeltaNet layers per cycle: {config_args.get('swa_layers_per_cycle', 'unknown')}
 - MLA layers per cycle: {config_args.get('mla_layers_per_cycle', 'unknown')}
-- SWA window size: {config_args.get('swa_window', 'unknown')}
 - MLA KV LoRA rank: {config_args.get('mla_kv_lora_rank', 'unknown')}
 
 ## Loading the Model
@@ -566,37 +556,6 @@ def train(args):
     if master_process:
         print(f"\nCreating {args.size} SWA-MLA model...")
 
-    # Check TE FP8 availability before model creation
-    use_te_fp8 = False
-    fp8_init_context = None
-    if args.use_fp8:
-        try:
-            from fp8_te import get_fp8_init_context, HAS_TE
-            if HAS_TE:
-                use_te_fp8 = True
-                # Get FP8 initialization context
-                # Note: fp8_model_init uses Float8CurrentScaling by default
-                # We must NOT use a custom recipe in fp8_autocast to avoid mismatch
-                fp8_init_context = get_fp8_init_context(
-                    enabled=True,
-                    preserve_high_precision=False
-                )
-                if master_process:
-                    print("\nUsing Transformer Engine native FP8 Linear layers")
-                    print("  - Using quantized_model_init with preserve_high_precision=False")
-                    print("  - Using default Float8CurrentScaling recipe")
-            else:
-                if master_process:
-                    print("Warning: Transformer Engine not installed")
-                    print("Install with: pip install transformer-engine[pytorch]")
-                    print("Falling back to BF16 training")
-                args.use_fp8 = False
-        except ImportError as e:
-            if master_process:
-                print(f"Warning: Failed to import Transformer Engine: {e}")
-                print("Falling back to BF16 training")
-            args.use_fp8 = False
-
     # Prepare MoE kwargs
     moe_kwargs = {}
     if args.use_moe:
@@ -647,39 +606,24 @@ def train(args):
         dropout=args.dropout,
         swa_layers_per_cycle=args.swa_layers_per_cycle,
         mla_layers_per_cycle=args.mla_layers_per_cycle,
-        swa_window=args.swa_window,
-        swa_sink_size=args.swa_sink_size,
         q_lora_rank=args.mla_q_lora_rank,
         kv_lora_rank=args.mla_kv_lora_rank,
         qk_nope_head_dim=args.mla_qk_nope_head_dim,
         qk_rope_head_dim=args.mla_qk_rope_head_dim,
         v_head_dim=args.mla_v_head_dim,
         use_gradient_checkpointing=args.gradient_checkpointing,
-        use_te_fp8=use_te_fp8,
         # Attention backend options
         use_flash_attention=args.use_flash_attention,
         use_gated_deltanet=args.use_gated_deltanet,
-        # Neural Memory parameters
-        use_neural_memory=args.use_neural_memory,
-        memory_dim=args.memory_dim,
-        memory_depth=args.memory_depth,
+        # DeltaNet latent compression options
+        deltanet_latent_dim=args.deltanet_latent_dim,
+        deltanet_share_qk=args.deltanet_share_qk,
         # MoE parameters
         **moe_kwargs,
     )
 
-    # Create model inside FP8 init context if available
-    if fp8_init_context is not None:
-        with fp8_init_context:
-            model = create_swa_mla_model(**model_kwargs)
-    else:
-        model = create_swa_mla_model(**model_kwargs)
-
+    model = create_swa_mla_model(**model_kwargs)
     model = model.to(device)
-
-    if use_te_fp8 and master_process:
-        print("✓ Model created with Transformer Engine FP8 Linear layers")
-        print("  - Using HYBRID format (E4M3 fwd, E5M2 bwd)")
-        print("  - No high-precision weight copies (memory efficient)")
 
     # Load model weights if resuming
     if resume_checkpoint:
@@ -726,17 +670,8 @@ def train(args):
     # Compile model if requested
     if args.compile:
         if master_process:
-            print("Compiling model with torch.compile()...")
-
-        # Use different compilation mode for FP8 to avoid FlexibleLayout issues
-        if args.use_fp8:
-            model = torch.compile(model, mode='reduce-overhead') 
-
-        else:
-            # 'max-autotune' for non-FP8 training
-            model = torch.compile(model, mode='reduce-overhead')
-            if master_process:
-                print("  Using 'reduce-overhead' mode")
+            print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
+        model = torch.compile(model, mode=args.compile_mode)
 
     # Wrap with DDP
     if is_ddp:
@@ -766,7 +701,6 @@ def train(args):
         betas=(args.beta1, args.beta2),
         device_type='cuda' if torch.cuda.is_available() else 'cpu',
         optimizer_type=args.optimizer_type,
-        use_fp8=args.use_fp8
     )
 
     # Load optimizer state if resuming
@@ -808,8 +742,6 @@ def train(args):
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
 
     data_iter = iter(data_loader)
-    # Transformer Engine FP8 handles scaling internally, no GradScaler needed
-    # Only enable GradScaler for non-FP8 training if needed
     scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     running_loss = 0.0
@@ -818,10 +750,6 @@ def train(args):
     # Track best validation loss for HF push
     best_val_loss = float('inf')
     total_tokens_seen = resume_tokens  # Start from resumed token count
-
-    # Initialize memory states for truncated BPTT (if using neural memory)
-    memory_states = None
-    use_neural_memory = args.use_neural_memory
 
     # Adjust starting step
     start_step = resume_step
@@ -873,49 +801,18 @@ def train(args):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            # Forward pass with mixed precision
-            # For Transformer Engine FP8, we need to wrap with fp8_autocast
-            if args.use_fp8 and use_te_fp8:
-                import transformer_engine.pytorch as te
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                    # Use default recipe (no fp8_recipe) to match fp8_model_init's Float8CurrentScaling
-                    with te.fp8_autocast(enabled=True):
-                        if use_neural_memory:
-                            logits, loss, memory_states = model(
-                                input_ids, targets=labels,
-                                memory_states=memory_states,
-                                return_memory_states=True
-                            )
-                        else:
-                            logits, loss = model(input_ids, targets=labels)
-                        # Add MoE auxiliary loss if model has MoE layers
-                        if hasattr(raw_model, 'get_moe_aux_loss'):
-                            moe_aux_loss = raw_model.get_moe_aux_loss()
-                            loss = loss + moe_aux_loss
-                        loss = loss / args.gradient_accumulation_steps
-            else:
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                    if use_neural_memory:
-                        logits, loss, memory_states = model(
-                            input_ids, targets=labels,
-                            memory_states=memory_states,
-                            return_memory_states=True
-                        )
-                    else:
-                        logits, loss = model(input_ids, targets=labels)
-                    # Add MoE auxiliary loss if model has MoE layers
-                    if hasattr(raw_model, 'get_moe_aux_loss'):
-                        moe_aux_loss = raw_model.get_moe_aux_loss()
-                        loss = loss + moe_aux_loss
-                    loss = loss / args.gradient_accumulation_steps
+            # Forward pass with mixed precision (BF16)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                logits, loss = model(input_ids, targets=labels)
+                # Add MoE auxiliary loss if model has MoE layers
+                if hasattr(raw_model, 'get_moe_aux_loss'):
+                    moe_aux_loss = raw_model.get_moe_aux_loss()
+                    loss = loss + moe_aux_loss
+                loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(loss).backward()
             accum_loss += loss.item()
-
-            # Truncated BPTT: detach memory states to prevent gradient flow across batches
-            if use_neural_memory and memory_states is not None:
-                memory_states = [s.detach() for s in memory_states]
 
         # Update MoE router biases after backward (must be after backward for checkpoint compatibility)
         if hasattr(raw_model, 'update_moe_bias'):
@@ -929,11 +826,7 @@ def train(args):
                     scaler.unscale_(opt)
             else:
                 scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            # Log gradient norms for debugging (only on master process and occasionally)
-            if master_process and step % 100 == 0 and args.use_fp8:
-                print(f"  [FP8 Debug] Grad norm: {grad_norm:.4f}")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
         # Optimizer step
         if isinstance(optimizer, list):
@@ -944,13 +837,6 @@ def train(args):
         scaler.update()
 
         running_loss += accum_loss
-
-        # Periodic memory state reset (prevents unbounded state growth)
-        if use_neural_memory and args.memory_reset_interval > 0:
-            if step > 0 and step % args.memory_reset_interval == 0:
-                memory_states = None
-                if master_process:
-                    print(f"  [Memory] Reset memory states at step {step}")
 
         # Track total tokens processed
         total_tokens_seen += args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size
@@ -1090,53 +976,44 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train SWA-MLA model')
+    parser = argparse.ArgumentParser(description='Train DeltaNet-MLA model with LatentMoE')
 
     # Model parameters
-    parser.add_argument('--size', type=str, default='small', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b'])
+    parser.add_argument('--size', type=str, default='moe-1b', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b'])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--block_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.0)
 
-    # SWA-MLA specific parameters
-    parser.add_argument('--swa_layers_per_cycle', type=int, default=2)
-    parser.add_argument('--mla_layers_per_cycle', type=int, default=1)
-    parser.add_argument('--swa_window', type=int, default=256)
-    parser.add_argument('--swa_sink_size', type=int, default=4)
-    parser.add_argument('--mla_q_lora_rank', type=int, default=0)
-    parser.add_argument('--mla_kv_lora_rank', type=int, default=256)
+    # DeltaNet-MLA architecture parameters
+    parser.add_argument('--swa_layers_per_cycle', type=int, default=2, help='DeltaNet blocks per cycle')
+    parser.add_argument('--mla_layers_per_cycle', type=int, default=1, help='MLA blocks per cycle')
+    parser.add_argument('--mla_q_lora_rank', type=int, default=0, help='MLA Q LoRA rank (0=disabled)')
+    parser.add_argument('--mla_kv_lora_rank', type=int, default=256, help='MLA KV LoRA rank')
     parser.add_argument('--mla_qk_nope_head_dim', type=int, default=128)
     parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64)
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
 
-    # Neural Memory parameters (Titans paper)
-    parser.add_argument('--use_neural_memory', action='store_true',
-                        help='Enable Neural Long-term Memory for MLA blocks')
-    parser.add_argument('--memory_dim', type=int, default=256,
-                        help='Internal dimension for memory MLP')
-    parser.add_argument('--memory_depth', type=int, default=2,
-                        help='Number of layers in memory MLP')
-    parser.add_argument('--memory_reset_interval', type=int, default=0,
-                        help='Reset memory states every N steps (0=never reset)')
+    # DeltaNet options (always enabled)
+    parser.add_argument('--use_flash_attention', action='store_true', default=True,
+                        help='Use Flash Attention for MLA blocks')
+    parser.add_argument('--use_gated_deltanet', action='store_true', default=True,
+                        help='Use GatedDeltaNet for local attention (O(n) linear)')
 
-    # Attention backend options
-    parser.add_argument('--use_flash_attention', action='store_true', default=False,
-                        help='Use Flash Attention for SWA and MLA blocks')
-    parser.add_argument('--use_gated_deltanet', action='store_true', default=False,
-                        help='Replace SWA blocks with GatedDeltaNet (linear O(n) attention)')
+    # DeltaNet latent compression options
+    parser.add_argument('--deltanet_latent_dim', type=int, default=0,
+                        help='Latent dimension for DeltaNet projections (0=disabled, >0=compress Q/K/V/O)')
+    parser.add_argument('--deltanet_share_qk', action='store_true', default=False,
+                        help='Share Q and K projection in DeltaNet (K is normalized Q)')
 
-    # MoE parameters (only applied to MLA blocks)
-    parser.add_argument('--use_moe', action='store_true', default=False, help='Enable MoE for MLA blocks')
-    parser.add_argument('--no_moe', action='store_true', default=False, help='Disable MoE (for compatibility)')
+    # LatentMoE parameters (always enabled for moe-* sizes)
+    parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
+    parser.add_argument('--use_latent_moe', action='store_true', default=True,
+                        help='Use LatentMoE: projects to latent space before expert computation')
     parser.add_argument('--n_experts', type=int, default=32, help='Number of routed experts')
     parser.add_argument('--n_shared_experts', type=int, default=1, help='Number of shared experts (always active)')
     parser.add_argument('--n_activated', type=int, default=3, help='Number of routed experts activated per token')
     parser.add_argument('--expert_dim', type=int, default=None, help='Expert hidden dimension (default: n_embd)')
     parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router Z-loss coefficient')
-
-    # LatentMoE parameters (NVIDIA Nemotron-3 style - better quality per FLOP)
-    parser.add_argument('--use_latent_moe', action='store_true', default=False,
-                        help='Use LatentMoE: projects to latent space before expert computation')
     parser.add_argument('--latent_ratio', type=int, default=4,
                         help='d_model/latent_dim ratio (default: 4, i.e., latent_dim = n_embd/4)')
     parser.add_argument('--latent_dim', type=int, default=None,
@@ -1160,22 +1037,15 @@ def main():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--gradient_checkpointing', action='store_true')
 
-    # Optimizer
-    parser.add_argument('--optimizer_type', type=str, default='adamw', choices=['adamw', 'lion', 'muon'])
-    parser.add_argument('--use_fp8', action='store_true')
-
-    # TF32 precision control (Ampere+ GPUs)
-    parser.add_argument('--enable_tf32', action='store_true', default=True,
-                        help='Enable TF32 for ~3-7x speedup on A100/H100 (default: True)')
-    parser.add_argument('--disable_tf32', action='store_true',
-                        help='Disable TF32 for full IEEE FP32 precision')
+    # Optimizer (Muon + AdamW or pure AdamW)
+    parser.add_argument('--optimizer_type', type=str, default='muon', choices=['adamw', 'muon'])
 
     # Data parameters
     parser.add_argument('--tokenizer_name', type=str, default='openai-community/gpt2')
     parser.add_argument('--num_workers', type=int, default=8)
 
     # Logging and checkpointing
-    parser.add_argument('--output_dir', type=str, default='outputs/swa_mla')
+    parser.add_argument('--output_dir', type=str, default='outputs/deltanet_mla')
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--eval_interval', type=int, default=1000)
     parser.add_argument('--save_interval', type=int, default=5000)
@@ -1183,15 +1053,17 @@ def main():
     parser.add_argument('--wandb_run_name', type=str, default=None)
 
     # Hugging Face integration
-    parser.add_argument('--hf_repo_id', type=str, default=None, help='HuggingFace repo ID (e.g., "username/model-name"). Set HF_TOKEN env var for authentication.')
-    parser.add_argument('--resume_from_hf', action='store_true', help='Resume training from the latest checkpoint in HF repo (requires --hf_repo_id)')
+    parser.add_argument('--hf_repo_id', type=str, default=None, help='HuggingFace repo ID')
+    parser.add_argument('--resume_from_hf', action='store_true', help='Resume from HF checkpoint')
 
     # Performance
-    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--compile', action='store_true', default=True)
+    parser.add_argument('--compile_mode', type=str, default='max-autotune',
+                        choices=['reduce-overhead', 'max-autotune', 'default'],
+                        help='torch.compile mode')
 
     # TensorBoard
-    parser.add_argument('--use_tensorboard', action='store_true', default=True,
-                        help='Enable TensorBoard logging (default: True)')
+    parser.add_argument('--use_tensorboard', action='store_true', default=True)
 
     args = parser.parse_args()
 

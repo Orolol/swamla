@@ -1,57 +1,22 @@
-"""Hybrid model interleaving Sliding-Window Attention (SWA) and MLA/MLA-Selective blocks."""
+"""Hybrid model interleaving GatedDeltaNet (O(n) linear attention) and MLA blocks with LatentMoE."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple, List
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
-
-# Import TE checkpoint for FP8-aware gradient checkpointing
-try:
-    from optimization.fp8_te import te_checkpoint
-except ImportError:
-    te_checkpoint = None
 
 from normalization import RMSNorm, DynamicTanh
-from attention import CausalSelfAttention
-from mlp import MLP
 from mla_block import MLABlock
-from mla_memory_block import MLAMemoryBlock
-from neural_memory import MemoryState
-# from mla_selective_fast import MLASelectiveFast as MLASelective
 from positional_encoding import (
     precompute_freqs_cis,
     precompute_freqs_cis_with_linear_scaling,
 )
-# from optimizers import configure_optimizer_for_gpt
 
-# FlexAttention support (PyTorch >= 2.5)
-try:
-    from attention_flex import FlexCausalSelfAttention, get_seq_lengths_from_labels, FLEX_ATTENTION_AVAILABLE
-except ImportError:
-    FlexCausalSelfAttention = None
-    FLEX_ATTENTION_AVAILABLE = False
-    def get_seq_lengths_from_labels(labels, ignore_index=-100):
-        # Fallback implementation
-        batch_size, seq_len = labels.shape
-        non_pad = labels != ignore_index
-        positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
-        masked_pos = torch.where(non_pad, positions, torch.tensor(-1, device=labels.device))
-        seq_lengths = masked_pos.max(dim=1).values + 1
-        return torch.clamp(seq_lengths, min=1)
-
-# FlashAttention varlen support (padding-aware with real speedup)
-try:
-    from attention_flash import FlashCausalSelfAttention, FLASH_ATTENTION_AVAILABLE
-except ImportError:
-    FlashCausalSelfAttention = None
-    FLASH_ATTENTION_AVAILABLE = False
-
-# Gated DeltaNet support (linear attention O(n))
+# Gated DeltaNet (linear attention O(n))
 try:
     from gated_deltanet import GatedDeltaNetBlock, GATED_DELTANET_AVAILABLE
 except ImportError:
@@ -60,118 +25,23 @@ except ImportError:
 
 
 @dataclass
-class SWALayerConfig:
-    """Configuration forwarded to SWA attention blocks."""
+class DeltaNetLayerConfig:
+    """Configuration for DeltaNet attention blocks."""
 
     n_embd: int
     n_head: int
     block_size: int
     dropout: float
     bias: bool
-    ratio_kv: int
-    attention_backend: Optional[str]
-    use_rope: bool
-    attention_window: Optional[int]
-    attention_sink_size: int  # Number of initial tokens to always attend to
-    rope_theta: float
-    logit_scale_base: Optional[float]
-    logit_scale_window: int
-    logit_scale_offset: int
-    logit_scale_min: float
-    logit_scale_max: Optional[float]
-    logit_scale_during_training: bool
     use_gradient_checkpointing: bool
-    use_dyt: bool
-    dyt_alpha_init: float
-    # FP8 support for SWA blocks
-    use_fp8: bool = False
-    fp8_mla_params: bool = False
-    fp8_tile_size: int = 128
-    use_te_fp8: bool = False  # Use Transformer Engine native FP8 Linear layers
-    # FlexAttention support (padding-aware attention)
-    use_flex_attention: bool = False
-    # FlashAttention varlen support (padding-aware with real speedup)
-    use_flash_attention: bool = False
-
-
-class SWALocalBlock(nn.Module):
-    """Sliding-window attention block with residual MLP."""
-
-    def __init__(self, config: SWALayerConfig):
-        super().__init__()
-        if config.use_dyt:
-            self.norm1 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
-            self.norm2 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
-        else:
-            self.norm1 = RMSNorm(config.n_embd)
-            self.norm2 = RMSNorm(config.n_embd)
-
-        # Choose attention implementation based on config
-        # Priority: FlashAttention (varlen) > FlexAttention > Standard
-        self.use_flash_attention = getattr(config, 'use_flash_attention', False)
-        self.use_flex_attention = getattr(config, 'use_flex_attention', False)
-
-        if self.use_flash_attention and FlashCausalSelfAttention is not None:
-            self.attn = FlashCausalSelfAttention(config)
-            self.use_flex_attention = False  # Flash takes priority
-        elif self.use_flex_attention and FlexCausalSelfAttention is not None:
-            self.attn = FlexCausalSelfAttention(config)
-            self.use_flash_attention = False
-        else:
-            self.attn = CausalSelfAttention(config)
-            if self.use_flash_attention and FlashCausalSelfAttention is None:
-                print("Warning: FlashAttention requested but not available, falling back to standard attention")
-                self.use_flash_attention = False
-            if self.use_flex_attention and FlexCausalSelfAttention is None:
-                print("Warning: FlexAttention requested but not available, falling back to standard attention")
-                self.use_flex_attention = False
-
-        self.mlp = MLP(config)
-        self.use_checkpoint = config.use_gradient_checkpointing
-        self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
-
-    def _attn_block(self, x: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if (self.use_flash_attention or self.use_flex_attention) and seq_lengths is not None:
-            return self.attn(self.norm1(x), seq_lengths=seq_lengths)
-        else:
-            return self.attn(self.norm1(x))
-
-    def _mlp_block(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.norm2(x))
-
-    def forward(self, x: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
-        use_ckpt = self.use_checkpoint and self.training
-
-        if use_ckpt:
-            # Use TE checkpoint for FP8-aware checkpointing (handles FP8 states properly)
-            if self.use_te_fp8 and te_checkpoint is not None:
-                attn_out = te_checkpoint(self._attn_block, x, seq_lengths, use_te_fp8=True)
-            else:
-                # Note: seq_lengths passed but checkpointing may not preserve it correctly
-                # For now, skip seq_lengths in checkpointed mode
-                attn_out = checkpoint.checkpoint(
-                    lambda inp: self._attn_block(inp, seq_lengths),
-                    x,
-                    use_reentrant=False
-                )
-        else:
-            attn_out = self._attn_block(x, seq_lengths)
-        x = x + attn_out
-
-        if use_ckpt:
-            if self.use_te_fp8 and te_checkpoint is not None:
-                mlp_out = te_checkpoint(self._mlp_block, x, use_te_fp8=True)
-            else:
-                mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
-        else:
-            mlp_out = self._mlp_block(x)
-        x = x + mlp_out
-        return x
+    # DeltaNet latent compression
+    deltanet_latent_dim: int = 0  # 0 = disabled, >0 = latent dimension
+    deltanet_share_qk: bool = False  # Share Q and K projection
 
 
 @dataclass
 class SWAMLAConfig:
-    """Top-level configuration for the SWA+MLA hybrid model."""
+    """Configuration for the DeltaNet+MLA hybrid model with LatentMoE."""
 
     vocab_size: int = 50304
     block_size: int = 4096
@@ -180,24 +50,14 @@ class SWAMLAConfig:
     n_embd: int = 1536
     dropout: float = 0.0
     bias: bool = False
-    ratio_kv: int = 1
-    attention_backend: Optional[str] = None
     use_gradient_checkpointing: bool = True
     use_dyt: bool = False
     dyt_alpha_init: float = 0.5
 
-    swa_layers_per_cycle: int = 2
-    mla_layers_per_cycle: int = 1
-    swa_window: int = 256
-    swa_sink_size: int = 4  # Number of initial tokens to always attend to (attention sink)
+    # Architecture: DeltaNet + MLA interleaving
+    swa_layers_per_cycle: int = 2  # DeltaNet blocks per cycle (kept name for compatibility)
+    mla_layers_per_cycle: int = 1  # MLA blocks per cycle
     rope_theta: float = 10000.0
-
-    logit_scale_base: Optional[float] = None
-    logit_scale_window: int = 128
-    logit_scale_offset: int = 0
-    logit_scale_min: float = 1.0
-    logit_scale_max: Optional[float] = None
-    apply_logit_scale_during_training: bool = False
 
     # MLA specific parameters
     q_lora_rank: int = 0
@@ -210,29 +70,14 @@ class SWAMLAConfig:
     rope_scaling: Optional[Dict[str, float]] = None
     rope_factor: float = 1.0
     mscale: float = 1.0
-    use_fp8: bool = False
-    fp8_mla_params: bool = False
-    fp8_tile_size: int = 128
-    use_te_fp8: bool = False  # Use Transformer Engine native FP8 Linear layers
 
-    # FlexAttention (padding-aware attention for real FLOPs savings)
-    use_flex_attention: bool = False  # Use FlexAttention with BlockMask for SWA blocks
-    # FlashAttention varlen (padding-aware with flash_attn_varlen_func)
-    use_flash_attention: bool = False  # Use FlashAttention for SWA blocks
-    # Enable varlen masking (skip padded tokens) - only works with use_flash_attention=True
-    use_varlen_masking: bool = True  # Set to False to disable padding-aware attention
-    # Gated DeltaNet (linear attention O(n) - replaces SWA blocks)
-    use_gated_deltanet: bool = False  # Use GatedDeltaNet instead of SWA for local attention
+    # Flash Attention for MLA blocks
+    use_flash_attention: bool = True
 
-    # MLA Selective specific parameters
-    use_mla_selective: bool = False  # Use MLA Selective instead of standard MLA
-    selection_head_idx: int = 0  # Which attention head to use for selection
-
-    # Neural Memory configuration (Titans paper)
-    use_neural_memory: bool = False  # Enable neural long-term memory for MLA blocks
-    memory_dim: int = 256  # Internal MLP dimension in memory module
-    memory_depth: int = 2  # Number of layers in memory MLP
-    memory_layers: Optional[List[int]] = None  # Which layers have memory (None = all MLA layers)
+    # DeltaNet configuration
+    use_gated_deltanet: bool = True  # Use GatedDeltaNet for local attention (O(n) linear)
+    deltanet_latent_dim: int = 0  # 0 = disabled, >0 = latent dimension for projections
+    deltanet_share_qk: bool = False  # If True, Q and K share projection weights
 
     label_smoothing: float = 0.0
 
@@ -245,81 +90,24 @@ class SWAMLAConfig:
     router_z_loss_coef: float = 0.001
 
     # LatentMoE configuration (NVIDIA Nemotron-3 style)
-    # When enabled, projects tokens to latent space before expert computation
-    # This allows more experts with same compute budget for better quality
     use_latent_moe: bool = False
-    latent_ratio: int = 4  # d_model / latent_dim ratio (e.g., 4 means latent_dim = n_embd / 4)
-    latent_dim: Optional[int] = None  # Explicit latent dim (overrides latent_ratio if set)
-    # Note: When use_latent_moe=True, n_experts and n_activated are automatically scaled
-    # by latent_ratio unless latent_n_experts/latent_n_activated are explicitly set
+    latent_ratio: int = 4  # d_model / latent_dim ratio
+    latent_dim: Optional[int] = None  # Explicit latent dim (overrides latent_ratio)
     latent_n_experts: Optional[int] = None  # Override: total experts for LatentMoE
     latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
-    latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim (more params, more capacity)
+    latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
 
     def __post_init__(self) -> None:
-        # Set expert_dim to n_embd if not specified
         if self.expert_dim is None:
             self.expert_dim = self.n_embd
         if self.swa_layers_per_cycle < 0 or self.mla_layers_per_cycle < 0:
             raise ValueError("Layer counts per cycle must be non-negative")
         if self.swa_layers_per_cycle + self.mla_layers_per_cycle == 0:
-            raise ValueError("At least one SWA or MLA layer per cycle is required")
-
-
-class MLASelectiveBlock(nn.Module):
-    """MLA Selective block with residual MLP."""
-
-    def __init__(self, config, layer_id: int):
-        super().__init__()
-        self.config = config
-        self.layer_id = layer_id
-
-        if config.use_dyt:
-            self.norm1 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
-            self.norm2 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
-        else:
-            self.norm1 = RMSNorm(config.n_embd)
-            self.norm2 = RMSNorm(config.n_embd)
-
-        # MLASelective not included in this standalone version - use standard MLA instead
-        from mla import MLA
-        self.attn = MLA(config)
-        self.mlp = MLP(config)
-        self.use_checkpoint = config.use_gradient_checkpointing
-        self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
-
-    def _attn_block(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        return self.attn(self.norm1(x), start_pos, freqs_cis, mask)
-
-    def _mlp_block(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.norm2(x))
-
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        use_ckpt = self.use_checkpoint and self.training
-
-        if use_ckpt:
-            # Use TE checkpoint for FP8-aware checkpointing
-            if self.use_te_fp8 and te_checkpoint is not None:
-                attn_out = te_checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_te_fp8=True)
-            else:
-                attn_out = checkpoint.checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_reentrant=False)
-        else:
-            attn_out = self._attn_block(x, start_pos, freqs_cis, mask)
-        x = x + attn_out
-
-        if use_ckpt:
-            if self.use_te_fp8 and te_checkpoint is not None:
-                mlp_out = te_checkpoint(self._mlp_block, x, use_te_fp8=True)
-            else:
-                mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
-        else:
-            mlp_out = self._mlp_block(x)
-        x = x + mlp_out
-        return x
+            raise ValueError("At least one DeltaNet or MLA layer per cycle is required")
 
 
 class SWAMLAModel(nn.Module):
-    """Model interleaving SWA layers with MLA Selective blocks."""
+    """DeltaNet-MLA hybrid model with LatentMoE."""
 
     def __init__(self, config: SWAMLAConfig):
         super().__init__()
@@ -360,7 +148,7 @@ class SWAMLAModel(nn.Module):
         self.register_buffer("freqs_cis", freqs, persistent=False)
 
         cycle_len = config.swa_layers_per_cycle + config.mla_layers_per_cycle
-        swa_per_cycle = config.swa_layers_per_cycle
+        deltanet_per_cycle = config.swa_layers_per_cycle
 
         for layer_idx in range(config.n_layer):
             # Calculate scaling factor for this layer: 0.5x at first layer to 2.0x at last layer
@@ -368,92 +156,33 @@ class SWAMLAModel(nn.Module):
                 scale_factor = 0.5 + 1.5 * (layer_idx / (config.n_layer - 1))
             else:
                 scale_factor = 1.0
-            
+
             position_in_cycle = layer_idx % cycle_len
-            if position_in_cycle < swa_per_cycle:
-                # SWA Layer
-                scaled_window = int(config.swa_window * scale_factor)
-                # Ensure window is at least 1 and even (optional but good practice)
-                scaled_window = max(1, scaled_window)
-                
-                logit_scale_window = config.logit_scale_window if config.logit_scale_window is not None else 128
-                logit_scale_offset = config.logit_scale_offset if config.logit_scale_offset is not None else 0
-                logit_scale_min = config.logit_scale_min if config.logit_scale_min is not None else 1.0
-                layer_config = SWALayerConfig(
+            if position_in_cycle < deltanet_per_cycle:
+                # DeltaNet Layer (O(n) linear attention)
+                if GatedDeltaNetBlock is None:
+                    raise RuntimeError("GatedDeltaNet not available. Install fla: pip install fla")
+
+                layer_config = DeltaNetLayerConfig(
                     n_embd=config.n_embd,
                     n_head=config.n_head,
                     block_size=config.block_size,
                     dropout=config.dropout,
                     bias=config.bias,
-                    ratio_kv=config.ratio_kv,
-                    attention_backend=config.attention_backend,
-                    use_rope=True,
-                    attention_window=scaled_window,
-                    attention_sink_size=config.swa_sink_size,
-                    rope_theta=config.rope_theta,
-                    logit_scale_base=config.logit_scale_base,
-                    logit_scale_window=logit_scale_window,
-                    logit_scale_offset=logit_scale_offset,
-                    logit_scale_min=logit_scale_min,
-                    logit_scale_max=config.logit_scale_max,
-                    logit_scale_during_training=config.apply_logit_scale_during_training,
                     use_gradient_checkpointing=config.use_gradient_checkpointing,
-                    use_dyt=config.use_dyt,
-                    dyt_alpha_init=config.dyt_alpha_init,
-                    # Pass FP8 configuration to SWA blocks
-                    use_fp8=config.use_fp8,
-                    fp8_mla_params=config.fp8_mla_params,
-                    fp8_tile_size=config.fp8_tile_size,
-                    use_te_fp8=config.use_te_fp8,
-                    # FlexAttention for padding-aware attention
-                    use_flex_attention=config.use_flex_attention,
-                    # FlashAttention varlen for padding-aware attention (recommended)
-                    use_flash_attention=config.use_flash_attention,
+                    deltanet_latent_dim=config.deltanet_latent_dim,
+                    deltanet_share_qk=config.deltanet_share_qk,
                 )
-                # Choose between SWA and GatedDeltaNet
-                if config.use_gated_deltanet and GatedDeltaNetBlock is not None:
-                    block = GatedDeltaNetBlock(layer_config)
-                else:
-                    block = SWALocalBlock(layer_config)
+                block = GatedDeltaNetBlock(layer_config)
             else:
                 # MLA Layer
                 scaled_rank = int(config.kv_lora_rank * scale_factor)
-                # Ensure rank is at least 1 and multiple of 16/32 if needed, but let's just keep it int for now
                 scaled_rank = max(1, scaled_rank)
 
-                # Create a copy of config with modified rank
-                # We can't easily copy and modify the dataclass if it's frozen, but SWAMLAConfig is not frozen
-                # However, to avoid side effects, let's use the helper or modify a copy
+                mla_config = _create_mla_block_config(config)
+                mla_config.kv_lora_rank = scaled_rank
+                block = MLABlock(mla_config, layer_id=layer_idx)
 
-                if config.use_mla_selective:
-                    # For MLASelective, we need to pass a config object
-                    # Let's create a proxy or modified copy
-                    import copy
-                    layer_specific_config = copy.copy(config)
-                    layer_specific_config.kv_lora_rank = scaled_rank
-                    block = MLASelectiveBlock(layer_specific_config, layer_id=layer_idx)
-                elif config.use_neural_memory:
-                    # Check if this layer should have memory
-                    has_memory = (
-                        config.memory_layers is None or
-                        layer_idx in config.memory_layers
-                    )
-                    if has_memory:
-                        # Use MLAMemoryBlock with neural long-term memory
-                        mla_config = _create_mla_block_config(config)
-                        mla_config.kv_lora_rank = scaled_rank
-                        mla_config.memory_dim = config.memory_dim
-                        mla_config.memory_depth = config.memory_depth
-                        block = MLAMemoryBlock(mla_config, layer_id=layer_idx)
-                    else:
-                        # Standard MLA without memory
-                        mla_config = _create_mla_block_config(config)
-                        mla_config.kv_lora_rank = scaled_rank
-                        block = MLABlock(mla_config, layer_id=layer_idx)
-                else:
-                    mla_config = _create_mla_block_config(config)
-                    mla_config.kv_lora_rank = scaled_rank
-                    block = MLABlock(mla_config, layer_id=layer_idx)
             block.use_checkpoint = config.use_gradient_checkpointing
             self.transformer.h.append(block)
 
@@ -463,19 +192,13 @@ class SWAMLAModel(nn.Module):
         self.apply(self._init_weights)
         self.param_count = sum(p.numel() for p in self.parameters())
 
-        # Count SWA, DeltaNet, and MLA blocks
-        swa_count = sum(1 for block in self.transformer.h if isinstance(block, SWALocalBlock))
+        # Count DeltaNet and MLA blocks
         deltanet_count = sum(1 for block in self.transformer.h if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock))
-        mla_selective_count = sum(1 for block in self.transformer.h if isinstance(block, MLASelectiveBlock))
-        mla_memory_count = sum(1 for block in self.transformer.h if isinstance(block, MLAMemoryBlock))
-        mla_standard_count = sum(1 for block in self.transformer.h if isinstance(block, MLABlock) and not isinstance(block, MLAMemoryBlock))
+        mla_count = sum(1 for block in self.transformer.h if isinstance(block, MLABlock))
 
         # Calculate active parameters for MoE models
         active_param_count = None
         if config.use_moe:
-            # For MoE: count non-expert params + active expert params only
-            # Active experts = n_activated (routed) + n_shared_experts (always active)
-            # Use class name check to avoid import path issues
             def is_moe_layer(module):
                 return module.__class__.__name__ in ('MoELayer', 'LatentMoELayer')
 
@@ -484,53 +207,31 @@ class SWAMLAModel(nn.Module):
 
             for name, module in self.named_modules():
                 if is_moe_layer(module):
-                    # Total params in this MoE layer
                     layer_params = sum(p.numel() for p in module.parameters())
                     all_moe_params += layer_params
 
-                    # Count shared experts (always active)
                     for expert in module.shared_experts:
                         moe_active_params += sum(p.numel() for p in expert.parameters())
-                    # Count only n_activated routed experts (out of n_experts total)
-                    # Each expert has the same size, so: active = total_routed * (n_activated / n_experts)
                     total_routed_params = sum(p.numel() for p in module.experts.parameters())
                     active_routed_params = total_routed_params * module.n_activated // module.n_experts
                     moe_active_params += active_routed_params
-                    # Router params are always active
                     moe_active_params += sum(p.numel() for p in module.router.parameters())
-                    # For LatentMoE: also count the latent projection layers (always active)
                     if hasattr(module, 'down_proj'):
                         moe_active_params += sum(p.numel() for p in module.down_proj.parameters())
                     if hasattr(module, 'up_proj'):
                         moe_active_params += sum(p.numel() for p in module.up_proj.parameters())
 
-            # Non-MoE params = total - all MoE layer params
             non_moe_params = self.param_count - all_moe_params
             active_param_count = non_moe_params + moe_active_params
 
-        if config.use_mla_selective:
-            model_type = "SWAMLA-Selective"
-        elif config.use_neural_memory:
-            model_type = "SWAMLA-Memory"
-        elif config.use_gated_deltanet:
-            model_type = "DeltaNet-MLA"
-        else:
-            model_type = "SWAMLA"
-
+        model_type = "DeltaNet-MLA"
         if config.use_moe:
             model_type += "-MoE"
 
         print(f"{model_type} Model - Number of parameters: {self.param_count / 1e6:.2f}M")
         if active_param_count is not None:
             print(f"  - Active parameters per forward: {active_param_count / 1e6:.2f}M ({100 * active_param_count / self.param_count:.1f}%)")
-        if config.use_mla_selective:
-            print(f"  - {swa_count} SWA blocks, {mla_selective_count} MLA Selective blocks")
-        elif config.use_neural_memory:
-            print(f"  - {swa_count} SWA blocks, {mla_memory_count} MLA Memory blocks, {mla_standard_count} MLA blocks")
-        elif config.use_gated_deltanet:
-            print(f"  - {deltanet_count} DeltaNet blocks, {mla_standard_count} MLA blocks")
-        else:
-            print(f"  - {swa_count} SWA blocks, {mla_standard_count} MLA blocks")
+        print(f"  - {deltanet_count} DeltaNet blocks, {mla_count} MLA blocks")
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -545,28 +246,16 @@ class SWAMLAModel(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         return_all_logits: bool = False,
-        memory_states: Optional[List[MemoryState]] = None,
-        return_memory_states: bool = False
     ):
-        """Forward pass with optional memory state management.
+        """Forward pass.
 
         Args:
             idx: Input token indices [B, S]
             targets: Target token indices for loss computation [B, S]
             return_all_logits: If True, return logits for all positions
-            memory_states: List of MemoryState objects for MLAMemoryBlocks
-            return_memory_states: If True, return updated memory states
 
         Returns:
-            If return_memory_states is False:
-                (logits, loss)
-            If return_memory_states is True:
-                (logits, loss, new_memory_states)
-
-        For training with truncated BPTT:
-            logits, loss, new_states = model(x, targets, memory_states=states,
-                                             return_memory_states=True)
-            states = [s.detach() for s in new_states]  # Truncate gradients
+            (logits, loss) tuple
         """
         device = idx.device
         b, t = idx.size()
@@ -586,28 +275,10 @@ class SWAMLAModel(nn.Module):
         # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
         freqs_cis = self.freqs_cis[:t].to(device, non_blocking=True).detach()
 
-        # Extract sequence lengths for FlexAttention/FlashAttention (to skip padded positions)
-        # Clone immediately to prevent CUDAGraph overwrite issues
-        # See: https://pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html
-        seq_lengths = None
-        use_varlen = getattr(self.config, 'use_varlen_masking', True)
-        if use_varlen and (self.config.use_flex_attention or self.config.use_flash_attention) and targets is not None:
-            seq_lengths = get_seq_lengths_from_labels(targets, ignore_index=-100).clone()
-
-        # Track memory states for MLAMemoryBlocks
-        new_memory_states = []
-        memory_idx = 0
-
         for block in self.transformer.h:
-            if isinstance(block, SWALocalBlock):
-                x = block(x, seq_lengths=seq_lengths)
-            elif isinstance(block, MLAMemoryBlock):
-                # MLAMemoryBlock handles memory state
-                state = memory_states[memory_idx] if memory_states else None
-                x, new_state = block(x, 0, freqs_cis, attn_mask, memory_state=state)
-                new_memory_states.append(new_state)
-                memory_idx += 1
-            elif isinstance(block, (MLASelectiveBlock, MLABlock)):
+            if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock):
+                x = block(x)
+            elif isinstance(block, MLABlock):
                 x = block(x, 0, freqs_cis, attn_mask)
             else:
                 # Fallback for any other block type
@@ -638,16 +309,11 @@ class SWAMLAModel(nn.Module):
                     ignore_index=-100,
                 )
         elif return_all_logits:
-            # Training mode: return logits for all positions without computing loss
             logits = self.lm_head(x)
             loss = None
         else:
-            # Inference mode: return logits only for last position
             logits = self.lm_head(x[:, [-1], :])
             loss = None
-
-        if return_memory_states:
-            return logits, loss, new_memory_states
 
         return logits, loss
 
@@ -697,7 +363,6 @@ class SWAMLAModel(nn.Module):
         top_k: Optional[int] = None,
         prompt=None,
         gen_length: Optional[int] = None,
-        use_memory: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Generate tokens autoregressively.
 
@@ -708,7 +373,6 @@ class SWAMLAModel(nn.Module):
             top_k: Top-k sampling parameter
             prompt: Alternative name for idx
             gen_length: Alternative name for max_new_tokens
-            use_memory: Whether to use persistent memory states during generation
 
         Returns:
             (generated_tokens, None)
@@ -723,21 +387,9 @@ class SWAMLAModel(nn.Module):
         )
         self.eval()
 
-        # Initialize memory states for generation if model uses neural memory
-        memory_states = None
-        has_memory = self.config.use_neural_memory and use_memory
-
         for _ in range(tokens_to_generate):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-
-            if has_memory:
-                logits, _, memory_states = self(
-                    idx_cond,
-                    memory_states=memory_states,
-                    return_memory_states=True
-                )
-            else:
-                logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond)
 
             logits = logits[:, -1, :] / max(temperature, 1e-6)
             if top_k is not None:
@@ -748,24 +400,6 @@ class SWAMLAModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx, None
-
-    def configure_optimizers(
-        self,
-        weight_decay: float,
-        learning_rate: float,
-        betas,
-        device_type: str,
-        optimizer_type: Optional[str] = None,
-        **kwargs,
-    ):
-        """
-        Configure optimizer for the SWA-MLA model.
-
-        This is handled by the training script - optimizer configuration
-        moved to train.py for standalone operation.
-        """
-        # Optimizer configuration is now in train.py
-        raise NotImplementedError("Use the training script's optimizer configuration")
 
 
 def _create_mla_block_config(config: SWAMLAConfig):
@@ -794,13 +428,6 @@ def _create_mla_block_config(config: SWAMLAConfig):
         rope_theta: float = config.rope_theta
         rope_factor: float = config.rope_factor
         mscale: float = config.mscale
-        use_fp8: bool = config.use_fp8
-        fp8_mla_params: bool = config.fp8_mla_params
-        fp8_tile_size: int = config.fp8_tile_size
-        use_te_fp8: bool = config.use_te_fp8
-        # Neural memory parameters (for MLAMemoryBlock)
-        memory_dim: int = config.memory_dim
-        memory_depth: int = config.memory_depth
         # MoE parameters
         use_moe: bool = config.use_moe
         n_experts: int = config.n_experts

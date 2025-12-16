@@ -61,12 +61,45 @@ class GatedDeltaNet(nn.Module):
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
+        proj_dim = self.n_head * self.head_dim
 
-        # Projections
-        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
+        # Latent compression config
+        self.latent_dim = getattr(config, 'deltanet_latent_dim', 0)
+        self.share_qk = getattr(config, 'deltanet_share_qk', False)
+
+        # Build projections based on configuration
+        if self.latent_dim > 0:
+            # Latent projections: down -> up bottleneck (50% param reduction per projection)
+            if self.share_qk:
+                # Shared Q/K with latent compression
+                self.qk_down = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+                self.qk_up = nn.Linear(self.latent_dim, proj_dim, bias=False)
+            else:
+                # Separate Q/K with latent compression
+                self.q_down = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+                self.q_up = nn.Linear(self.latent_dim, proj_dim, bias=False)
+                self.k_down = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+                self.k_up = nn.Linear(self.latent_dim, proj_dim, bias=False)
+
+            # V always has its own projection
+            self.v_down = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+            self.v_up = nn.Linear(self.latent_dim, proj_dim, bias=False)
+
+            # Output projection with latent bottleneck
+            self.o_down = nn.Linear(proj_dim, self.latent_dim, bias=False)
+            self.o_up = nn.Linear(self.latent_dim, config.n_embd, bias=False)
+        else:
+            # Original full projections
+            if self.share_qk:
+                # Shared Q/K without latent compression
+                self.qk_proj = nn.Linear(config.n_embd, proj_dim, bias=False)
+            else:
+                # Separate Q/K projections
+                self.q_proj = nn.Linear(config.n_embd, proj_dim, bias=False)
+                self.k_proj = nn.Linear(config.n_embd, proj_dim, bias=False)
+
+            self.v_proj = nn.Linear(config.n_embd, proj_dim, bias=False)
+            self.o_proj = nn.Linear(proj_dim, config.n_embd, bias=False)
 
         # Gate projection (single gate g for decay)
         self.g_proj = nn.Linear(config.n_embd, self.n_head, bias=False)
@@ -78,9 +111,9 @@ class GatedDeltaNet(nn.Module):
         self.use_short_conv = getattr(config, 'deltanet_use_conv', True)
         if self.use_short_conv:
             conv_kernel = getattr(config, 'deltanet_conv_kernel', 4)
-            self.q_conv = ShortConvolution(self.n_head * self.head_dim, conv_kernel)
-            self.k_conv = ShortConvolution(self.n_head * self.head_dim, conv_kernel)
-            self.v_conv = ShortConvolution(self.n_head * self.head_dim, conv_kernel)
+            self.q_conv = ShortConvolution(proj_dim, conv_kernel)
+            self.k_conv = ShortConvolution(proj_dim, conv_kernel)
+            self.v_conv = ShortConvolution(proj_dim, conv_kernel)
 
         # Dropout
         self.dropout = nn.Dropout(config.dropout)
@@ -92,10 +125,34 @@ class GatedDeltaNet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.o_proj.weight, gain=0.1)
+        # Initialize based on projection configuration
+        if self.latent_dim > 0:
+            # Latent projections
+            if self.share_qk:
+                nn.init.xavier_uniform_(self.qk_down.weight, gain=0.1)
+                nn.init.xavier_uniform_(self.qk_up.weight, gain=0.1)
+            else:
+                nn.init.xavier_uniform_(self.q_down.weight, gain=0.1)
+                nn.init.xavier_uniform_(self.q_up.weight, gain=0.1)
+                nn.init.xavier_uniform_(self.k_down.weight, gain=0.1)
+                nn.init.xavier_uniform_(self.k_up.weight, gain=0.1)
+
+            nn.init.xavier_uniform_(self.v_down.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.v_up.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.o_down.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.o_up.weight, gain=0.1)
+        else:
+            # Original full projections
+            if self.share_qk:
+                nn.init.xavier_uniform_(self.qk_proj.weight, gain=0.1)
+            else:
+                nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+                nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+
+            nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
+            nn.init.xavier_uniform_(self.o_proj.weight, gain=0.1)
+
+        # Always initialize gate and beta projections
         nn.init.xavier_uniform_(self.g_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(self.beta_proj.weight, gain=0.1)
 
@@ -116,10 +173,27 @@ class GatedDeltaNet(nn.Module):
         """
         B, T, D = x.shape
 
-        # Project Q, K, V
-        q = self.q_proj(x)  # (B, T, n_head * head_dim)
-        k = self.k_proj(x)  # (B, T, n_head * head_dim)
-        v = self.v_proj(x)  # (B, T, n_head * head_dim)
+        # Project Q, K, V based on configuration
+        if self.latent_dim > 0:
+            # Latent projections: down -> up bottleneck
+            if self.share_qk:
+                qk = self.qk_up(self.qk_down(x))  # Shared projection
+                q = qk
+                k = qk  # K will be normalized later
+            else:
+                q = self.q_up(self.q_down(x))
+                k = self.k_up(self.k_down(x))
+            v = self.v_up(self.v_down(x))
+        else:
+            # Original full projections
+            if self.share_qk:
+                qk = self.qk_proj(x)  # Shared projection
+                q = qk
+                k = qk  # K will be normalized later
+            else:
+                q = self.q_proj(x)
+                k = self.k_proj(x)
+            v = self.v_proj(x)
 
         # Apply short convolutions for local context
         if self.use_short_conv:
@@ -140,6 +214,7 @@ class GatedDeltaNet(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim)
 
         # L2 normalize keys for stability (required by delta rule)
+        # This also differentiates K from Q when using shared projection
         k = F.normalize(k, p=2, dim=-1)
 
         # FLA kernel requires bf16 - convert all tensors
@@ -149,8 +224,6 @@ class GatedDeltaNet(nn.Module):
             v = v.to(torch.bfloat16)
             g = g.to(torch.bfloat16)
             beta = beta.to(torch.bfloat16)
-
-
         else:
             # Ensure all tensors have the same dtype
             dtype = q.dtype
@@ -189,7 +262,12 @@ class GatedDeltaNet(nn.Module):
         if output.dtype != x.dtype:
             output = output.to(x.dtype)
 
-        output = self.o_proj(output)
+        # Output projection (latent or full)
+        if self.latent_dim > 0:
+            output = self.o_up(self.o_down(output))
+        else:
+            output = self.o_proj(output)
+
         output = self.dropout(output)
 
         return output

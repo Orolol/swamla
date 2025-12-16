@@ -1,4 +1,4 @@
-"""MLP and Block components for transformer models."""
+"""MLP components for transformer models."""
 
 import torch
 import torch.nn as nn
@@ -6,36 +6,22 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
 from normalization import RMSNorm
-from attention import CausalSelfAttention
-
-# Import TE FP8 helper
-try:
-    from optimization.fp8_te import get_te_linear, HAS_TE
-except ImportError:
-    HAS_TE = False
-    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
-        return nn.Linear(in_features, out_features, bias=bias)
 
 
 class MLP(nn.Module):
     """
-    Multi-Layer Perceptron avec activation SwiGLU optimisée et gestion efficace de la mémoire.
+    Multi-Layer Perceptron with SwiGLU activation.
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # Utiliser 4 * n_embd comme dimension cachée par défaut
+        # Default hidden dimension: 4 * n_embd
         hidden_dim = 4 * config.n_embd
 
-        # Check if TE FP8 should be used
-        use_te_fp8 = getattr(config, 'use_te_fp8', False)
-
-        # Projections combinées pour réduire le nombre d'opérations
-        # Use TE FP8 linear layers if enabled
-        self.gate_up_proj = get_te_linear(config.n_embd, 2 * hidden_dim, bias=config.bias, use_te_fp8=use_te_fp8)
-        self.down_proj = get_te_linear(hidden_dim, config.n_embd, bias=config.bias, use_te_fp8=use_te_fp8)
-        self.using_te_fp8 = use_te_fp8 and HAS_TE
+        # Combined gate+up projection for efficiency
+        self.gate_up_proj = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
+        self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
 
         self.dropout = nn.Dropout(config.dropout)
 
@@ -49,21 +35,16 @@ class MLP(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Initialisation spéciale des poids pour une meilleure convergence
-        """
-        # Scaled initialization for better gradient flow
+        """Initialize weights for better gradient flow."""
         scale = 2 / (self.config.n_embd ** 0.5)
 
-        # TE Linear has its own init, so only init if not using TE FP8
-        if not self.using_te_fp8:
-            nn.init.normal_(self.gate_up_proj.weight, mean=0.0, std=scale)
-            if self.gate_up_proj.bias is not None:
-                nn.init.zeros_(self.gate_up_proj.bias)
+        nn.init.normal_(self.gate_up_proj.weight, mean=0.0, std=scale)
+        if self.gate_up_proj.bias is not None:
+            nn.init.zeros_(self.gate_up_proj.bias)
 
-            nn.init.normal_(self.down_proj.weight, mean=0.0, std=scale)
-            if self.down_proj.bias is not None:
-                nn.init.zeros_(self.down_proj.bias)
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=scale)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
 
     def _get_optimized_activation(self):
         """
@@ -123,66 +104,3 @@ class MLP(nn.Module):
             return checkpoint.checkpoint(self._fuse_operations, x, use_reentrant=False)
 
         return self._fuse_operations(x)
-
-class Block(nn.Module):
-    """
-    Transformer block with attention and MLP
-    """
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd)
-        self.mlp = MLP(config)
-        # Respect config for gradient checkpointing
-        self.use_checkpoint = getattr(config, 'use_gradient_checkpointing', True)
-
-    def _attn_block(self, x, key_value=None):
-        ln_out = self.ln_1(x)
-        if key_value is not None:
-            return self.attn(ln_out, key_value=key_value)
-        return self.attn(ln_out)
-
-    def _mlp_block(self, x):
-        return self.mlp(self.ln_2(x))
-
-    def forward(self, x, key_value=None):
-        # Disable gradient checkpointing when using compiled model
-        if hasattr(self, '_compiled_forward'):
-            self.use_checkpoint = False
-        
-        if self.use_checkpoint and self.training:
-            # Modified wrapper for gradient checkpointing
-            def create_custom_forward(func):
-                def custom_forward(*inputs):
-                    # Filter out None inputs
-                    valid_inputs = [inp for inp in inputs if inp is not None]
-                    return func(*valid_inputs)
-                return custom_forward
-
-            # Attention with checkpoint
-            attn_func = create_custom_forward(self._attn_block)
-            attn_out = checkpoint.checkpoint(
-                attn_func, 
-                x, 
-                key_value,
-                use_reentrant=False,
-                preserve_rng_state=True
-            )
-            x = x + attn_out
-
-            # MLP with checkpoint
-            mlp_func = create_custom_forward(self._mlp_block)
-            mlp_out = checkpoint.checkpoint(
-                mlp_func, 
-                x,
-                use_reentrant=False,
-                preserve_rng_state=True
-            )
-            x = x + mlp_out
-        else:
-            # Standard forward pass without checkpoint
-            x = x + self._attn_block(x, key_value)
-            x = x + self._mlp_block(x)
-
-        return x 
