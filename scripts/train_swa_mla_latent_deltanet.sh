@@ -23,7 +23,7 @@ BLOCK_SIZE=${2:-2048}
 OUTPUT_DIR=${3:-outputs/deltanet_mla_latent}
 RESUME_FROM_HF=${4:-false}  # Set to 'true' to resume from HuggingFace
 OPTIMIZER=${5:-muon}  # adamw or muon
-HF_REPO_ID=${6:-}  # e.g., "Orosius/deltanet-mla-latent"
+HF_REPO_ID=${6:-Orosius/deltanet-mla-latent}  # e.g., "Orosius/deltanet-mla-latent"
 USE_TENSORBOARD=${7:-true}  # Enable TensorBoard by default
 TENSORBOARD_PORT=${8:-6006}  # Default TensorBoard port
 
@@ -127,7 +127,7 @@ COMMON_ARGS="--size moe-1b \
     --tokenizer_name openai-community/gpt2 \
     --log_interval 10 \
     --eval_interval 1000 \
-    --save_interval 1000 \
+    --save_interval 5000 \
     $DELTANET_ARGS \
     --compile \
     --compile_mode max-autotune \

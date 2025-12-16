@@ -1,45 +1,52 @@
-# SWA-MLA: Standalone Sliding Window Attention + Multi-head Latent Attention
+# DeltaNet-MLA: Hybrid Linear Attention + Multi-head Latent Attention with LatentMoE
 
-A completely self-contained implementation of the SWA-MLA hybrid architecture for efficient large language model training.
+A high-performance hybrid architecture combining O(n) linear attention with MLA and efficient mixture-of-experts.
 
 ## Features
 
-- **Hybrid Architecture**: Combines Sliding Window Attention (SWA) for local context with Multi-head Latent Attention (MLA) for global understanding
-- **Memory Efficient**: MLA uses low-rank compression for KV cache, reducing memory footprint
-- **FP8 Support**: Automatic FP8 training on H100/H200 GPUs for 25-30% VRAM reduction
-- **Optimized Data Loading**: Packed sequence data loader minimizes padding waste
-- **Multiple Optimizers**: Supports AdamW, Lion, and FP8 variants
-- **Wandb Integration**: Built-in experiment tracking
-- **Multi-GPU Ready**: Full DDP support with optimized communication
-- **torch.compile Compatible**: Enhanced performance with PyTorch 2.0+ compilation
-- **Automatic HuggingFace Push**: Auto-upload checkpoints to HuggingFace Hub at every validation
-- **Resume from HuggingFace**: Seamlessly resume training from the latest checkpoint on HuggingFace Hub
+- **GatedDeltaNet**: O(n) linear attention for local context (replaces quadratic SWA)
+- **MLA (Multi-head Latent Attention)**: Global attention with low-rank KV compression
+- **LatentMoE**: NVIDIA Nemotron-3 style mixture-of-experts in latent space
+- **Flash Attention 2/3**: Optimized attention kernels for MLA blocks
+- **Muon + AdamW**: Native PyTorch Muon optimizer with AdamW fallback
+- **DeltaNet Latent Compression**: Bottleneck projections for Q/K/V/O
+- **Packed Sequence Loading**: Minimizes padding waste
+- **Multi-GPU Ready**: Full DDP support with auto-detection
+- **torch.compile**: Max-autotune mode for optimal throughput
+- **HuggingFace Integration**: Auto-push checkpoints and resume from HF
 
 ## Architecture Overview
 
-The SWA-MLA model interleaves two types of attention blocks:
+The model interleaves two types of attention blocks in a cyclic pattern (default: 2 DeltaNet + 1 MLA):
 
-### SWA (Sliding Window Attention) Blocks
-- Local attention with configurable window size (default: 256 tokens)
-- Attention sink: Always attends to first N tokens for stability
-- Uses RoPE (Rotary Position Embeddings)
-- Efficient for capturing local patterns
+### GatedDeltaNet Blocks (Local Context)
+- **O(n) linear attention** using the delta rule
+- Gated mechanism for improved expressiveness
+- Optional latent compression for Q/K/V/O projections
+- Optional shared Q/K projection (K is normalized Q)
+- Memory-efficient for long sequences
 
-### MLA (Multi-head Latent Attention) Blocks
-- Global attention with low-rank KV compression
-- Configurable LoRA ranks for Q and KV projections
+### MLA Blocks (Global Context)
+- **Flash Attention** for efficient computation
+- Low-rank KV compression via LoRA
 - Separate NoPE and RoPE head dimensions
-- Memory-efficient for long contexts
+- **LatentMoE FFN**: Projects to latent space before expert routing
+  - 4x compression ratio (e.g., 1024 → 256 latent dim)
+  - 4x more experts with same compute budget
+  - Better quality per FLOP
 
 ## Installation
 
 ```bash
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Install Flash Linear Attention (for GatedDeltaNet)
+pip install fla
 ```
 
 ## Quick Start
@@ -47,268 +54,152 @@ pip install -r requirements.txt
 ### Basic Training
 
 ```bash
-# Train small model (12 layers, 1024 dim)
-./scripts/train_swa_mla.sh small 8 2048
+# Train with defaults (auto-detects GPUs, uses DDP if multiple)
+./scripts/train_swa_mla_latent_deltanet.sh 8 2048
 
-# Train medium model (24 layers, 1536 dim)
-./scripts/train_swa_mla.sh medium 4 2048
+# Custom output directory
+./scripts/train_swa_mla_latent_deltanet.sh 8 2048 outputs/my_model
 
-# Train with Lion optimizer
-./scripts/train_swa_mla.sh small 16 2048 outputs/my_model false lion
-
-# Train with automatic HuggingFace push (set HF_TOKEN env var first)
-export HF_TOKEN="your_hf_token_here"
-./scripts/train_swa_mla.sh small 8 2048 outputs/my_model false adamw "Orosius/swamla"
-
-# Resume training from latest HuggingFace checkpoint
-./scripts/train_swa_mla.sh small 8 2048 outputs/my_model true adamw "Orosius/swamla"
+# With HuggingFace auto-push
+export HF_TOKEN="your_token"
+./scripts/train_swa_mla_latent_deltanet.sh 8 2048 outputs/my_model false muon "YourUser/your-repo"
 ```
-
-**Note:** See [RESUME_TRAINING.md](RESUME_TRAINING.md) for detailed guide on resuming training from HuggingFace.
 
 ### Advanced Training
 
 ```bash
 python train.py \
-    --size medium \
+    --size moe-1b \
     --batch_size 8 \
     --block_size 2048 \
-    --output_dir outputs/swa_mla \
-    --optimizer_type lion \
+    --optimizer_type muon \
     --learning_rate 1e-4 \
-    --max_iters 100000 \
-    --wandb_project my-llm-project \
     --compile \
+    --compile_mode max-autotune \
     --gradient_checkpointing \
-    --use_fp8  # Only on H100/H200
+    --deltanet_latent_dim 256 \
+    --deltanet_share_qk \
+    --mla_q_lora_rank 256
 ```
 
 ### Multi-GPU Training
 
 ```bash
-# Use torchrun for distributed training
+# Auto-detected by the script
+./scripts/train_swa_mla_latent_deltanet.sh 8 2048
+
+# Or manual with torchrun
 torchrun --nproc_per_node=4 train.py \
-    --size medium \
+    --size moe-1b \
     --batch_size 4 \
-    --block_size 2048 \
-    --gradient_accumulation_steps 4 \
     --compile
 ```
 
 ## Model Sizes
 
-| Size   | Layers | Embed Dim | Heads | Parameters |
-|--------|--------|-----------|-------|------------|
-| small  | 12     | 1024      | 12    | ~150M      |
-| base   | 24     | 1536      | 16    | ~400M      |
-| large  | 28     | 2048      | 24    | ~800M      |
-| xl     | 32     | 4096      | 32    | ~2B        |
+| Size    | Layers | Embed Dim | Heads | Total Params | Active Params |
+|---------|--------|-----------|-------|--------------|---------------|
+| small   | 12     | 1024      | 16    | ~150M        | ~150M         |
+| base    | 24     | 1536      | 16    | ~400M        | ~400M         |
+| large   | 28     | 2048      | 16    | ~800M        | ~800M         |
+| moe-1b  | 12     | 1024      | 12    | ~800M        | ~280M (35%)   |
+| moe-2b  | 18     | 1024      | 16    | ~1.5B        | ~400M (27%)   |
 
 ## Configuration
 
-### SWA Parameters
+### DeltaNet Parameters
 
-- `--swa_layers_per_cycle`: Number of SWA blocks per cycle (default: 2)
-- `--swa_window`: Sliding window size in tokens (default: 256)
-- `--swa_sink_size`: Number of initial tokens for attention sink (default: 4)
+- `--swa_layers_per_cycle`: DeltaNet blocks per cycle (default: 2)
+- `--deltanet_latent_dim`: Latent dimension for projections (0=disabled, default: 256)
+- `--deltanet_share_qk`: Share Q/K projection (K is normalized Q)
 
 ### MLA Parameters
 
-- `--mla_layers_per_cycle`: Number of MLA blocks per cycle (default: 1)
-- `--mla_q_lora_rank`: Q projection LoRA rank (default: 0 = no compression)
+- `--mla_layers_per_cycle`: MLA blocks per cycle (default: 1)
+- `--mla_q_lora_rank`: Q projection LoRA rank (default: 0)
 - `--mla_kv_lora_rank`: KV projection LoRA rank (default: 256)
-- `--mla_qk_nope_head_dim`: Non-positional head dimension (default: 128)
-- `--mla_qk_rope_head_dim`: RoPE head dimension (default: 64)
-- `--mla_v_head_dim`: Value head dimension (default: 128)
+- `--mla_qk_nope_head_dim`: Non-positional head dim (default: 128)
+- `--mla_qk_rope_head_dim`: RoPE head dim (default: 64)
+- `--mla_v_head_dim`: Value head dim (default: 128)
+
+### LatentMoE Parameters
+
+- `--use_moe`: Enable MoE for MLA blocks (default: true for moe-* sizes)
+- `--use_latent_moe`: Use LatentMoE instead of standard MoE (default: true)
+- `--latent_ratio`: Compression ratio (default: 4, i.e., latent_dim = n_embd/4)
+- `--n_experts`: Base number of routed experts (default: 32)
+- `--n_activated`: Base activated experts per token (default: 3)
+- `--n_shared_experts`: Always-active shared experts (default: 1)
+- `--latent_preserve_expert_dim`: Keep full expert_dim in latent space
 
 ### Training Parameters
 
 - `--learning_rate`: Peak learning rate (default: 1e-4)
 - `--warmup_iters`: Warmup iterations (default: 400)
 - `--grad_clip`: Gradient clipping norm (default: 1.0)
-- `--weight_decay`: AdamW weight decay (default: 0.1)
-- `--gradient_accumulation_steps`: Gradient accumulation (default: 1)
+- `--weight_decay`: Weight decay (default: 0.1)
+- `--gradient_checkpointing`: Enable gradient checkpointing
 
 ### Optimizer Options
 
-- `adamw`: Standard AdamW (fused on CUDA)
-- `lion`: Lion optimizer (50% less memory than AdamW)
+- `muon`: Native PyTorch Muon optimizer (requires PyTorch 2.6+)
+  - Uses ~200x higher LR than AdamW internally
+  - Only for exactly 2D parameters (matrices)
+  - Non-2D params use AdamW automatically
+- `adamw`: Standard fused AdamW
 
-With `--use_fp8` on H100/H200:
-- `FP8AdamW`: BF16 moments + FP8 compute
-- `FP8Lion`: BF16 moment + FP8 compute
+## Performance
 
-## Data Loading
+### Throughput (moe-1b on 2x RTX 5090)
 
-The packed data loader automatically:
-- Downloads FineWeb-Edu dataset (CC-MAIN-2024-10)
-- Packs multiple documents per sequence to minimize padding
-- Handles tokenization with configurable tokenizer
-- Supports DDP with automatic sharding
+| Configuration | Tokens/sec |
+|---------------|------------|
+| BF16 + compile (max-autotune) | ~35K |
+| + Gradient checkpointing | ~32K |
 
-### Custom Dataset
+### Memory Efficiency
 
-Modify `data/data_loader_packed.py` to use your own dataset:
+The LatentMoE architecture provides:
+- **4x more experts** with same compute budget
+- **~35% active parameters** per forward pass
+- Better scaling compared to dense models
 
-```python
-self.dataset = load_dataset(
-    "your-org/your-dataset",
-    split=split,
-    streaming=True,
-)
-```
-
-## FP8 Training
-
-### Requirements
-
-- NVIDIA H100 or H200 GPU
-- PyTorch 2.0+
-- transformer-engine (`pip install transformer-engine[pytorch]`)
-
-### Benefits
-
-- ~25-30% VRAM reduction vs BF16
-- ~38% speedup with torch.compile
-- BF16 optimizer moments for numerical stability
-- FP32 master weights and gradients
-
-### Usage
+## Environment Variables
 
 ```bash
-# FP8 is automatically enabled on H100/H200
-./scripts/train_swa_mla.sh medium 8 2048
-```
+# LatentMoE configuration
+LATENT_RATIO=4           # Compression ratio
+N_EXPERTS=32             # Base experts (scaled by LATENT_RATIO → 128)
+N_ACTIVATED=3            # Base activated (scaled → 12)
 
-## Logging
+# DeltaNet Latent Compression
+DELTANET_LATENT_DIM=256  # Latent dimension (0=disabled)
+DELTANET_SHARE_QK=true   # Share Q/K projection
 
-### Console Logging
-
-```
-Step    100 | Loss: 3.4567 | LR: 1.00e-04 | Tokens/sec: 45,123
-Step    200 | Loss: 3.2134 | LR: 1.00e-04 | Tokens/sec: 46,892
-```
-
-### Wandb Logging
-
-```bash
-export WANDB_API_KEY=your_key_here
-
-python train.py \
-    --wandb_project my-project \
-    --wandb_run_name swa_mla_experiment
-```
-
-Tracks:
-- Training loss
-- Validation loss and perplexity
-- Learning rate schedule
-- Tokens per second
-- GPU memory usage
-
-### Automatic HuggingFace Push
-
-The training script can automatically push checkpoints to HuggingFace Hub when validation loss improves. See [HUGGINGFACE_PUSH.md](HUGGINGFACE_PUSH.md) for complete documentation.
-
-**Quick setup:**
-```bash
-# 1. Set your HuggingFace token
-export HF_TOKEN="your_hf_token_here"
-
-# 2. Train with automatic push
-python train.py \
-    --size small \
-    --batch_size 8 \
-    --hf_repo_id "YourUsername/your-repo"
-```
-
-Features:
-- Automatically pushes when validation loss improves
-- Checkpoints named by tokens processed and loss (e.g., `checkpoint_tokens_512M_loss_2.3456`)
-- Includes model weights, config, tokenizer, and comprehensive README
-- Only master process pushes in multi-GPU training
-- Errors don't stop training
-
-## Performance Tips
-
-1. **Use torch.compile**: Add `--compile` for 10-20% speedup (requires PyTorch 2.0+)
-2. **Gradient Checkpointing**: Use `--gradient_checkpointing` to reduce memory at cost of 20% slower training
-3. **Batch Size**: Increase until GPU memory is ~90% used for best throughput
-4. **Gradient Accumulation**: Use `--gradient_accumulation_steps` to simulate larger batch sizes
-5. **Lion Optimizer**: Consider Lion for 50% less optimizer memory
-6. **FP8**: Use FP8 on H100/H200 for best memory efficiency
-7. **Packed Sequences**: The packed data loader is already optimized, but you can increase `buffer_docs`
-
-## Checkpointing
-
-Checkpoints are saved every `--save_interval` steps to `--output_dir`:
-
-```
-outputs/swa_mla/
-├── checkpoint_5000.pt
-├── checkpoint_10000.pt
-└── checkpoint_15000.pt
-```
-
-Each checkpoint contains:
-- Model state dict
-- Optimizer state dict
-- Training step
-- Full configuration
-
-### Resume Training
-
-To resume training from a checkpoint:
-
-```python
-checkpoint = torch.load('outputs/swa_mla/checkpoint_10000.pt')
-model.load_state_dict(checkpoint['model'])
-optimizer.load_state_dict(checkpoint['optimizer'])
-start_step = checkpoint['step']
+# MLA Q LoRA
+MLA_Q_LORA_RANK=256      # Q LoRA rank (0=disabled)
 ```
 
 ## Project Structure
 
 ```
-swa_mla/
+swamla/
 ├── models/
 │   ├── swa_mla_model.py      # Main hybrid model
-│   ├── mla.py                 # MLA attention implementation
-│   ├── mla_block.py           # MLA transformer block
-│   ├── attention.py           # SWA attention implementation
-│   ├── mlp.py                 # Feed-forward network
-│   ├── normalization.py       # RMSNorm, DynamicTanh
-│   └── positional_encoding.py # RoPE implementation
+│   ├── gated_deltanet.py     # GatedDeltaNet blocks
+│   ├── mla.py                # MLA attention
+│   ├── mla_block.py          # MLA transformer block
+│   ├── moe.py                # MoE and LatentMoE layers
+│   ├── mlp.py                # SwiGLU MLP
+│   ├── normalization.py      # RMSNorm, DynamicTanh
+│   └── positional_encoding.py # RoPE
 ├── data/
-│   └── data_loader_packed.py  # Packed sequence data loader
-├── optimization/
-│   └── fp8_trainer.py         # FP8 optimizers and utilities
+│   └── data_loader_packed.py # Packed sequence loader
 ├── scripts/
-│   └── train_swa_mla.sh       # Training launch script
-├── train.py                   # Main training script
-├── requirements.txt           # Python dependencies
-└── README.md                  # This file
+│   └── train_swa_mla_latent_deltanet.sh
+├── train.py                  # Main training script
+└── README.md
 ```
-
-## Technical Details
-
-### Memory Usage (Medium Model, Block Size 2048)
-
-| Configuration | VRAM per GPU |
-|---------------|--------------|
-| BF16 + AdamW | ~24 GB |
-| BF16 + Lion | ~18 GB |
-| FP8 + FP8AdamW | ~16 GB |
-| FP8 + FP8Lion | ~12 GB |
-
-### Training Speed (Medium Model, 4x H100)
-
-| Configuration | Tokens/sec |
-|---------------|------------|
-| BF16 | ~180K |
-| BF16 + compile | ~220K |
-| FP8 | ~200K |
-| FP8 + compile | ~270K |
 
 ## Troubleshooting
 
@@ -317,44 +208,39 @@ swa_mla/
 1. Reduce `--batch_size`
 2. Enable `--gradient_checkpointing`
 3. Reduce `--block_size`
-4. Use `--use_fp8` on H100/H200
-5. Switch to `--optimizer_type lion`
+4. Use smaller `--deltanet_latent_dim`
 
 ### NaN Loss
 
 1. Reduce `--learning_rate`
 2. Increase `--warmup_iters`
 3. Ensure `--grad_clip 1.0` is set
-4. Check data quality
 
 ### Slow Training
 
-1. Use `--compile` (PyTorch 2.0+)
+1. Use `--compile --compile_mode max-autotune`
 2. Increase `--batch_size` if memory allows
-3. Disable `--gradient_checkpointing` if memory allows
-4. Use FP8 on H100/H200
-5. Increase `--num_workers` for data loading
+3. Use `--num_workers 8` or higher
 
-## License
+### Muon Not Available
 
-This is a standalone implementation extracted from the gptoughts project for easy deployment and experimentation.
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@software{swa_mla_standalone,
-  title = {SWA-MLA: Standalone Implementation},
-  year = {2025},
-  note = {Hybrid Sliding Window + Multi-head Latent Attention}
-}
-```
+PyTorch Muon requires PyTorch 2.6+. The script automatically falls back to AdamW.
 
 ## References
 
+- [DeltaNet: Linear Transformers](https://arxiv.org/abs/2310.00701)
 - [Multi-head Latent Attention (DeepSeek)](https://arxiv.org/abs/2401.06066)
-- [Sliding Window Attention](https://arxiv.org/abs/2004.05150)
-- [RoPE: Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
-- [Lion Optimizer](https://arxiv.org/abs/2302.06675)
-- [FP8 Training (NVIDIA)](https://arxiv.org/abs/2209.05433)
+- [LatentMoE (NVIDIA Nemotron-3)](https://arxiv.org/abs/2407.08936)
+- [Flash Attention](https://arxiv.org/abs/2205.14135)
+- [Muon Optimizer](https://arxiv.org/abs/2502.16982)
+- [RoPE](https://arxiv.org/abs/2104.09864)
+
+## Citation
+
+```bibtex
+@software{deltanet_mla,
+  title = {DeltaNet-MLA: Hybrid Linear Attention with LatentMoE},
+  year = {2025},
+  note = {O(n) DeltaNet + MLA + LatentMoE Architecture}
+}
+```
