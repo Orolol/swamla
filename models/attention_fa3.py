@@ -136,12 +136,13 @@ class FA3CausalSelfAttention(nn.Module):
         # Apply RoPE
         if self.rope is not None:
             # RoPE expects (B, n_head, T, head_dim)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
+            # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
             q = self.rope(q)
             k = self.rope(k)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
         elif freqs_cis is not None:
             # Use external RoPE frequencies
             q, k = self._apply_rope_external(q, k, freqs_cis)
@@ -257,9 +258,10 @@ class FA3CausalSelfAttention(nn.Module):
         B, T, n_head, head_dim = q.shape
 
         # Transpose to (B, n_head, T, head_dim) for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
         # GQA: expand K, V heads if needed
         if self.n_head_kv != self.n_head:
@@ -276,7 +278,7 @@ class FA3CausalSelfAttention(nn.Module):
         )
 
         # Transpose back to (B, T, n_head, head_dim)
-        output = output.transpose(1, 2)
+        output = output.transpose(1, 2).contiguous()
 
         return output
 
@@ -481,9 +483,10 @@ class FA3MLAAttention(nn.Module):
         v_dim = v.shape[-1]
 
         # Transpose to (B, n_head, T, head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
         # For SDPA with different Q/K and V dims, compute attention manually
         # attn = softmax(Q @ K^T / scale) @ V
@@ -507,7 +510,7 @@ class FA3MLAAttention(nn.Module):
         output = torch.matmul(attn_weights, v)
 
         # Transpose back to (B, T, n_head, v_dim)
-        output = output.transpose(1, 2)
+        output = output.transpose(1, 2).contiguous()
 
         return output
 

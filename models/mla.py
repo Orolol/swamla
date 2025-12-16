@@ -263,9 +263,10 @@ class MLA(nn.Module):
                 x = self._flash_attention(q.contiguous(), k_to_use.contiguous(), v_to_use.contiguous(), causal=seqlen > 1)
             else:
                 # Reshape for SDPA: [B, H, S, D]
-                q_sdpa = q.transpose(1, 2)  # [B, H, S, D]
-                k_sdpa = k_to_use.transpose(1, 2)  # [B, H, T, D]
-                v_sdpa = v_to_use.transpose(1, 2)  # [B, H, T, D]
+                # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+                q_sdpa = q.transpose(1, 2).contiguous()  # [B, H, S, D]
+                k_sdpa = k_to_use.transpose(1, 2).contiguous()  # [B, H, T, D]
+                v_sdpa = v_to_use.transpose(1, 2).contiguous()  # [B, H, T, D]
 
                 # Use SDPA for attention computation
                 # Expand mask if provided from [S, T] to [B, H, S, T]
@@ -284,7 +285,7 @@ class MLA(nn.Module):
                 )
 
                 # Transpose back to [B, S, H, D]
-                x = attn_output.transpose(1, 2)
+                x = attn_output.transpose(1, 2).contiguous()
         else:
             # Optimized approach: use low-rank decomposition
             # Extract weight for wkv_b
@@ -329,9 +330,10 @@ class MLA(nn.Module):
                 x = self._flash_attention(q_full.contiguous(), k_full.contiguous(), v.contiguous(), causal=seqlen > 1)
             else:
                 # Reshape for SDPA: [B, H, S, D]
-                q_sdpa = q_full.transpose(1, 2)  # [B, H, S, D]
-                k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
-                v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
+                # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+                q_sdpa = q_full.transpose(1, 2).contiguous()  # [B, H, S, D]
+                k_sdpa = k_full.transpose(1, 2).contiguous()  # [B, H, T, D]
+                v_sdpa = v.transpose(1, 2).contiguous()  # [B, H, T, D]
 
                 # Use SDPA for attention computation
                 # Expand mask if provided from [S, T] to [B, H, S, T]
@@ -350,7 +352,7 @@ class MLA(nn.Module):
                 )
 
                 # Transpose back to [B, S, H, D]
-                x = attn_output.transpose(1, 2)
+                x = attn_output.transpose(1, 2).contiguous()
         
         # Reshape and project to output dimension
         x = x.reshape(bsz, seqlen, -1)

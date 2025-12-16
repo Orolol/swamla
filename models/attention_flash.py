@@ -197,8 +197,9 @@ class FlashCausalSelfAttention(nn.Module):
         # Apply RoPE before unpadding (needs positional info)
         if self.rope is not None:
             # RoPE expects (B, n_head, T, head_dim), so transpose, apply, transpose back
-            q = self.rope(q.transpose(1, 2)).transpose(1, 2)
-            k = self.rope(k.transpose(1, 2)).transpose(1, 2)
+            # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+            q = self.rope(q.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+            k = self.rope(k.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
 
         # Flash Attention only supports fp16 and bf16
         # RoPE or other ops might have converted to float32
@@ -367,9 +368,10 @@ class FlashCausalSelfAttention(nn.Module):
         B, T, n_head, head_dim = q.shape
 
         # Transpose to (B, n_head, T, head_dim) for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
         # GQA: expand K, V heads if needed
         if self.n_head_kv != self.n_head:
@@ -386,7 +388,7 @@ class FlashCausalSelfAttention(nn.Module):
         )
 
         # Transpose back to (B, T, n_head, head_dim)
-        output = output.transpose(1, 2)
+        output = output.transpose(1, 2).contiguous()
 
         return output
 

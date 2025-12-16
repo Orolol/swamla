@@ -29,34 +29,37 @@ class RoPE(nn.Module):
 
     def _rotate_half(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         B, H, T, D = x.shape
-        
+
         # Safety check for sequence length
         seq_len = min(seq_len, self.max_seq_len)
-        
+
+        # IMPORTANT: Ensure input is contiguous for torch.compile compatibility
+        x = x.contiguous()
+
         # Reshape with explicit dimensions
         x_reshaped = x.view(B, H, T, D // 2, 2)
-        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
-        
+        x1, x2 = x_reshaped[..., 0].contiguous(), x_reshaped[..., 1].contiguous()
+
         # Make sure we have enough cached values
         if T > self.max_seq_len:
             # Extend the cache if needed
             self._extend_cos_sin_cache(T)
-        
+
         # Get the cos and sin values for the current sequence length
         cos = self.cos_cached[:, :, :T, :(D//2)]
         sin = self.sin_cached[:, :, :T, :(D//2)]
-        
+
         # Ensure broadcasting works correctly by explicitly matching dimensions
-        cos = cos.expand(B, H, T, -1)
-        sin = sin.expand(B, H, T, -1)
-        
+        cos = cos.expand(B, H, T, -1).contiguous()
+        sin = sin.expand(B, H, T, -1).contiguous()
+
         # Apply rotation
         rotated = torch.stack([
             x1 * cos - x2 * sin,
             x2 * cos + x1 * sin,
         ], dim=-1)
-        
-        return rotated.view(B, H, T, D)
+
+        return rotated.view(B, H, T, D).contiguous()
         
     def _extend_cos_sin_cache(self, new_max_len):
         """Extend the cached cos and sin values if needed."""
