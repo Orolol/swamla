@@ -259,7 +259,8 @@ class MLA(nn.Module):
             if self.use_flash_attention and mask is None:
                 # Use Flash Attention (expects B, T, H, D)
                 # q, k_to_use, v_to_use are already (B, T, H, D)
-                x = self._flash_attention(q, k_to_use, v_to_use, causal=seqlen > 1)
+                # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+                x = self._flash_attention(q.contiguous(), k_to_use.contiguous(), v_to_use.contiguous(), causal=seqlen > 1)
             else:
                 # Reshape for SDPA: [B, H, S, D]
                 q_sdpa = q.transpose(1, 2)  # [B, H, S, D]
@@ -324,7 +325,8 @@ class MLA(nn.Module):
             if self.use_flash_attention and mask is None:
                 # Use Flash Attention (expects B, T, H, D)
                 # q_full, k_full are (B, T, H, qk_head_dim), v is (B, T, H, v_head_dim)
-                x = self._flash_attention(q_full, k_full, v, causal=seqlen > 1)
+                # IMPORTANT: Make tensors contiguous for torch.compile compatibility
+                x = self._flash_attention(q_full.contiguous(), k_full.contiguous(), v.contiguous(), causal=seqlen > 1)
             else:
                 # Reshape for SDPA: [B, H, S, D]
                 q_sdpa = q_full.transpose(1, 2)  # [B, H, S, D]
