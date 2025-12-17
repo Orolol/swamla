@@ -206,12 +206,16 @@ class MLA(nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         
         # Apply rotary positional encoding to q_pe
+        # RoPE expects [B, H, T, D] but q_pe is [B, T, H, D], so transpose
         if freqs_cis is not None:
-            # Ensure input tensors have correct shape [B, H, T, D]
-            q_pe = self.rope(q_pe.contiguous(), start_pos)
+            q_pe = q_pe.transpose(1, 2).contiguous()  # [B, H, T, D]
+            q_pe = self.rope(q_pe, start_pos)
+            q_pe = q_pe.transpose(1, 2).contiguous()  # [B, T, H, D]
         else:
             # For backward compatibility with models that don't use freqs_cis
-            q_pe = self.rope(q_pe.contiguous())
+            q_pe = q_pe.transpose(1, 2).contiguous()  # [B, H, T, D]
+            q_pe = self.rope(q_pe)
+            q_pe = q_pe.transpose(1, 2).contiguous()  # [B, T, H, D]
         
         # Process keys and values through low-rank projections
         kv = self.wkv_a(x)
@@ -380,12 +384,18 @@ class MLA(nn.Module):
         Returns:
             output: (B, T, H, D_v)
         """
+        # IMPORTANT: FA3 on H100 requires strictly contiguous tensors for CUDA graphs
+        # Make sure all inputs are contiguous before any operations
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         # Flash Attention requires bf16 or fp16
         orig_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
+            q = q.to(torch.bfloat16).contiguous()
+            k = k.to(torch.bfloat16).contiguous()
+            v = v.to(torch.bfloat16).contiguous()
 
         # Flash Attention requires Q, K, V to have the same head dimension
         # If V has different dimension, pad it
@@ -395,12 +405,13 @@ class MLA(nn.Module):
         if d_v != d_qk:
             # Pad V to match Q/K dimension
             pad_size = d_qk - d_v
-            v_padded = F.pad(v, (0, pad_size), value=0.0)
+            # F.pad can create non-contiguous tensors, ensure contiguous after padding
+            v_padded = F.pad(v, (0, pad_size), value=0.0).contiguous()
         else:
             v_padded = v
 
         # Run Flash Attention
-        # flash_attn_func expects (B, T, H, D)
+        # flash_attn_func expects (B, T, H, D) with contiguous memory layout
         attn_output = flash_attn_func(
             q, k, v_padded,
             dropout_p=self.dropout if self.training else 0.0,
@@ -410,11 +421,12 @@ class MLA(nn.Module):
 
         # Remove padding from output if we padded V
         if d_v != d_qk:
-            attn_output = attn_output[..., :d_v]
+            # Slicing creates a view, make contiguous
+            attn_output = attn_output[..., :d_v].contiguous()
 
         # Convert back to original dtype
         if attn_output.dtype != orig_dtype:
-            attn_output = attn_output.to(orig_dtype)
+            attn_output = attn_output.to(orig_dtype).contiguous()
 
         return attn_output
 

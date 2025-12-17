@@ -21,7 +21,7 @@ fi
 BATCH_SIZE=${1:-4}
 BLOCK_SIZE=${2:-2048}
 OUTPUT_DIR=${3:-outputs/deltanet_mla_latent}
-RESUME_FROM_HF=${4:-false}  # Set to 'true' to resume from HuggingFace
+RESUME_FROM=${4:-false}  # 'true' = resume from HF, 'false' = no resume, or path to local checkpoint
 OPTIMIZER=${5:-muon}  # adamw or muon
 HF_REPO_ID=${6:-Orosius/deltanet-mla-latent}  # e.g., "Orosius/deltanet-mla-latent"
 USE_TENSORBOARD=${7:-true}  # Enable TensorBoard by default
@@ -70,9 +70,11 @@ echo "  Q LoRA rank: $MLA_Q_LORA_RANK (0 = disabled)"
 echo ""
 if [ -n "$HF_REPO_ID" ]; then
     echo "HF Repo: $HF_REPO_ID (automatic push every validation)"
-    if [ "$RESUME_FROM_HF" = "true" ]; then
-        echo "Resume: true (will load latest checkpoint from HF)"
-    fi
+fi
+if [ "$RESUME_FROM" = "true" ]; then
+    echo "Resume: from HuggingFace (will load latest checkpoint from HF)"
+elif [ "$RESUME_FROM" != "false" ] && [ -n "$RESUME_FROM" ]; then
+    echo "Resume: from local path ($RESUME_FROM)"
 fi
 
 # Launch TensorBoard if enabled
@@ -86,9 +88,16 @@ fi
 HF_REPO_ARG=""
 if [ -n "$HF_REPO_ID" ]; then
     HF_REPO_ARG="--hf_repo_id $HF_REPO_ID"
-    if [ "$RESUME_FROM_HF" = "true" ]; then
-        HF_REPO_ARG="$HF_REPO_ARG --resume_from_hf"
-    fi
+fi
+
+# Build resume argument (HF or local path)
+RESUME_ARG=""
+if [ "$RESUME_FROM" = "true" ]; then
+    # Resume from HuggingFace
+    RESUME_ARG="--resume_from_hf"
+elif [ "$RESUME_FROM" != "false" ] && [ -n "$RESUME_FROM" ]; then
+    # Resume from local checkpoint path
+    RESUME_ARG="--resume_from $RESUME_FROM"
 fi
 
 # Build TensorBoard argument if enabled
@@ -127,7 +136,7 @@ COMMON_ARGS="--size moe-1b \
     --tokenizer_name openai-community/gpt2 \
     --log_interval 10 \
     --eval_interval 1000 \
-    --save_interval 5000 \
+    --save_interval 1000 \
     $DELTANET_ARGS \
     --compile \
     --compile_mode max-autotune \
@@ -136,6 +145,7 @@ COMMON_ARGS="--size moe-1b \
     --n_experts $N_EXPERTS \
     --n_activated $N_ACTIVATED \
     $HF_REPO_ARG \
+    $RESUME_ARG \
     $TB_ARG"
 
 # Launch training with DDP if multiple GPUs detected
@@ -179,10 +189,15 @@ fi
 #   $1: Batch size [default: 4]
 #   $2: Block size (context length) [default: 2048]
 #   $3: Output directory [default: outputs/deltanet_mla_latent]
-#   $4: Resume from HuggingFace (true/false) [default: false]
+#   $4: Resume from (true=HF, false=none, or local path) [default: false]
 #   $5: Optimizer (adamw/muon) [default: muon]
 #   $6: HuggingFace repo ID (e.g., "username/repo") [default: none]
 #   $7: Use TensorBoard (true/false) [default: true]
 #   $8: TensorBoard port [default: 6006]
+#
+# Resume examples:
+#   ./scripts/train_swa_mla_latent_deltanet.sh 4 2048 outputs/model false      # No resume
+#   ./scripts/train_swa_mla_latent_deltanet.sh 4 2048 outputs/model true       # Resume from HF
+#   ./scripts/train_swa_mla_latent_deltanet.sh 4 2048 outputs/model /path/to/checkpoint.pt  # Resume from local
 
 exit 0

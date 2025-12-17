@@ -479,5 +479,7 @@ def create_swa_mla_model(
     cfg_kwargs = presets[size].copy()
     cfg_kwargs.update(dict(vocab_size=vocab_size, block_size=block_size, dropout=dropout))
     cfg_kwargs.update(kwargs)
+    # Pop compile_mode if it exists, as it's not part of SWAMLAConfig
+    cfg_kwargs.pop("compile_mode", None)
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)

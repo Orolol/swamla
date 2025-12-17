@@ -318,10 +318,15 @@ class FlashCausalSelfAttention(nn.Module):
         Returns:
             Output tensor of shape (B, T, n_head, head_dim)
         """
+        # IMPORTANT: FA3 on H100 requires strictly contiguous tensors for CUDA graphs
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         # GQA: expand K, V heads if needed
         if self.n_head_kv != self.n_head:
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=2).contiguous()
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=2).contiguous()
 
         # window_size for sliding window
         if self.window_size is not None:

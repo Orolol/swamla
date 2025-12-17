@@ -528,11 +528,59 @@ def train(args):
     tokenizer.model_max_length = args.block_size
     vocab_size = len(tokenizer)
 
-    # Try to load checkpoint from HuggingFace if requested
+    # Try to load checkpoint from HuggingFace or local path if requested
     resume_checkpoint = None
     resume_step = 0
     resume_tokens = 0
-    if args.resume_from_hf and args.hf_repo_id:
+
+    if args.resume_from:
+        # Resume from local checkpoint path
+        if master_process:
+            print("\n" + "="*80)
+            print("RESUMING FROM LOCAL CHECKPOINT")
+            print("="*80)
+            print(f"Path: {args.resume_from}")
+
+        checkpoint_path = args.resume_from
+        # If path is a directory, find the latest checkpoint
+        if os.path.isdir(checkpoint_path):
+            import glob
+            checkpoint_files = glob.glob(os.path.join(checkpoint_path, "checkpoint_*.pt"))
+            if checkpoint_files:
+                # Sort by step number (extract from filename)
+                def get_step(f):
+                    try:
+                        return int(os.path.basename(f).replace("checkpoint_", "").replace(".pt", ""))
+                    except:
+                        return 0
+                checkpoint_files.sort(key=get_step, reverse=True)
+                checkpoint_path = checkpoint_files[0]
+                if master_process:
+                    print(f"Found latest checkpoint: {checkpoint_path}")
+            else:
+                if master_process:
+                    print(f"⚠ No checkpoint_*.pt files found in {args.resume_from}")
+                checkpoint_path = None
+
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            try:
+                resume_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                resume_step = resume_checkpoint.get('step', 0)
+                resume_tokens = resume_checkpoint.get('total_tokens', 0)
+                if master_process:
+                    print(f"✓ Will resume from step {resume_step:,} ({resume_tokens:,} tokens)")
+                    print("="*80 + "\n")
+            except Exception as e:
+                if master_process:
+                    print(f"⚠ Failed to load checkpoint: {e}")
+                    print("="*80 + "\n")
+        elif checkpoint_path:
+            if master_process:
+                print(f"⚠ Checkpoint not found: {checkpoint_path}")
+                print("="*80 + "\n")
+
+    elif args.resume_from_hf and args.hf_repo_id:
+        # Resume from HuggingFace
         if master_process:
             print("\n" + "="*80)
             print("RESUMING FROM HUGGINGFACE")
@@ -669,9 +717,18 @@ def train(args):
 
     # Compile model if requested
     if args.compile:
+        compile_mode = args.compile_mode
+        # CUDA graphs (used in max-autotune) are incompatible with gradient accumulation > 1
+        # because tensors get overwritten between forward passes before backward is called.
+        # Fall back to reduce-overhead mode which doesn't use CUDA graphs.
+        if args.gradient_accumulation_steps > 1 and compile_mode == 'max-autotune':
+            compile_mode = 'reduce-overhead'
+            if master_process:
+                print(f"Note: Using 'reduce-overhead' mode instead of 'max-autotune' due to gradient accumulation > 1")
+                print(f"      (CUDA graphs in max-autotune are incompatible with gradient accumulation)")
         if master_process:
-            print(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
-        model = torch.compile(model, mode=args.compile_mode)
+            print(f"Compiling model with torch.compile(mode='{compile_mode}')...")
+        model = torch.compile(model, mode=compile_mode)
 
     # Wrap with DDP
     if is_ddp:
@@ -1055,6 +1112,7 @@ def main():
     # Hugging Face integration
     parser.add_argument('--hf_repo_id', type=str, default=None, help='HuggingFace repo ID')
     parser.add_argument('--resume_from_hf', action='store_true', help='Resume from HF checkpoint')
+    parser.add_argument('--resume_from', type=str, default=None, help='Resume from local checkpoint path')
 
     # Performance
     parser.add_argument('--compile', action='store_true', default=True)

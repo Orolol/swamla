@@ -208,12 +208,17 @@ class FA3CausalSelfAttention(nn.Module):
         Returns:
             Output tensor (B, T, n_head, head_dim)
         """
+        # IMPORTANT: FA3 on H100 requires strictly contiguous tensors for CUDA graphs
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         # FA3 supports fp16 and bf16, convert if needed
         orig_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
+            q = q.to(torch.bfloat16).contiguous()
+            k = k.to(torch.bfloat16).contiguous()
+            v = v.to(torch.bfloat16).contiguous()
 
         # Window size for sliding window attention
         # FA3 uses (left_window, right_window), 0 for right because causal
@@ -234,7 +239,7 @@ class FA3CausalSelfAttention(nn.Module):
 
         # Convert back if needed
         if output.dtype != orig_dtype and orig_dtype not in (torch.float16, torch.bfloat16):
-            output = output.to(orig_dtype)
+            output = output.to(orig_dtype).contiguous()
 
         return output
 
@@ -437,11 +442,16 @@ class FA3MLAAttention(nn.Module):
         v: torch.Tensor,
     ) -> torch.Tensor:
         """FA3 attention for MLA (handles different Q/K vs V dims)."""
+        # IMPORTANT: FA3 on H100 requires strictly contiguous tensors for CUDA graphs
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         orig_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
+            q = q.to(torch.bfloat16).contiguous()
+            k = k.to(torch.bfloat16).contiguous()
+            v = v.to(torch.bfloat16).contiguous()
 
         B, T, n_head, qk_dim = q.shape
         v_dim = v.shape[-1]
@@ -451,7 +461,7 @@ class FA3MLAAttention(nn.Module):
         if v_dim != qk_dim:
             v_padded = torch.zeros(B, T, n_head, qk_dim, dtype=v.dtype, device=v.device)
             v_padded[..., :v_dim] = v
-            v = v_padded
+            v = v_padded.contiguous()
 
         # Call FA3
         output = flash_attn_func(
@@ -464,10 +474,10 @@ class FA3MLAAttention(nn.Module):
 
         # Extract only the V dimensions from output
         if v_dim != qk_dim:
-            output = output[..., :v_dim]
+            output = output[..., :v_dim].contiguous()
 
         if output.dtype != orig_dtype and orig_dtype not in (torch.float16, torch.bfloat16):
-            output = output.to(orig_dtype)
+            output = output.to(orig_dtype).contiguous()
 
         return output
 
