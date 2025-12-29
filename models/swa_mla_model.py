@@ -39,6 +39,7 @@ class DeltaNetLayerConfig:
     deltanet_share_qk: bool = False  # Share Q and K projection
 
 
+
 @dataclass
 class SWAMLAConfig:
     """Configuration for the DeltaNet+MLA hybrid model with LatentMoE."""
@@ -96,6 +97,7 @@ class SWAMLAConfig:
     latent_n_experts: Optional[int] = None  # Override: total experts for LatentMoE
     latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
     latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
+    resume_from: Optional[str] = None # Checkpoint to resume from
 
     def __post_init__(self) -> None:
         if self.expert_dim is None:
@@ -481,5 +483,7 @@ def create_swa_mla_model(
     cfg_kwargs.update(kwargs)
     # Pop compile_mode if it exists, as it's not part of SWAMLAConfig
     cfg_kwargs.pop("compile_mode", None)
+    cfg_kwargs.pop("use_tensorboard", None)
+    cfg_kwargs.pop("use_fp8", None)
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)

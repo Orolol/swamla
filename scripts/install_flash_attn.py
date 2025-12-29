@@ -125,6 +125,12 @@ def install_wheel(url):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Installer automatiquement Flash Attention")
+    parser.add_argument("-y", "--yes", action="store_true", help="Installer sans demander confirmation")
+    parser.add_argument("--dry-run", action="store_true", help="Afficher l'URL sans installer")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Installation automatique de Flash Attention")
     print("=" * 60)
@@ -190,9 +196,24 @@ def main():
 
     # Installation
     print(f"\nWheel trouvée: {found_filename}")
+    print(f"URL: {found_url}")
 
-    response = input("\nInstaller maintenant? [O/n] ").strip().lower()
-    if response in ("", "o", "oui", "y", "yes"):
+    if args.dry_run:
+        print("\n[Dry run] Installation non effectuée.")
+        return
+
+    if args.yes:
+        do_install = True
+    else:
+        try:
+            response = input("\nInstaller maintenant? [O/n] ").strip().lower()
+            do_install = response in ("", "o", "oui", "y", "yes")
+        except EOFError:
+            # Mode non-interactif, on n'installe pas par défaut
+            print("\n[Non-interactif] Utilisez --yes pour installer automatiquement.")
+            return
+
+    if do_install:
         if install_wheel(found_url):
             print("\nFlash Attention installé avec succès!")
 
@@ -207,7 +228,6 @@ def main():
             sys.exit(1)
     else:
         print("\nInstallation annulée.")
-        print(f"URL de la wheel: {found_url}")
 
 
 if __name__ == "__main__":

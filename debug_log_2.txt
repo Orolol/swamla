@@ -1,2 +1,0 @@
-/home/orolol/.pyenv/versions/cuda13/lib/python3.12/site-packages/fla/utils.py:354: UserWarning: Triton is not supported on current platform, roll back to CPU.
-  warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
