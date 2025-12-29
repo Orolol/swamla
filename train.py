@@ -8,6 +8,7 @@ Supported features:
 - MLA with Flash Attention
 - Gradient checkpointing
 - torch.compile with max-autotune
+- WeDLM training (Causal Diffusion Language Model)
 """
 
 import os
@@ -54,6 +55,15 @@ except ImportError:
     print("huggingface_hub not available - HF push disabled")
 
 from transformers import AutoTokenizer
+
+# WeDLM imports (lazy to avoid import errors if not using WeDLM)
+WEDLM_AVAILABLE = False
+try:
+    from wedlm import WeDLMConfig, DualStreamMasker, WeDLMLoss, adapt_deltanet_for_wedlm
+    from wedlm.loss import compute_accuracy
+    WEDLM_AVAILABLE = True
+except ImportError:
+    pass
 
 
 def setup_distributed():
@@ -689,8 +699,64 @@ def train(args):
         if master_process:
             print("✓ Model weights loaded")
 
+    # Setup WeDLM training if enabled
+    wedlm_masker = None
+    wedlm_loss_fn = None
+    wedlm_config = None
+    mask_token_id = None
 
-               
+    if args.use_wedlm:
+        if not WEDLM_AVAILABLE:
+            raise RuntimeError("WeDLM training requested but wedlm module not found. "
+                             "Make sure the wedlm/ directory is in the Python path.")
+
+        if master_process:
+            print("\n" + "="*60)
+            print("WeDLM TRAINING MODE ENABLED")
+            print("="*60)
+
+        # Determine mask token ID
+        if args.wedlm_mask_token_id is not None:
+            mask_token_id = args.wedlm_mask_token_id
+        elif hasattr(tokenizer, 'mask_token_id') and tokenizer.mask_token_id is not None:
+            mask_token_id = tokenizer.mask_token_id
+        else:
+            # Use last token in vocabulary as mask token
+            mask_token_id = vocab_size - 1
+            if master_process:
+                print(f"  Note: Using vocab_size-1 ({mask_token_id}) as [MASK] token")
+
+        # Create WeDLM config
+        wedlm_config = WeDLMConfig(
+            use_wedlm_training=True,
+            block_size=args.wedlm_block_size,
+            min_mask_ratio=args.wedlm_min_mask_ratio,
+            max_mask_ratio=args.wedlm_max_mask_ratio,
+            ar_loss_weight=args.wedlm_ar_loss_weight,
+            mask_token_id=mask_token_id,
+        )
+
+        # Create masker and loss function
+        wedlm_masker = DualStreamMasker(wedlm_config, mask_token_id)
+        wedlm_loss_fn = WeDLMLoss(
+            ar_loss_weight=args.wedlm_ar_loss_weight,
+            label_smoothing=0.0,
+            ignore_index=-100,
+        )
+
+        # Adapt DeltaNet blocks for WeDLM (add position embeddings)
+        if args.use_gated_deltanet:
+            if master_process:
+                print("  Adapting GatedDeltaNet blocks for WeDLM...")
+            model = adapt_deltanet_for_wedlm(model, max_seq_len=args.block_size * 2, d_model=None)
+
+        if master_process:
+            print(f"  Block size: {wedlm_config.block_size}")
+            print(f"  Mask ratio: [{wedlm_config.min_mask_ratio:.1f}, {wedlm_config.max_mask_ratio:.1f}]")
+            print(f"  AR loss weight: {wedlm_config.ar_loss_weight}")
+            print(f"  Mask token ID: {mask_token_id}")
+            print("="*60 + "\n")
+
     # Print model info and log to wandb
     if master_process:
         total_params = sum(p.numel() for p in model.parameters())
@@ -860,7 +926,41 @@ def train(args):
 
             # Forward pass with mixed precision (BF16)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                logits, loss = model(input_ids, targets=labels)
+                if args.use_wedlm and wedlm_masker is not None:
+                    # WeDLM training: dual-stream forward pass
+                    wedlm_batch = wedlm_masker(input_ids)
+
+                    dual_input_ids = wedlm_batch['dual_input_ids']
+                    dual_position_ids = wedlm_batch['dual_position_ids']
+                    dual_attention_mask = wedlm_batch['dual_attention_mask']
+                    target_ids = wedlm_batch['target_ids']
+                    target_mask = wedlm_batch['target_mask']
+                    mask_ratios = wedlm_batch['mask_ratios']
+
+                    # Forward pass with dual-stream inputs
+                    logits, _ = model(
+                        dual_input_ids,
+                        position_ids=dual_position_ids,
+                        attention_mask_2d=dual_attention_mask,
+                        return_all_logits=True,
+                    )
+
+                    # Extract prediction stream logits (second half)
+                    L = input_ids.size(1)
+                    pred_logits = logits[:, L:, :]  # [B, L, V]
+
+                    # Compute WeDLM loss
+                    loss, loss_dict = wedlm_loss_fn(
+                        pred_logits,
+                        target_ids,
+                        target_mask,
+                        mask_ratios,
+                        wedlm_config.block_size,
+                    )
+                else:
+                    # Standard AR training
+                    logits, loss = model(input_ids, targets=labels)
+
                 # Add MoE auxiliary loss if model has MoE layers
                 if hasattr(raw_model, 'get_moe_aux_loss'):
                     moe_aux_loss = raw_model.get_moe_aux_loss()
@@ -954,14 +1054,43 @@ def train(args):
                     labels = batch['labels'].to(device)
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                        logits, loss = model(input_ids, targets=labels)
+                        if args.use_wedlm and wedlm_masker is not None:
+                            # WeDLM validation
+                            wedlm_batch = wedlm_masker(input_ids)
+                            dual_input_ids = wedlm_batch['dual_input_ids']
+                            dual_position_ids = wedlm_batch['dual_position_ids']
+                            dual_attention_mask = wedlm_batch['dual_attention_mask']
+                            target_ids = wedlm_batch['target_ids']
+                            target_mask = wedlm_batch['target_mask']
+                            mask_ratios = wedlm_batch['mask_ratios']
+
+                            logits, _ = model(
+                                dual_input_ids,
+                                position_ids=dual_position_ids,
+                                attention_mask_2d=dual_attention_mask,
+                                return_all_logits=True,
+                            )
+
+                            L = input_ids.size(1)
+                            pred_logits = logits[:, L:, :]
+
+                            loss, _ = wedlm_loss_fn(
+                                pred_logits,
+                                target_ids,
+                                target_mask,
+                                mask_ratios,
+                                wedlm_config.block_size,
+                            )
+                        else:
+                            logits, loss = model(input_ids, targets=labels)
 
                     val_loss += loss.item()
 
             val_loss /= val_steps
             perplexity = math.exp(val_loss) if val_loss < 10 else float('inf')
 
-            print(f"\nValidation | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}\n")
+            mode_str = " (WeDLM)" if args.use_wedlm else ""
+            print(f"\nValidation{mode_str} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}\n")
 
             if wandb_run is not None:
                 wandb.log({
@@ -1122,6 +1251,20 @@ def main():
 
     # TensorBoard
     parser.add_argument('--use_tensorboard', action='store_true', default=True)
+
+    # WeDLM (Causal Diffusion Language Model) training
+    parser.add_argument('--use_wedlm', action='store_true', default=False,
+                        help='Enable WeDLM training with dual-stream masking')
+    parser.add_argument('--wedlm_block_size', type=int, default=32,
+                        help='WeDLM prediction block size')
+    parser.add_argument('--wedlm_min_mask_ratio', type=float, default=0.1,
+                        help='Minimum masking ratio per block')
+    parser.add_argument('--wedlm_max_mask_ratio', type=float, default=1.0,
+                        help='Maximum masking ratio per block')
+    parser.add_argument('--wedlm_ar_loss_weight', type=float, default=0.5,
+                        help='Weight for auxiliary AR loss (0 to disable)')
+    parser.add_argument('--wedlm_mask_token_id', type=int, default=None,
+                        help='Token ID for [MASK] (default: use tokenizer.mask_token_id or vocab_size-1)')
 
     args = parser.parse_args()
 

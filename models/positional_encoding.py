@@ -123,4 +123,74 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_rotated = x_complex * freqs_cis
     x_out = torch.view_as_real(x_rotated).flatten(3)
     return x_out.type_as(x)
+
+
+def gather_freqs_by_positions(
+    freqs_cis: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Gather precomputed RoPE frequencies by arbitrary position indices.
+
+    This is the key function enabling WeDLM's Topological Reordering:
+    - Physical positions can differ from logical positions
+    - RoPE is applied using logical positions for correct attention scores
+
+    Args:
+        freqs_cis: [max_len, dim//2] complex tensor of precomputed frequencies
+        position_ids: [B, T] or [T] tensor of logical position indices
+
+    Returns:
+        gathered_freqs: [B, T, dim//2] or [T, dim//2] complex tensor
+                        frequencies for the specified positions
+    """
+    if position_ids.dim() == 1:
+        # Single sequence: [T] -> [T, dim//2]
+        return freqs_cis[position_ids]
+    else:
+        # Batched: [B, T] -> [B, T, dim//2]
+        B, T = position_ids.shape
+        # Flatten, gather, reshape
+        flat_positions = position_ids.view(-1)  # [B*T]
+        gathered = freqs_cis[flat_positions]    # [B*T, dim//2]
+        return gathered.view(B, T, -1)          # [B, T, dim//2]
+
+
+def apply_rope_with_positions(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply rotary embeddings using arbitrary position IDs.
+
+    This supports WeDLM's topological reordering where physical order
+    differs from logical positions.
+
+    Args:
+        x: [B, H, T, D] or [B, T, H, D] query/key tensor
+        freqs_cis: [max_len, dim//2] precomputed frequencies
+        position_ids: [B, T] logical position indices
+
+    Returns:
+        x_rotated: tensor with RoPE applied using specified positions
+    """
+    # Gather frequencies for the specified positions
+    # freqs_cis: [max_len, dim//2] -> [B, T, dim//2]
+    gathered_freqs = gather_freqs_by_positions(freqs_cis, position_ids)
+
+    # Apply RoPE
+    # x shape is typically [B, H, T, D] for attention
+    # gathered_freqs is [B, T, dim//2], need to broadcast for heads
+    if x.dim() == 4:
+        B, H, T, D = x.shape
+        # Reshape gathered_freqs for broadcasting: [B, 1, T, dim//2]
+        gathered_freqs = gathered_freqs.unsqueeze(1)
+
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    gathered_freqs = gathered_freqs.to(x_complex.device)
+    x_rotated = x_complex * gathered_freqs
+    x_out = torch.view_as_real(x_rotated).flatten(-2)
+
+    return x_out.type_as(x)
  

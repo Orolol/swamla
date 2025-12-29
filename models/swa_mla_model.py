@@ -248,6 +248,8 @@ class SWAMLAModel(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         return_all_logits: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask_2d: Optional[torch.Tensor] = None,
     ):
         """Forward pass.
 
@@ -255,33 +257,77 @@ class SWAMLAModel(nn.Module):
             idx: Input token indices [B, S]
             targets: Target token indices for loss computation [B, S]
             return_all_logits: If True, return logits for all positions
+            position_ids: Explicit position IDs for RoPE [B, S].
+                If provided, allows physical position to differ from logical position.
+                Used for WeDLM topological reordering.
+            attention_mask_2d: Custom 2D attention mask [S, S] or [B, S, S].
+                If provided, overrides the default causal mask.
+                Used for WeDLM dual-stream masking.
 
         Returns:
             (logits, loss) tuple
         """
         device = idx.device
         b, t = idx.size()
-        if t > self.config.block_size:
-            raise ValueError(
-                f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-            )
+
+        # For WeDLM dual-stream, sequence length can be 2x block_size
+        # but position_ids (logical positions) should stay within block_size
+        if position_ids is not None:
+            # WeDLM mode: check logical positions, not physical sequence length
+            max_logical_pos = position_ids.max().item() + 1
+            if max_logical_pos > self.config.block_size:
+                raise ValueError(
+                    f"Cannot forward sequence with max logical position {max_logical_pos}, "
+                    f"block size is only {self.config.block_size}"
+                )
+            max_pos = max_logical_pos
+        else:
+            # Standard mode: sequence length must fit in block_size
+            if t > self.config.block_size:
+                raise ValueError(
+                    f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+                )
+            max_pos = t
 
         tok_emb = self.transformer.wte(idx)
         x = self.transformer.drop(tok_emb)
 
-        attn_mask = None
-        if t > 1:
+        # Build attention mask
+        if attention_mask_2d is not None:
+            # Use provided 2D mask (for WeDLM dual-stream)
+            # Convert boolean mask to float mask with -inf for False
+            if attention_mask_2d.dtype == torch.bool:
+                attn_mask = torch.where(
+                    attention_mask_2d,
+                    torch.tensor(0.0, device=device),
+                    torch.tensor(float("-inf"), device=device),
+                )
+            else:
+                attn_mask = attention_mask_2d
+            # Ensure correct shape [S, S] for MLA
+            if attn_mask.dim() == 3:
+                # [B, S, S] -> use first batch as template (assuming same for all)
+                attn_mask = attn_mask[0]
+        elif t > 1:
+            # Default causal mask
             attn_mask = torch.full((t, t), float("-inf"), device=device)
             attn_mask = torch.triu(attn_mask, diagonal=1)
+        else:
+            attn_mask = None
 
         # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
-        freqs_cis = self.freqs_cis[:t].to(device, non_blocking=True).detach()
+        freqs_cis = self.freqs_cis[:max_pos].to(device, non_blocking=True).detach()
 
         for block in self.transformer.h:
             if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock):
-                x = block(x)
+                # GatedDeltaNet: pass position_ids if using WeDLM adapter
+                if position_ids is not None and hasattr(block, 'forward_with_positions'):
+                    x = block.forward_with_positions(x, position_ids)
+                else:
+                    x = block(x)
             elif isinstance(block, MLABlock):
-                x = block(x, 0, freqs_cis, attn_mask)
+                # MLA: pass position_ids for WeDLM topological reordering
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)

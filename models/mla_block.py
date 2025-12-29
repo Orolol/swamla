@@ -60,16 +60,16 @@ class MLABlock(nn.Module):
         self.use_checkpoint = config.use_gradient_checkpointing if hasattr(config, 'use_gradient_checkpointing') else True
         self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
-    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None):
+    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None):
         """Attention portion of the block with appropriate normalization"""
         x_norm = self.attn_norm(x)
-        return self.attn(x_norm, start_pos, freqs_cis, mask)
+        return self.attn(x_norm, start_pos, freqs_cis, mask, position_ids=position_ids)
 
     def _ffn_block(self, x):
         """Feed-forward portion of the block with appropriate normalization"""
         return self.ffn(self.ffn_norm(x))
 
-    def forward(self, x, start_pos=0, freqs_cis=None, mask=None):
+    def forward(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None):
         """
         Forward pass for the MLABlock.
 
@@ -78,6 +78,7 @@ class MLABlock(nn.Module):
             start_pos (int, optional): Starting position for attention caching. Defaults to 0.
             freqs_cis (torch.Tensor, optional): Precomputed position embeddings. Defaults to None.
             mask (torch.Tensor, optional): Attention mask tensor. Defaults to None.
+            position_ids (torch.Tensor, optional): Explicit position IDs for WeDLM. Defaults to None.
 
         Returns:
             torch.Tensor: Processed tensor with same shape as input
@@ -98,6 +99,7 @@ class MLABlock(nn.Module):
                     start_pos,
                     freqs_cis,
                     mask,
+                    position_ids,
                     use_te_fp8=True
                 )
             else:
@@ -107,6 +109,7 @@ class MLABlock(nn.Module):
                     start_pos,
                     freqs_cis,
                     mask,
+                    position_ids,
                     use_reentrant=False
                 )
             # First residual connection
@@ -126,7 +129,7 @@ class MLABlock(nn.Module):
         else:
             # Standard forward pass without checkpoint
             # First residual connection
-            x = x + self._attn_block(x, start_pos, freqs_cis, mask)
+            x = x + self._attn_block(x, start_pos, freqs_cis, mask, position_ids)
             # Second residual connection
             x = x + self._ffn_block(x)
 

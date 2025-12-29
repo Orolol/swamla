@@ -22,6 +22,15 @@ try:
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
 
+# Import FlexAttention (PyTorch 2.5+)
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    flex_attention = None
+    create_block_mask = None
+
 
 class MLA(nn.Module):
     """
@@ -113,6 +122,10 @@ class MLA(nn.Module):
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention")
+
+        # FlexAttention support (for WeDLM with custom masks)
+        self.use_flex_attention = getattr(config, 'use_flex_attention', True) and FLEX_ATTENTION_AVAILABLE
+        self._flex_attention_compiled = None  # Will be compiled on first use
         
         # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
@@ -175,7 +188,14 @@ class MLA(nn.Module):
     
 
     
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
@@ -184,6 +204,9 @@ class MLA(nn.Module):
             start_pos (int): Starting position in the sequence for caching.
             freqs_cis (Optional[torch.Tensor]): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            position_ids (Optional[torch.Tensor]): Explicit position IDs for RoPE [B, T].
+                If provided, allows physical position to differ from logical position
+                (used for WeDLM topological reordering).
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
@@ -207,7 +230,11 @@ class MLA(nn.Module):
         
         # Apply rotary positional encoding to q_pe
         # RoPE expects [B, H, T, D] but q_pe is [B, T, H, D], so transpose
-        if freqs_cis is not None:
+        if position_ids is not None:
+            # WeDLM mode: use explicit position IDs for RoPE
+            # This enables topological reordering where physical != logical position
+            q_pe = self._apply_rope_with_position_ids(q_pe, position_ids)
+        elif freqs_cis is not None:
             q_pe = q_pe.transpose(1, 2).contiguous()  # [B, H, T, D]
             q_pe = self.rope(q_pe, start_pos)
             q_pe = q_pe.transpose(1, 2).contiguous()  # [B, T, H, D]
@@ -222,7 +249,10 @@ class MLA(nn.Module):
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         
         # Apply rotary positional encoding to k_pe
-        if freqs_cis is not None:
+        if position_ids is not None:
+            # WeDLM mode: use explicit position IDs for RoPE
+            k_pe = self._apply_rope_with_position_ids_1d(k_pe, position_ids)
+        elif freqs_cis is not None:
             # We need to reshape k_pe to match rope's expected input format
             k_pe = k_pe.view(bsz, seqlen, 1, -1)  # [B, T, 1, D]
             k_pe = k_pe.transpose(1, 2)  # [B, 1, T, D]
@@ -439,3 +469,91 @@ class MLA(nn.Module):
         # Force garbage collection of any remaining references
         if hasattr(self, '_cache_tensors'):
             del self._cache_tensors
+
+    def _apply_rope_with_position_ids(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply RoPE using explicit position IDs for WeDLM topological reordering.
+
+        Args:
+            x: [B, T, H, D] tensor (queries or keys with head dimension)
+            position_ids: [B, T] logical position indices
+
+        Returns:
+            x_rotated: [B, T, H, D] with RoPE applied using logical positions
+        """
+        B, T, H, D = x.shape
+        device = x.device
+
+        # Get cos/sin from cached values using position indices
+        # self.rope has cos_cached and sin_cached of shape [1, 1, max_seq_len, D]
+        cos_cached = self.rope.cos_cached.squeeze(0).squeeze(0)  # [max_seq_len, D]
+        sin_cached = self.rope.sin_cached.squeeze(0).squeeze(0)  # [max_seq_len, D]
+
+        # Gather cos/sin for the specified positions
+        # position_ids: [B, T] -> indices into [max_seq_len, D]
+        flat_pos = position_ids.view(-1)  # [B*T]
+
+        # Only use D//2 as that's what we need for rotation
+        half_D = D // 2
+        cos_gathered = cos_cached[flat_pos, :half_D].view(B, T, half_D)  # [B, T, D//2]
+        sin_gathered = sin_cached[flat_pos, :half_D].view(B, T, half_D)  # [B, T, D//2]
+
+        # Expand for heads: [B, T, 1, D//2] -> broadcast to [B, T, H, D//2]
+        cos_gathered = cos_gathered.unsqueeze(2)  # [B, T, 1, D//2]
+        sin_gathered = sin_gathered.unsqueeze(2)  # [B, T, 1, D//2]
+
+        # Split x into two halves for rotation
+        x1 = x[..., :half_D]  # [B, T, H, D//2]
+        x2 = x[..., half_D:]  # [B, T, H, D//2]
+
+        # Apply rotation
+        x_rotated = torch.cat([
+            x1 * cos_gathered - x2 * sin_gathered,
+            x2 * cos_gathered + x1 * sin_gathered,
+        ], dim=-1)
+
+        return x_rotated.contiguous()
+
+    def _apply_rope_with_position_ids_1d(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply RoPE using explicit position IDs for 1D case (k_pe without head dim).
+
+        Args:
+            x: [B, T, D] tensor (k_pe before head expansion)
+            position_ids: [B, T] logical position indices
+
+        Returns:
+            x_rotated: [B, T, D] with RoPE applied using logical positions
+        """
+        B, T, D = x.shape
+
+        # Get cos/sin from cached values
+        cos_cached = self.rope.cos_cached.squeeze(0).squeeze(0)  # [max_seq_len, D_rope]
+        sin_cached = self.rope.sin_cached.squeeze(0).squeeze(0)  # [max_seq_len, D_rope]
+
+        # Gather cos/sin for the specified positions
+        flat_pos = position_ids.view(-1)  # [B*T]
+
+        half_D = D // 2
+        cos_gathered = cos_cached[flat_pos, :half_D].view(B, T, half_D)  # [B, T, D//2]
+        sin_gathered = sin_cached[flat_pos, :half_D].view(B, T, half_D)  # [B, T, D//2]
+
+        # Split x into two halves for rotation
+        x1 = x[..., :half_D]  # [B, T, D//2]
+        x2 = x[..., half_D:]  # [B, T, D//2]
+
+        # Apply rotation
+        x_rotated = torch.cat([
+            x1 * cos_gathered - x2 * sin_gathered,
+            x2 * cos_gathered + x1 * sin_gathered,
+        ], dim=-1)
+
+        return x_rotated.contiguous()
