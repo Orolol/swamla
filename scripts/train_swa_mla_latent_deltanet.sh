@@ -121,7 +121,7 @@ COMMON_ARGS="--size moe-1b \
     --learning_rate 1e-4 \
     --weight_decay 0.1 \
     --warmup_iters 400 \
-    --max_iters 100000 \
+    --max_iters 1000000 \
     --grad_clip 1.0 \
     --gradient_accumulation_steps 1 \
     --gradient_checkpointing \
@@ -136,7 +136,7 @@ COMMON_ARGS="--size moe-1b \
     --tokenizer_name openai-community/gpt2 \
     --log_interval 10 \
     --eval_interval 1000 \
-    --save_interval 1000 \
+    --save_interval 5000 \
     $DELTANET_ARGS \
     --compile \
     --compile_mode max-autotune \

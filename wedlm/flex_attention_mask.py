@@ -37,9 +37,14 @@ def create_wedlm_mask_mod(
     - Memory stream [0:L]: Standard causal attention within memory
     - Prediction stream [L:2L]:
         - Block k [L+k*B : L+(k+1)*B] can attend to:
-            - Memory positions [0 : k*B) (clean history)
+            - Memory positions [0 : (k+1)*B) (clean context up to current block end)
             - Its own block causally (after reordering: observed first, masked last)
-        - Cannot attend to other prediction blocks or future memory
+        - Cannot attend to other prediction blocks or memory beyond current block
+
+    WeDLM interpretation:
+    - Block k predicts positions [k*B, (k+1)*B)
+    - It sees memory up to (k+1)*B - 1, which includes the clean tokens
+      for the positions it's trying to predict
 
     Args:
         seq_len: Length of the original sequence (L), total will be 2L
@@ -73,7 +78,10 @@ def create_wedlm_mask_mod(
         pred_pos = q_idx - L  # Position in original sequence
         pred_block = pred_pos // B  # Which block this query belongs to
 
-        # Prediction can attend to memory before its block starts
+        # Prediction can attend to memory BEFORE its block (NOT including current block!)
+        # Block k can see memory positions [0, k*B)
+        # Block 0 sees NO memory, block 1 sees [0, B), etc.
+        # Per WeDLM paper Section 4.2: "Memory tokens whose logical positions PRECEDE block k"
         pred_to_memory = is_pred_query & (kv_idx < L) & (kv_idx < pred_block * B)
 
         # Prediction can attend to same block in prediction stream (causal)

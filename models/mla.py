@@ -124,7 +124,9 @@ class MLA(nn.Module):
             print(f"MLA: Using Flash Attention")
 
         # FlexAttention support (for WeDLM with custom masks)
-        self.use_flex_attention = getattr(config, 'use_flex_attention', True) and FLEX_ATTENTION_AVAILABLE
+        # NOTE: FlexAttention with score_mod doesn't work well with torch.compile
+        # when using dynamic tensor closures. Disabled by default, use SDPA instead.
+        self.use_flex_attention = getattr(config, 'use_flex_attention', False) and FLEX_ATTENTION_AVAILABLE
         self._flex_attention_compiled = None  # Will be compiled on first use
         
         # Initialize RoPE before anything else
@@ -295,6 +297,15 @@ class MLA(nn.Module):
                 # q, k_to_use, v_to_use are already (B, T, H, D)
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility
                 x = self._flash_attention(q.contiguous(), k_to_use.contiguous(), v_to_use.contiguous(), causal=seqlen > 1)
+            elif self.use_flex_attention and mask is not None and FLEX_ATTENTION_AVAILABLE:
+                # Use FlexAttention for custom masks (WeDLM dual-stream)
+                # FlexAttention expects [B, H, S, D]
+                q_flex = q.transpose(1, 2).contiguous()
+                k_flex = k_to_use.transpose(1, 2).contiguous()
+                v_flex = v_to_use.transpose(1, 2).contiguous()
+
+                attn_output = self._flex_attention_with_mask(q_flex, k_flex, v_flex, mask)
+                x = attn_output.transpose(1, 2).contiguous()
             else:
                 # Reshape for SDPA: [B, H, S, D]
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility
@@ -362,6 +373,15 @@ class MLA(nn.Module):
                 # q_full, k_full are (B, T, H, qk_head_dim), v is (B, T, H, v_head_dim)
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility
                 x = self._flash_attention(q_full.contiguous(), k_full.contiguous(), v.contiguous(), causal=seqlen > 1)
+            elif self.use_flex_attention and mask is not None and FLEX_ATTENTION_AVAILABLE:
+                # Use FlexAttention for custom masks (WeDLM dual-stream)
+                # FlexAttention expects [B, H, S, D]
+                q_flex = q_full.transpose(1, 2).contiguous()
+                k_flex = k_full.transpose(1, 2).contiguous()
+                v_flex = v.transpose(1, 2).contiguous()
+
+                attn_output = self._flex_attention_with_mask(q_flex, k_flex, v_flex, mask)
+                x = attn_output.transpose(1, 2).contiguous()
             else:
                 # Reshape for SDPA: [B, H, S, D]
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility
@@ -557,3 +577,80 @@ class MLA(nn.Module):
         ], dim=-1)
 
         return x_rotated.contiguous()
+
+    def _flex_attention_with_mask(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute attention using FlexAttention with a mask.
+
+        FlexAttention compiles the mask into efficient CUDA kernels,
+        providing near Flash Attention performance for arbitrary masks.
+
+        Args:
+            q: [B, H, S, D] queries
+            k: [B, H, T, D] keys
+            v: [B, H, T, D_v] values
+            mask: [S, T] mask - either:
+                  - boolean (True = attend, False = don't attend)
+                  - float (0 = attend, -inf = don't attend)
+
+        Returns:
+            output: [B, H, S, D_v]
+        """
+        if not FLEX_ATTENTION_AVAILABLE:
+            raise RuntimeError("FlexAttention not available")
+
+        B, H, S, D = q.shape
+        _, _, T, D_v = v.shape
+
+        # Ensure all tensors have the same dtype (FlexAttention requirement)
+        target_dtype = q.dtype
+        if k.dtype != target_dtype:
+            k = k.to(target_dtype)
+        if v.dtype != target_dtype:
+            v = v.to(target_dtype)
+
+        # Handle V dimension mismatch by padding if necessary
+        need_v_padding = D_v != D
+        if need_v_padding:
+            pad_size = D - D_v
+            v = F.pad(v, (0, pad_size), value=0.0)
+
+        # Convert mask to attention bias format [1, 1, S, T]
+        # Handle both boolean and float masks
+        if mask.dtype == torch.bool:
+            # Boolean mask: True -> 0.0, False -> -inf
+            attn_bias = torch.where(
+                mask,
+                torch.zeros((), device=q.device, dtype=q.dtype),
+                torch.tensor(float('-inf'), device=q.device, dtype=q.dtype),
+            ).unsqueeze(0).unsqueeze(0)  # [1, 1, S, T]
+        else:
+            # Float mask: already in correct format (0 or -inf)
+            # Just ensure correct dtype and add batch/head dimensions
+            attn_bias = mask.to(q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, S, T]
+
+        # Use score_mod to apply the bias
+        # Capture attn_bias in closure - flex_attention will compile this
+        _bias = attn_bias
+
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + _bias[0, 0, q_idx, kv_idx]
+
+        # Compile flex_attention for this mask pattern
+        attn_output = flex_attention(
+            q, k, v,
+            score_mod=score_mod,
+            scale=self.softmax_scale,
+        )
+
+        # Remove padding from output if we padded V
+        if need_v_padding:
+            attn_output = attn_output[..., :D_v]
+
+        return attn_output.contiguous()

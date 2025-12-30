@@ -35,6 +35,7 @@ class StreamingDecoderState:
 
     # Generation state
     generated_tokens: List[List[int]]  # List of generated token IDs per batch
+    committed_ids: torch.Tensor  # [B, C] Tensor of committed tokens for context
     next_position: int  # Next logical position to fill
 
     # KV cache (if supported by model)
@@ -75,6 +76,10 @@ class StreamingParallelDecoder:
         self.window_size = config.window_size
         self.entropy_threshold = config.entropy_threshold
         self.distance_penalty = config.distance_penalty
+
+        # Refinement iterations: number of forward passes per window before committing
+        # This allows predictions to condition on each other, similar to training
+        self.refinement_iters = getattr(config, 'refinement_iters', 3)
 
     @torch.no_grad()
     def generate(
@@ -117,44 +122,56 @@ class StreamingParallelDecoder:
         tokens_committed = 0
         prefix_committed = 0  # Tokens committed as contiguous prefix
 
+        import time
+        t0 = time.time()
+
         while tokens_committed < max_new_tokens:
             # Check for EOS in all batches
             if self._check_eos(state):
                 break
 
-            # 1. Reorder window: [filled | masks]
-            reordered_tokens, reordered_positions, num_filled = self._reorder_window(state)
+            # ===== REFINEMENT LOOP =====
+            # Do multiple forward passes on the same window to allow predictions
+            # to condition on each other (similar to training where observed tokens
+            # provide context for masked predictions)
+            for refine_iter in range(self.refinement_iters):
+                # 1. Reorder window: [filled | masks]
+                reordered_tokens, reordered_positions, num_filled = self._reorder_window(state)
 
-            # 2. Forward pass on window
-            logits = self._forward_window(
-                prompt_ids,
-                reordered_tokens,
-                reordered_positions,
-                state,
-            )
-            total_forward_passes += 1
+                # 2. Forward pass on window
+                # Crucial Fix: Include committed tokens in context
+                logits = self._forward_window(
+                    prompt_ids,
+                    reordered_tokens,
+                    reordered_positions,
+                    state,
+                )
+                total_forward_passes += 1
 
-            # 3. Compute probabilities and entropy
-            probs = self._compute_probs(logits, temperature, top_k, top_p, min_p)
-            entropies = self._compute_entropy(probs)
+                # 3. Compute probabilities and entropy
+                probs = self._compute_probs(logits, temperature, top_k, top_p, min_p)
+                entropies = self._compute_entropy(probs)
 
-            # 4. Restore original order for processing
-            # The logits are in reordered space, need to map back
-            logits_original = self._restore_order(logits, reordered_positions, state)
-            probs_original = self._restore_order(probs, reordered_positions, state)
-            entropies_original = self._restore_order(entropies.unsqueeze(-1), reordered_positions, state).squeeze(-1)
+                # 4. Restore original order for processing
+                logits_original = self._restore_order(logits, reordered_positions, state)
+                probs_original = self._restore_order(probs, reordered_positions, state)
+                entropies_original = self._restore_order(entropies.unsqueeze(-1), reordered_positions, state).squeeze(-1)
 
-            # 5. Select masks to fill based on distance-adjusted entropy
-            to_fill = self._select_positions_to_fill(
-                state,
-                entropies_original,
-            )
+                # 5. Select masks to fill based on distance-adjusted entropy
+                to_fill = self._select_positions_to_fill(
+                    state,
+                    entropies_original,
+                )
 
-            # 6. Sample tokens for selected positions
-            new_tokens = self._sample_tokens(probs_original, to_fill)
+                # 6. Sample tokens for selected positions
+                new_tokens = self._sample_tokens(probs_original, to_fill)
 
-            # 7. Update window with new tokens
-            self._update_window(state, new_tokens, to_fill)
+                # 7. Update window with new tokens
+                self._update_window(state, new_tokens, to_fill)
+
+                # Check if all positions are filled - can exit refinement early
+                if state.window_filled.all():
+                    break
 
             # 8. Commit leftmost contiguous filled prefix
             n_committed = self._commit_prefix(state)
@@ -196,12 +213,16 @@ class StreamingParallelDecoder:
         window_tokens = torch.full((B, W), self.mask_token_id, device=device, dtype=torch.long)
         window_positions = torch.arange(P, P + W, device=device).unsqueeze(0).expand(B, -1).clone()
         window_filled = torch.zeros(B, W, dtype=torch.bool, device=device)
+        
+        # New: Initialize empty committed tensor
+        committed_ids = torch.empty((B, 0), dtype=torch.long, device=device)
 
         return StreamingDecoderState(
             window_tokens=window_tokens,
             window_positions=window_positions,
             window_filled=window_filled,
             generated_tokens=[[] for _ in range(B)],
+            committed_ids=committed_ids,
             next_position=P + W,
         )
 
@@ -237,30 +258,80 @@ class StreamingParallelDecoder:
         window_positions: torch.Tensor,
         state: StreamingDecoderState,
     ) -> torch.Tensor:
-        """Forward pass on window with prompt context."""
+        """Forward pass on window with prompt context.
+
+        Uses WeDLM-style attention mask where:
+        - Prompt + Committed (memory stream) uses standard causal attention
+        - Window (prediction stream) can attend to:
+          - All of prompt + committed (clean memory)
+          - Other window positions causally (based on reordered positions)
+        """
         B = prompt_ids.shape[0]
         P = prompt_ids.shape[1]
+        C = state.committed_ids.shape[1]
         W = window_tokens.shape[1]
         device = prompt_ids.device
+        
+        # Concatenate prompt + committed
+        context_ids = torch.cat([prompt_ids, state.committed_ids], dim=1)
+        C_full_len = P + C
+        
+        # Concatenate prompt + committed + window
+        full_input = torch.cat([context_ids, window_tokens], dim=1)
 
-        # Concatenate prompt + window
-        full_input = torch.cat([prompt_ids, window_tokens], dim=1)
+        # Position IDs: context uses sequential, window uses reordered positions
+        context_positions = torch.arange(C_full_len, device=device).unsqueeze(0).expand(B, -1)
+        full_positions = torch.cat([context_positions, window_positions], dim=1)
 
-        # Position IDs: prompt uses sequential, window uses reordered positions
-        prompt_positions = torch.arange(P, device=device).unsqueeze(0).expand(B, -1)
-        full_positions = torch.cat([prompt_positions, window_positions], dim=1)
+        # Build WeDLM-style attention mask for inference
+        attn_mask = self._build_inference_mask(C_full_len, W, window_positions, device)
 
-        # Forward pass
+        # Forward pass with attention mask
         logits, _ = self.model(
             full_input,
             position_ids=full_positions,
+            attention_mask_2d=attn_mask,
             return_all_logits=True,
         )
 
-        # Extract window logits
-        window_logits = logits[:, P:, :]  # [B, W, V]
+        # Extract window logits (last W tokens)
+        window_logits = logits[:, C_full_len:, :]  # [B, W, V]
 
         return window_logits
+
+    def _build_inference_mask(
+        self,
+        C_len: int,  # Total context length (Prompt + Committed)
+        W: int,
+        window_positions: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build attention mask for WeDLM inference."""
+        total_len = C_len + W
+
+        # Start with all False (no attention)
+        mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+
+        # Context: standard causal (lower triangular)
+        mask[:C_len, :C_len] = torch.tril(torch.ones(C_len, C_len, dtype=torch.bool, device=device))
+
+        # Window can attend to ALL of "clean memory" (Context)
+        mask[C_len:, :C_len] = True
+
+        # Window: causal attention based on logical positions
+        # Position i can attend to position j if pos[j] <= pos[i]
+        # Use the first batch's positions as reference (assume same for all batches)
+        win_pos = window_positions[0]  # [W]
+
+        # Create position comparison matrix
+        # win_mask[i, j] = True if window pos j <= window pos i
+        pos_i = win_pos.unsqueeze(1)  # [W, 1]
+        pos_j = win_pos.unsqueeze(0)  # [1, W]
+        win_mask = pos_j <= pos_i  # [W, W]
+
+        mask[C_len:, C_len:] = win_mask
+
+        return mask
 
     def _compute_probs(
         self,
@@ -316,7 +387,7 @@ class StreamingParallelDecoder:
         B, W = state.window_tokens.shape
         device = tensor.device
 
-        # Create inverse permutation based on positions
+        # Create result (same shape as input, e.g., logits [B, W, V] or entropy [B, W])
         result = torch.zeros_like(tensor)
 
         for b in range(B):
@@ -345,7 +416,23 @@ class StreamingParallelDecoder:
         is_mask = ~state.window_filled
 
         # Compute distance penalty (favor positions closer to the left)
-        distances = torch.arange(W, device=device).float().unsqueeze(0).expand(B, -1)
+        distances = torch.zeros(B, W, device=device)
+        
+        for b in range(B):
+            # Find first (leftmost) unfilled mask
+            mask_indices = is_mask[b].nonzero(as_tuple=True)[0]
+            if len(mask_indices) > 0:
+                first_mask_idx = mask_indices[0].item()
+                # Distance is relative to this first mask
+                # d = 0 for the first mask, 1 for the next slot, etc.
+                # Valid distance should be calculated based on SLOT index, not logical position
+                # (since the window slides)
+                current_indices = torch.arange(W, device=device)
+                d = current_indices - first_mask_idx
+                # Only punish positions AFTER the first mask (d >= 0)
+                # But we only care about masks anyway
+                distances[b] = d.clamp(min=0)
+            
         adjusted_entropy = entropies + self.distance_penalty * distances
 
         # Select positions with adjusted entropy below threshold
@@ -402,7 +489,7 @@ class StreamingParallelDecoder:
     def _commit_prefix(self, state: StreamingDecoderState) -> int:
         """Commit leftmost contiguous filled prefix."""
         B, W = state.window_tokens.shape
-
+        
         # Find how many contiguous filled tokens from the left
         n_commit = W
         for b in range(B):
@@ -414,10 +501,23 @@ class StreamingParallelDecoder:
         if n_commit == 0:
             return 0
 
-        # Commit tokens
+        # Commit tokens for all batches (assumes sync commit size for simplicity, or take min)
+        # Taking MIN across batches ensures we shift same amount, keeping batches aligned
+        # In this implementation we computed per-batch n_commit earlier but logic here implies scalar.
+        # Let's verify loop logic.
+        # The loop reduces `n_commit`. So `n_commit` becomes the minimum commit length across all batches.
+        # This keeps the window aligned.
+
+        # Append to generated list AND committed_ids tensor
+        new_committed_list = []
         for b in range(B):
-            committed = state.window_tokens[b, :n_commit].tolist()
-            state.generated_tokens[b].extend(committed)
+            committed = state.window_tokens[b, :n_commit]
+            state.generated_tokens[b].extend(committed.tolist())
+            new_committed_list.append(committed)
+        
+        # Update committed_ids tensor
+        new_committed_tensor = torch.stack(new_committed_list) # [B, n_commit]
+        state.committed_ids = torch.cat([state.committed_ids, new_committed_tensor], dim=1)
 
         # Shift window
         if n_commit < W:
@@ -437,7 +537,7 @@ class StreamingParallelDecoder:
         B, W = state.window_tokens.shape
         device = state.window_tokens.device
 
-        # Find empty slots
+        # Find empty slots (should be at the end after shift)
         n_empty = (~state.window_filled).sum(dim=1).min().item()
 
         if n_empty == 0 or remaining_tokens <= 0:
@@ -461,9 +561,9 @@ class StreamingParallelDecoder:
             return False
 
         for b, tokens in enumerate(state.generated_tokens):
-            if self.eos_token_id not in tokens:
-                return False
-        return True
+            if self.eos_token_id in tokens:
+                return True
+        return False
 
     def _collect_results(
         self,

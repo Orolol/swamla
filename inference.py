@@ -479,6 +479,9 @@ def load_model_from_checkpoint(
             'memory_reset_interval',
             # Other training-only params
             'use_tensorboard', 'use_te_fp8',
+            # WeDLM training params
+            'use_wedlm', 'wedlm_block_size', 'wedlm_min_mask_ratio',
+            'wedlm_max_mask_ratio', 'wedlm_ar_loss_weight', 'wedlm_mask_token_id',
             # Deprecated/removed params
             'no_moe',
         ]

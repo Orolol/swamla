@@ -141,7 +141,6 @@ COMMON_ARGS="--size moe-1b \
     --max_iters 100000 \
     --grad_clip 1.0 \
     --gradient_accumulation_steps 1 \
-    --gradient_checkpointing \
     --num_workers 8 \
     --swa_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
@@ -156,7 +155,7 @@ COMMON_ARGS="--size moe-1b \
     --save_interval 1000 \
     $DELTANET_ARGS \
     --compile \
-    --compile_mode reduce-overhead \
+    --compile_mode max-autotune \
     --latent_ratio $LATENT_RATIO \
     --latent_preserve_expert_dim \
     --n_experts $N_EXPERTS \

@@ -272,22 +272,14 @@ class SWAMLAModel(nn.Module):
 
         # For WeDLM dual-stream, sequence length can be 2x block_size
         # but position_ids (logical positions) should stay within block_size
-        if position_ids is not None:
-            # WeDLM mode: check logical positions, not physical sequence length
-            max_logical_pos = position_ids.max().item() + 1
-            if max_logical_pos > self.config.block_size:
-                raise ValueError(
-                    f"Cannot forward sequence with max logical position {max_logical_pos}, "
-                    f"block size is only {self.config.block_size}"
-                )
-            max_pos = max_logical_pos
-        else:
-            # Standard mode: sequence length must fit in block_size
-            if t > self.config.block_size:
-                raise ValueError(
-                    f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-                )
-            max_pos = t
+        # Note: We use t (physical seq length) for freqs_cis slicing to avoid
+        # GPU->CPU sync (.item()) that would break CUDAGraphs.
+        # Position validation is done at data preparation time, not here.
+        if position_ids is None and t > self.config.block_size:
+            raise ValueError(
+                f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+            )
+        max_pos = t
 
         tok_emb = self.transformer.wte(idx)
         x = self.transformer.drop(tok_emb)

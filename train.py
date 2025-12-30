@@ -1139,11 +1139,18 @@ def train(args):
             else:
                 optimizer_state = optimizer.state_dict()
 
+            # Build config dict with effective values (not just args)
+            config_dict = vars(args).copy()
+
+            # For WeDLM, save the actual mask_token_id used (not None)
+            if args.use_wedlm and mask_token_id is not None:
+                config_dict['wedlm_mask_token_id'] = mask_token_id
+
             checkpoint = {
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer_state,
                 'step': step,
-                'config': vars(args),
+                'config': config_dict,
             }
 
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{step}.pt')

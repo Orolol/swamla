@@ -23,6 +23,8 @@ class WeDLMConfig:
     entropy_threshold: float = 0.5          # tau: confidence threshold for mask filling
     distance_penalty: float = 0.1           # lambda: penalty for distance from leftmost mask
     min_commit_size: int = 1                # Minimum tokens to commit per step
+    refinement_iters: int = 3               # Number of forward passes per window before committing
+                                            # Allows predictions to condition on each other
 
     # Architecture adaptation
     adapt_deltanet: bool = True             # Adapt GatedDeltaNet blocks for WeDLM

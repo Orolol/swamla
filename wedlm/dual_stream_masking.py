@@ -182,9 +182,14 @@ class DualStreamMasker:
         Structure (2L x 2L):
         - Memory stream [0:L]: Standard causal attention
         - Prediction block k [L+start:L+end]:
-            - Can attend to: Memory positions < block_k_start (clean history)
+            - Can attend to: Memory positions <= (k+1)*block_size - 1 (clean context up to current block)
             - Can attend to: Other positions in same block (causal after reordering)
-            - Cannot attend to: Other prediction blocks or future memory
+            - Cannot attend to: Other prediction blocks or future memory beyond current block
+
+        WeDLM paper interpretation:
+        - Block k predicts positions [k*B, (k+1)*B)
+        - It can see memory up to position (k+1)*B - 1 (the end of the current block in memory)
+        - This allows the model to condition on clean tokens for the positions it's predicting
 
         Returns:
             mask: [2L, 2L] boolean attention mask (True = can attend)
@@ -204,7 +209,11 @@ class DualStreamMasker:
         pred_row_block = pred_row_pos // self.block_size  # Which block this row belongs to
 
         # Prediction rows can attend to:
-        # 1. Memory positions before their block starts
+        # 1. Memory positions BEFORE their block (NOT including current block!)
+        #    Block k can see memory positions [0, k*block_size)
+        #    This means block 0 sees NO memory (must predict without clean context)
+        #    Block 1 sees [0, block_size), block 2 sees [0, 2*block_size), etc.
+        #    Per WeDLM paper Section 4.2: "Memory tokens whose logical positions PRECEDE block k"
         pred_to_memory = (row_idx >= L) & (col_idx < L) & (col_idx < pred_row_block * self.block_size)
 
         # 2. Same block in prediction stream (causal within block)
