@@ -421,6 +421,7 @@ class MLA(nn.Module):
         
         return x
     
+    @torch.compiler.disable
     def _flash_attention(self, q, k, v, causal=True):
         """
         Run Flash Attention with proper dtype and dimension handling.
@@ -434,23 +435,24 @@ class MLA(nn.Module):
         Returns:
             output: (B, T, H, D_v)
         """
-        # CRITICAL: FA2 on H100 with torch.compile max-autotune + CUDA graphs
-        # requires tensors with consistent strides across all graph replays.
+        # NOTE: This method is decorated with @torch.compiler.disable to prevent
+        # torch.compile from capturing FA2's internal operations into CUDA graphs.
         #
-        # The CUDA graph captures the exact memory layout (strides) during recording.
-        # On replay, if tensor strides differ, we get assertion failures like:
-        # "expected stride 262144==128 at dim=1"
+        # On H100 with FA2 + torch.compile max-autotune, CUDA graph replay can
+        # fail with stride assertion errors because FA2's internal transpose
+        # creates tensors with non-standard strides that differ between recording
+        # and replay.
         #
-        # Using .contiguous().clone() ensures:
-        # 1. Tensor is contiguous (standard row-major layout)
-        # 2. Clone forces a fresh allocation with canonical strides
-        # 3. Strides are deterministic across iterations
+        # By disabling compilation for this method, FA2 runs normally while
+        # the rest of the model benefits from torch.compile optimization.
+        # This is a targeted fix that preserves max-autotune performance.
         #
-        # Note: This adds memory overhead but is required for CUDA graph stability on H100.
         # Blackwell (B200) doesn't seem to have this issue.
-        q = q.contiguous().clone()
-        k = k.contiguous().clone()
-        v = v.contiguous().clone()
+
+        # Ensure inputs are contiguous
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         # Flash Attention requires bf16 or fp16
         orig_dtype = q.dtype
