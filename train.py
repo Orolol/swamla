@@ -819,8 +819,11 @@ def train(args):
         model = torch.compile(model, mode=compile_mode)
 
     # Wrap with DDP
+    # Note: find_unused_parameters=True is required when using @torch._dynamo.disable
+    # on submodules (like MLA.forward) because DDP can't track gradients through
+    # dynamo-disabled regions during graph construction.
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         raw_model = model.module
     else:
         raw_model = model
