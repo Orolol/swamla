@@ -80,6 +80,23 @@ def setup_distributed():
     return False, 0, 0, 1
 
 
+def configure_cuda_optimizations():
+    """Configure CUDA optimizations for maximum throughput."""
+    if not torch.cuda.is_available():
+        return
+
+    # Enable cudnn benchmark for consistent input sizes (fixed batch/seq length)
+    # This finds the fastest convolution algorithms
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+    # Enable flash attention memory efficient patterns
+    # torch.backends.cuda.enable_flash_sdp(True)  # Already default in PyTorch 2.0+
+    # torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    print("✓ CUDA optimizations enabled (cudnn.benchmark=True)")
+
+
 def configure_tf32(enable_tf32=True, verbose=True):
     """Configure TensorFloat-32 (TF32) precision for Ampere+ GPUs.
 
@@ -501,6 +518,11 @@ def train(args):
         print(f"Device: {device}")
         print(f"DDP: {is_ddp}, World size: {world_size}")
 
+    # Configure CUDA optimizations
+    if master_process:
+        print("\nConfiguring CUDA optimizations...")
+        configure_cuda_optimizations()
+
     # Configure TF32 precision (only on master process to avoid spam)
     # enable_tf32 = not args.disable_tf32 if hasattr(args, 'disable_tf32') else True
     enable_tf32 = False
@@ -867,6 +889,9 @@ def train(args):
     data_iter = iter(data_loader)
     scaler = torch.amp.GradScaler('cuda', enabled=False)
 
+    # Create a separate CUDA stream for async data prefetching
+    prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
     running_loss = 0.0
     t0 = time.time()
 
@@ -884,6 +909,14 @@ def train(args):
     for opt in optimizers_list:
         opt_lrs = [pg['lr'] for pg in opt.param_groups]
         initial_lrs.append(opt_lrs)
+
+    # Prefetch first batch
+    next_batch = None
+    try:
+        next_batch = next(data_iter)
+    except StopIteration:
+        data_iter = iter(data_loader)
+        next_batch = next(data_iter)
 
     for step in range(start_step, args.max_iters):
         # Update learning rate - compute the schedule ratio
@@ -904,25 +937,37 @@ def train(args):
 
         # Training step with gradient accumulation
         model.train()
-        
-        # Zero grad for all optimizers
+
+        # Zero grad for all optimizers (set_to_none is faster than zero_grad)
         if isinstance(optimizer, list):
             for opt in optimizer:
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
         else:
-            optimizer.zero_grad()
-            
+            optimizer.zero_grad(set_to_none=True)
+
         accum_loss = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(data_loader)
-                batch = next(data_iter)
+            # Use prefetched batch
+            batch = next_batch
 
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
+            # Prefetch next batch while current one is being processed
+            if prefetch_stream is not None:
+                with torch.cuda.stream(prefetch_stream):
+                    try:
+                        next_batch = next(data_iter)
+                    except StopIteration:
+                        data_iter = iter(data_loader)
+                        next_batch = next(data_iter)
+            else:
+                try:
+                    next_batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(data_loader)
+                    next_batch = next(data_iter)
+
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
 
             # Forward pass with mixed precision (BF16)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
@@ -1050,8 +1095,8 @@ def train(args):
                         data_iter = iter(data_loader)
                         batch = next(data_iter)
 
-                    input_ids = batch['input_ids'].to(device)
-                    labels = batch['labels'].to(device)
+                    input_ids = batch['input_ids'].to(device, non_blocking=True)
+                    labels = batch['labels'].to(device, non_blocking=True)
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                         if args.use_wedlm and wedlm_masker is not None:

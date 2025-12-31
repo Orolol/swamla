@@ -92,13 +92,14 @@ class PackedFinewebDataset(IterableDataset):
         split: str = "train",
         max_length: int = 2048,
         batch_size: int = 4,
-        buffer_docs: int = 4096,
-        prefetch_batches: int = 16,
+        buffer_docs: int = 8192,
+        prefetch_batches: int = 64,
         shuffle: bool = True,
         shuffle_buffer_size: int = 10000,
         tokenizer: Optional[Any] = None,
         num_workers: int = 1,
         start_offset: int = 0,
+        pin_memory: bool = True,
     ):
         super().__init__()
 
@@ -111,6 +112,7 @@ class PackedFinewebDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.num_workers = max(1, num_workers)
         self.start_offset = start_offset
+        self.pin_memory = pin_memory
 
         # DDP awareness: detect if we're in a distributed environment
         try:
@@ -254,6 +256,12 @@ class PackedFinewebDataset(IterableDataset):
         self.stats["total_padding"] += pad
         if self.stats["total_tokens"] > 0:
             self.stats["avg_padding_ratio"] = self.stats["total_padding"] / self.stats["total_tokens"]
+
+        # Pin memory for faster CPU->GPU transfer
+        if self.pin_memory:
+            input_ids = input_ids.pin_memory()
+            attention_mask = attention_mask.pin_memory()
+            labels = labels.pin_memory()
 
         return {
             "input_ids": input_ids.contiguous(),  # [B, L]

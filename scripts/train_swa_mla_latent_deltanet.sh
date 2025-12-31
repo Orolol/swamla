@@ -134,8 +134,8 @@ COMMON_ARGS="--size moe-1b \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
     --tokenizer_name openai-community/gpt2 \
-    --log_interval 10 \
-    --eval_interval 1000 \
+    --log_interval 50 \
+    --eval_interval 5000 \
     --save_interval 5000 \
     $DELTANET_ARGS \
     --compile \
