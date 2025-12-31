@@ -189,7 +189,8 @@ class MLA(nn.Module):
 
     
 
-    
+
+    @torch._dynamo.disable
     def forward(
         self,
         x: torch.Tensor,
@@ -200,6 +201,18 @@ class MLA(nn.Module):
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
+
+        NOTE: This method is decorated with @torch._dynamo.disable to prevent
+        torch.compile from capturing FA2's internal operations into CUDA graphs.
+
+        On H100 with FA2 + torch.compile max-autotune, CUDA graph replay can
+        fail with stride assertion errors because FA2's internal transpose
+        creates tensors with non-standard strides that differ between recording
+        and replay. By disabling dynamo for the entire MLA forward, FA2 runs
+        normally while the rest of the model (DeltaNet, MLP, norms) benefits
+        from torch.compile optimization.
+
+        Blackwell (B200) doesn't seem to have this issue.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
@@ -421,7 +434,6 @@ class MLA(nn.Module):
         
         return x
     
-    @torch.compiler.disable
     def _flash_attention(self, q, k, v, causal=True):
         """
         Run Flash Attention with proper dtype and dimension handling.
@@ -435,20 +447,6 @@ class MLA(nn.Module):
         Returns:
             output: (B, T, H, D_v)
         """
-        # NOTE: This method is decorated with @torch.compiler.disable to prevent
-        # torch.compile from capturing FA2's internal operations into CUDA graphs.
-        #
-        # On H100 with FA2 + torch.compile max-autotune, CUDA graph replay can
-        # fail with stride assertion errors because FA2's internal transpose
-        # creates tensors with non-standard strides that differ between recording
-        # and replay.
-        #
-        # By disabling compilation for this method, FA2 runs normally while
-        # the rest of the model benefits from torch.compile optimization.
-        # This is a targeted fix that preserves max-autotune performance.
-        #
-        # Blackwell (B200) doesn't seem to have this issue.
-
         # Ensure inputs are contiguous
         q = q.contiguous()
         k = k.contiguous()
