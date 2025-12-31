@@ -434,18 +434,30 @@ class MLA(nn.Module):
         Returns:
             output: (B, T, H, D_v)
         """
-        # IMPORTANT: FA3 on H100 requires strictly contiguous tensors for CUDA graphs
-        # Make sure all inputs are contiguous before any operations
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
+        # CRITICAL: FA2 on H100 with torch.compile max-autotune + CUDA graphs
+        # requires tensors with consistent strides across all graph replays.
+        #
+        # The CUDA graph captures the exact memory layout (strides) during recording.
+        # On replay, if tensor strides differ, we get assertion failures like:
+        # "expected stride 262144==128 at dim=1"
+        #
+        # Using .contiguous().clone() ensures:
+        # 1. Tensor is contiguous (standard row-major layout)
+        # 2. Clone forces a fresh allocation with canonical strides
+        # 3. Strides are deterministic across iterations
+        #
+        # Note: This adds memory overhead but is required for CUDA graph stability on H100.
+        # Blackwell (B200) doesn't seem to have this issue.
+        q = q.contiguous().clone()
+        k = k.contiguous().clone()
+        v = v.contiguous().clone()
 
         # Flash Attention requires bf16 or fp16
         orig_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16).contiguous()
-            k = k.to(torch.bfloat16).contiguous()
-            v = v.to(torch.bfloat16).contiguous()
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
 
         # Flash Attention requires Q, K, V to have the same head dimension
         # If V has different dimension, pad it
