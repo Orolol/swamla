@@ -74,8 +74,10 @@ class BatchedExperts(nn.Module):
     Batched implementation of multiple SwiGLU experts.
 
     Instead of N separate Linear layers, we stack all weights into 3D tensors
-    and use batched matrix multiplications. This dramatically reduces kernel
-    launch overhead and enables better GPU utilization.
+    and use Triton grouped GEMM for efficient computation. This dramatically
+    reduces kernel launch overhead and enables better GPU utilization.
+
+    Weights are stored in Triton-friendly format [E, K, N] to avoid transpose during forward.
     """
 
     def __init__(self, n_experts: int, d_model: int, d_ff: int, bias: bool = False):
@@ -84,11 +86,11 @@ class BatchedExperts(nn.Module):
         self.d_model = d_model
         self.d_ff = d_ff
 
-        # Stacked weights: [n_experts, out_dim, in_dim]
-        # gate_up: d_model -> 2*d_ff (gate and up combined)
-        # down: d_ff -> d_model
-        self.gate_up_weight = nn.Parameter(torch.empty(n_experts, 2 * d_ff, d_model))
-        self.down_weight = nn.Parameter(torch.empty(n_experts, d_model, d_ff))
+        # Weights stored in Triton format: [E, K, N] for A[Total, K] @ B[E, K, N] -> C[Total, N]
+        # gate_up: d_model -> 2*d_ff, so B is [E, d_model, 2*d_ff]
+        # down: d_ff -> d_model, so B is [E, d_ff, d_model]
+        self.gate_up_weight = nn.Parameter(torch.empty(n_experts, d_model, 2 * d_ff))
+        self.down_weight = nn.Parameter(torch.empty(n_experts, d_ff, d_model))
 
         if bias:
             self.gate_up_bias = nn.Parameter(torch.zeros(n_experts, 2 * d_ff))
@@ -106,7 +108,7 @@ class BatchedExperts(nn.Module):
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for selected experts.
+        Forward pass for selected experts (legacy path, used by _compute_experts_simple).
 
         Args:
             x: [num_tokens, d_model] input tokens
@@ -116,20 +118,19 @@ class BatchedExperts(nn.Module):
             output: [num_tokens, d_model] expert outputs
         """
         # Gather the weights for each token's expert
-        # gate_up_weight: [n_experts, 2*d_ff, d_model]
-        # We need: [num_tokens, 2*d_ff, d_model]
+        # gate_up_weight: [n_experts, d_model, 2*d_ff] (Triton format)
+        # We need: [num_tokens, d_model, 2*d_ff]
         num_tokens = x.shape[0]
 
         # Index into expert weights
-        # expert_indices: [num_tokens]
-        gate_up_w = self.gate_up_weight[expert_indices]  # [num_tokens, 2*d_ff, d_model]
-        down_w = self.down_weight[expert_indices]  # [num_tokens, d_model, d_ff]
+        gate_up_w = self.gate_up_weight[expert_indices]  # [num_tokens, d_model, 2*d_ff]
+        down_w = self.down_weight[expert_indices]  # [num_tokens, d_ff, d_model]
 
-        # Batched matmul: x @ W^T for each token
+        # Batched matmul: x @ W for each token (no transpose needed with Triton format)
         # x: [num_tokens, d_model] -> [num_tokens, 1, d_model]
-        # gate_up_w: [num_tokens, 2*d_ff, d_model]
+        # gate_up_w: [num_tokens, d_model, 2*d_ff]
         # result: [num_tokens, 1, 2*d_ff] -> [num_tokens, 2*d_ff]
-        combined = torch.bmm(x.unsqueeze(1), gate_up_w.transpose(1, 2)).squeeze(1)
+        combined = torch.bmm(x.unsqueeze(1), gate_up_w).squeeze(1)
 
         if self.gate_up_bias is not None:
             gate_up_b = self.gate_up_bias[expert_indices]  # [num_tokens, 2*d_ff]
@@ -141,9 +142,9 @@ class BatchedExperts(nn.Module):
 
         # Down projection
         # hidden: [num_tokens, d_ff] -> [num_tokens, 1, d_ff]
-        # down_w: [num_tokens, d_model, d_ff]
+        # down_w: [num_tokens, d_ff, d_model]
         # result: [num_tokens, 1, d_model] -> [num_tokens, d_model]
-        output = torch.bmm(hidden.unsqueeze(1), down_w.transpose(1, 2)).squeeze(1)
+        output = torch.bmm(hidden.unsqueeze(1), down_w).squeeze(1)
 
         if self.down_bias is not None:
             down_b = self.down_bias[expert_indices]  # [num_tokens, d_model]
@@ -253,14 +254,14 @@ class AuxLossFreeRouter(nn.Module):
     @torch.no_grad()
     def _update_bias(self, selected_experts: torch.Tensor, num_tokens: int):
         """Update expert bias based on load (no gradients)."""
-        # Count load per expert
+        # Count load per expert - vectorized: flatten and count all at once
+        # selected_experts: [num_tokens, top_k] -> [num_tokens * top_k]
+        flat_indices = selected_experts.view(-1)
         load = torch.zeros(self.n_experts, device=selected_experts.device, dtype=torch.float32)
-        for k in range(self.top_k):
-            expert_indices = selected_experts[:, k]
-            load.scatter_add_(
-                0, expert_indices,
-                torch.ones(num_tokens, device=selected_experts.device, dtype=torch.float32)
-            )
+        load.scatter_add_(
+            0, flat_indices,
+            torch.ones_like(flat_indices, dtype=torch.float32)
+        )
 
         # Expected load if perfectly balanced
         expected_load = num_tokens * self.top_k / self.n_experts
@@ -436,16 +437,18 @@ class MoELayer(nn.Module):
         gating_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Efficient MoE computation with token grouping.
+        Efficient MoE computation using Triton grouped GEMM.
 
-        Instead of nested loops over top-k and experts (96 kernel launches),
-        this approach:
+        Instead of nested loops or padded BMM, this approach:
         1. Expands tokens for each top-k slot
         2. Sorts all (token, slot) pairs by expert assignment
-        3. Processes each expert with a single contiguous batch
+        3. Uses Triton moe_gemm for efficient batched computation (no padding waste)
         4. Scatters results back and sums over top-k
 
-        This reduces kernel launches from 96 (3 top-k × 32 experts) to 32.
+        This is significantly faster than padded BMM due to:
+        - No memory waste from padding
+        - Optimized Triton kernel with autotuning
+        - Single kernel launch per GEMM operation
         """
         B_S, K = selected_experts.shape  # [num_tokens, top_k]
         D = x.shape[-1]
@@ -453,13 +456,11 @@ class MoELayer(nn.Module):
         dtype = x.dtype
 
         # 1-2. Fused routing: histogram + permutation in GPU kernels
-        # Replaces bincount + argsort with fused Triton operations
         tokens_per_expert, expert_offsets, sorted_indices = fused_moe_routing(
             selected_experts, self.n_experts
         )
 
         # 3. Expand x for each of K selections and reorder
-        # x: [B_S, D] -> x_expanded: [B_S * K, D]
         x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
         weights_flat = gating_weights.view(-1, 1)  # [B_S * K, 1]
 
@@ -467,152 +468,86 @@ class MoELayer(nn.Module):
         x_sorted = x_expanded[sorted_indices]  # Contiguous batches per expert
         weights_sorted = weights_flat[sorted_indices]
 
-        # 4. Compute expert outputs with contiguous batches
-        # expert_offsets already contains [0, cumsum[0], cumsum[1], ...]
-        cumsum = expert_offsets[1:]  # [E] end positions for each expert
-
-        # Use padded batched GEMM approach for better GPU utilization
-        # This eliminates the Python loop overhead by using a single batched operation
-        use_padded_bmm = True
-
-        if use_padded_bmm:
-            outputs_sorted = self._compute_experts_padded_bmm(
-                x_sorted, weights_sorted, tokens_per_expert, cumsum, B_S, K, D, device, dtype
-            )
-        else:
-            outputs_sorted = torch.zeros(B_S * K, D, device=device, dtype=dtype)
-
-            # Start positions: [0, cumsum[0], cumsum[1], ...]
-            starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-
-            for expert_idx in range(self.n_experts):
-                start = starts[expert_idx]
-                end = cumsum[expert_idx]
-
-                # Get contiguous batch for this expert
-                expert_input = x_sorted[start:end]  # [count, D]
-
-                # Manual expert computation using BatchedExperts weights
-                # gate_up
-                w_gate_up = self.experts.gate_up_weight[expert_idx] # [2*d_ff, d_model]
-                b_gate_up = self.experts.gate_up_bias[expert_idx] if self.experts.gate_up_bias is not None else None
-
-                combined = F.linear(expert_input, w_gate_up, b_gate_up)
-
-                gate, up = combined.chunk(2, dim=-1)
-                hidden = F.silu(gate) * up
-
-                # down
-                w_down = self.experts.down_weight[expert_idx] # [d_model, d_ff]
-                b_down = self.experts.down_bias[expert_idx] if self.experts.down_bias is not None else None
-
-                expert_output = F.linear(hidden, w_down, b_down)
-
-                # Apply weights and store
-                outputs_sorted[start:end] = weights_sorted[start:end] * expert_output.to(dtype)
+        # 4. Compute expert outputs using Triton grouped GEMM
+        outputs_sorted = self._compute_experts_triton(
+            x_sorted, weights_sorted, expert_offsets, device, dtype
+        )
 
         # 5. Scatter back to original order
-        # Create output in sorted order, then unsort
         outputs_expanded = torch.zeros_like(outputs_sorted)
         outputs_expanded[sorted_indices] = outputs_sorted
 
         # 6. Reshape and sum over K selections
-        # [B_S * K, D] -> [B_S, K, D] -> [B_S, D]
         output = outputs_expanded.view(B_S, K, D).sum(dim=1)
 
         return output
 
-    def _compute_experts_padded_bmm(
+    def _compute_experts_triton(
         self,
         x_sorted: torch.Tensor,
         weights_sorted: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
-        cumsum: torch.Tensor,
-        B_S: int,
-        K: int,
-        D: int,
+        expert_offsets: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """
-        Compute expert outputs using padded batched matrix multiplication.
+        Compute expert outputs using Triton grouped GEMM kernel.
 
-        This approach pads all expert batches to the same size and uses
-        torch.bmm for a single fused operation, eliminating Python loop overhead.
+        Uses the moe_gemm kernel which is optimized for variable-size expert batches.
+        No padding waste - processes exactly the tokens assigned to each expert.
 
-        Trade-off: Some wasted compute on padding, but much better GPU utilization
-        due to reduced kernel launch overhead.
+        Weights are stored in Triton format [E, K, N] to avoid transpose overhead.
         """
-        E = self.n_experts
-        d_ff = self.expert_dim
-        total_tokens = B_S * K
+        total_tokens = x_sorted.shape[0]
+        D = x_sorted.shape[-1]  # d_model
 
-        # Use a safe upper bound for max_tokens to avoid index out of bounds
-        # Worst case: all tokens go to one expert = total_tokens
-        # But we cap it to avoid excessive memory usage
-        # With 32 experts and top-3, expected max is ~3x average = 3 * total_tokens / 32
-        # Use 4x average as safe bound, capped at total_tokens
-        max_tokens = min(total_tokens, (total_tokens * 4 + E - 1) // E)
-        # Round up to power of 2 for memory alignment
-        max_tokens = 1 << (max_tokens - 1).bit_length() if max_tokens > 0 else 64
-        max_tokens = max(64, max_tokens)
+        # Ensure weights are in the same dtype as input for Triton
+        gate_up_w = self.experts.gate_up_weight.to(dtype)
+        down_w = self.experts.down_weight.to(dtype)
 
-        # Build vectorized scatter/gather indices - fully vectorized, no Python loops
-        starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-
-        # Create expert_ids by repeating each expert index by its token count
-        # e.g., if tokens_per_expert = [3, 2, 1], expert_ids = [0, 0, 0, 1, 1, 2]
-        expert_ids = torch.repeat_interleave(
-            torch.arange(E, device=device),
-            tokens_per_expert
-        )
-
-        # Create positions within each expert batch
-        # positions[i] = i - starts[expert_ids[i]]
-        # e.g., for expert_ids = [0, 0, 0, 1, 1, 2], positions = [0, 1, 2, 0, 1, 0]
-        arange_total = torch.arange(total_tokens, device=device)
-        positions = arange_total - starts[expert_ids]
-
-        # Clamp positions to valid range to prevent out-of-bounds access
-        # This handles edge cases where routing is extremely imbalanced
-        positions = positions.clamp(0, max_tokens - 1)
-
-        # Create padded input tensor using advanced indexing
-        # x_padded[e, pos] = x_sorted[i] where expert_ids[i] == e and positions[i] == pos
-        x_padded = torch.zeros(E, max_tokens, D, device=device, dtype=dtype)
-        weights_padded = torch.zeros(E, max_tokens, 1, device=device, dtype=dtype)
-
-        # Scatter inputs into padded tensor (ensure dtype matches)
-        x_padded[expert_ids, positions] = x_sorted.to(dtype)
-        weights_padded[expert_ids, positions] = weights_sorted.to(dtype)
-
-        # Batched gate_up projection: [E, max_tokens, D] @ [E, D, 2*d_ff] -> [E, max_tokens, 2*d_ff]
-        # gate_up_weight is [E, 2*d_ff, D], need to transpose last two dims
-        combined = torch.bmm(x_padded, self.experts.gate_up_weight.transpose(1, 2))
+        # Gate+Up projection: x_sorted @ gate_up_weight
+        # x_sorted: [Total, d_model]
+        # gate_up_weight: [E, d_model, 2*d_ff] (Triton format)
+        combined = moe_gemm(x_sorted, gate_up_w, expert_offsets)
 
         # Add bias if present
         if self.experts.gate_up_bias is not None:
-            combined = combined + self.experts.gate_up_bias.unsqueeze(1)  # [E, 1, 2*d_ff]
+            expert_ids = self._get_expert_ids_from_offsets(expert_offsets, total_tokens, device)
+            combined = combined + self.experts.gate_up_bias[expert_ids].to(dtype)
 
         # SwiGLU activation
-        gate, up = combined.chunk(2, dim=-1)  # Each [E, max_tokens, d_ff]
+        gate, up = combined.chunk(2, dim=-1)
         hidden = F.silu(gate) * up
 
-        # Batched down projection: [E, max_tokens, d_ff] @ [E, d_ff, D] -> [E, max_tokens, D]
-        # down_weight is [E, D, d_ff], need to transpose last two dims
-        expert_outputs = torch.bmm(hidden, self.experts.down_weight.transpose(1, 2))
+        # Down projection: hidden @ down_weight
+        # hidden: [Total, d_ff]
+        # down_weight: [E, d_ff, d_model] (Triton format)
+        expert_outputs = moe_gemm(hidden, down_w, expert_offsets)
 
         # Add bias if present
         if self.experts.down_bias is not None:
-            expert_outputs = expert_outputs + self.experts.down_bias.unsqueeze(1)  # [E, 1, D]
+            if not hasattr(self, '_cached_expert_ids') or self._cached_total != total_tokens:
+                expert_ids = self._get_expert_ids_from_offsets(expert_offsets, total_tokens, device)
+            expert_outputs = expert_outputs + self.experts.down_bias[expert_ids].to(dtype)
 
         # Apply gating weights
-        expert_outputs = expert_outputs * weights_padded
+        expert_outputs = expert_outputs * weights_sorted
 
-        # Gather outputs back using the same indices
-        outputs_sorted = expert_outputs[expert_ids, positions].to(dtype)
+        return expert_outputs.to(dtype)
 
-        return outputs_sorted
+    def _get_expert_ids_from_offsets(
+        self,
+        expert_offsets: torch.Tensor,
+        total_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Convert expert_offsets to per-token expert IDs efficiently."""
+        # expert_offsets: [E+1] with cumulative sums
+        # We need expert_ids: [total_tokens] where expert_ids[i] = expert index for token i
+        token_indices = torch.arange(total_tokens, device=device)
+        expert_ids = torch.searchsorted(expert_offsets[1:], token_indices, right=True)
+        expert_ids = expert_ids.clamp(0, self.n_experts - 1)
+        return expert_ids
 
     def get_aux_loss(self) -> torch.Tensor:
         """Return auxiliary loss (z-loss from router)."""
