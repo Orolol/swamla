@@ -19,8 +19,9 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 try:
-    from moe_triton import moe_gemm
+    from moe_triton import moe_gemm, fused_moe_routing
     TRITON_AVAILABLE = True
+    FUSED_ROUTING_AVAILABLE = True
     # Allow capturing scalar outputs to avoid graph break warnings with .item()
     import torch._dynamo
     torch._dynamo.config.capture_scalar_outputs = True
@@ -451,37 +452,24 @@ class MoELayer(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        # 1. Count tokens per expert (across all K slots)
-        tokens_per_expert = torch.zeros(self.n_experts, dtype=torch.long, device=device)
-        flat_expert_indices = selected_experts.view(-1)  # [B_S * K]
-
-        # Use bincount for efficient counting
-        tokens_per_expert = torch.bincount(
-            flat_expert_indices,
-            minlength=self.n_experts
+        # 1-2. Fused routing: histogram + permutation in GPU kernels
+        # Replaces bincount + argsort with fused Triton operations
+        tokens_per_expert, expert_offsets, sorted_indices = fused_moe_routing(
+            selected_experts, self.n_experts
         )
-
-        # 2. Sort tokens by expert assignment
-        sorted_indices = torch.argsort(flat_expert_indices, stable=True)
 
         # 3. Expand x for each of K selections and reorder
         # x: [B_S, D] -> x_expanded: [B_S * K, D]
         x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
         weights_flat = gating_weights.view(-1, 1)  # [B_S * K, 1]
 
-        # Reorder by expert
+        # Reorder by expert using fused permutation
         x_sorted = x_expanded[sorted_indices]  # Contiguous batches per expert
         weights_sorted = weights_flat[sorted_indices]
 
         # 4. Compute expert outputs with contiguous batches
-
-        # Check if we can use Triton optimization
-        # Note: BatchedExperts stores weights as [E, Out, In]
-        # gate_up_weight: [E, 2*d_ff, d_model]
-        # down_weight: [E, d_model, d_ff]
-
-        # Cumulative sum gives us end positions for each expert
-        cumsum = torch.cumsum(tokens_per_expert, dim=0)
+        # expert_offsets already contains [0, cumsum[0], cumsum[1], ...]
+        cumsum = expert_offsets[1:]  # [E] end positions for each expert
 
         # Use padded batched GEMM approach for better GPU utilization
         # This eliminates the Python loop overhead by using a single batched operation
@@ -828,29 +816,21 @@ class LatentMoELayer(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        # 1. Count tokens per expert (across all K slots)
-        flat_expert_indices = selected_experts.view(-1)  # [B_S * K]
-        tokens_per_expert = torch.bincount(
-            flat_expert_indices,
-            minlength=self.n_experts
+        # 1-2. Fused routing: histogram + permutation in GPU kernels
+        # Replaces bincount + argsort with fused Triton operations
+        tokens_per_expert, expert_offsets, sorted_indices = fused_moe_routing(
+            selected_experts, self.n_experts
         )
-
-        # 2. Sort tokens by expert assignment
-        sorted_indices = torch.argsort(flat_expert_indices, stable=True)
 
         # 3. Expand x for each of K selections and reorder
         x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
         weights_flat = gating_weights.view(-1, 1)
 
-        # Reorder by expert - creates contiguous batches per expert
+        # Reorder by expert using fused permutation
         x_sorted = x_expanded[sorted_indices]
         weights_sorted = weights_flat[sorted_indices]
 
-        # 4. Expert offsets for Triton kernel: [0, count0, count0+count1, ...]
-        expert_offsets = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            torch.cumsum(tokens_per_expert, dim=0)
-        ])
+        # expert_offsets already contains [0, count0, count0+count1, ...]
 
         # 5. Compute expert outputs using Triton grouped GEMM
         # This is much more GPU-efficient than padded BMM

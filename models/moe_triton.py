@@ -3,6 +3,115 @@ import torch
 import triton
 import triton.language as tl
 
+
+# ============================================================================
+# Fused Routing Kernel: bincount + argsort in one pass
+# ============================================================================
+# Avoids CPU synchronization by keeping everything on GPU
+
+@triton.jit
+def _histogram_kernel(
+    expert_indices_ptr,  # [N] input expert assignments
+    histogram_ptr,       # [E] output histogram (tokens per expert)
+    N,                   # number of tokens
+    E,                   # number of experts
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Count tokens per expert using atomic adds."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    expert_ids = tl.load(expert_indices_ptr + offs, mask=mask, other=0)
+
+    # Atomic increment histogram
+    for i in range(BLOCK_SIZE):
+        if offs[i] < N:
+            idx = tl.load(expert_indices_ptr + offs[i])
+            tl.atomic_add(histogram_ptr + idx, 1)
+
+
+@triton.jit
+def _compute_permutation_kernel(
+    expert_indices_ptr,  # [N] input expert assignments
+    offsets_ptr,         # [E] prefix sum of histogram (write positions)
+    permutation_ptr,     # [N] output permutation indices
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute permutation indices using atomic fetch-add for write positions."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    # Process each token
+    for i in range(BLOCK_SIZE):
+        token_idx = pid * BLOCK_SIZE + i
+        if token_idx < N:
+            expert_id = tl.load(expert_indices_ptr + token_idx)
+            # Atomically get write position and increment
+            write_pos = tl.atomic_add(offsets_ptr + expert_id, 1)
+            # Store: permutation[write_pos] = token_idx
+            tl.store(permutation_ptr + write_pos, token_idx)
+
+
+def fused_moe_routing(
+    expert_indices: torch.Tensor,
+    n_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused routing computation: histogram + permutation in GPU kernels.
+
+    Replaces: bincount + argsort with fused GPU operations.
+
+    Args:
+        expert_indices: [N] or [N, K] tensor of expert assignments
+        n_experts: number of experts
+
+    Returns:
+        tokens_per_expert: [E] count of tokens per expert
+        expert_offsets: [E+1] cumsum for expert boundaries
+        permutation: [N] indices to reorder tokens by expert
+    """
+    # Flatten if needed
+    flat_indices = expert_indices.view(-1).contiguous()
+    N = flat_indices.shape[0]
+    device = flat_indices.device
+
+    # Allocate outputs
+    histogram = torch.zeros(n_experts, dtype=torch.int32, device=device)
+
+    # Step 1: Compute histogram (tokens per expert)
+    BLOCK_SIZE = 256
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    _histogram_kernel[grid](
+        flat_indices, histogram,
+        N, n_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    # Step 2: Compute prefix sum (expert offsets) - this is fast on GPU
+    expert_offsets = torch.zeros(n_experts + 1, dtype=torch.int64, device=device)
+    expert_offsets[1:] = torch.cumsum(histogram.to(torch.int64), dim=0)
+
+    # Step 3: Compute permutation using atomic write positions
+    # We need a copy of offsets as write cursors (will be modified)
+    write_cursors = expert_offsets[:-1].clone()
+    permutation = torch.empty(N, dtype=torch.int64, device=device)
+
+    _compute_permutation_kernel[grid](
+        flat_indices, write_cursors, permutation,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return histogram.to(torch.int64), expert_offsets, permutation
+
+
+# ============================================================================
+# Original MoE GEMM Kernel
+# ============================================================================
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),

@@ -1267,12 +1267,12 @@ def train(args):
                     print(key_avg.table(sort_by="cuda_memory_usage", row_limit=15))
 
                     # Summary statistics
-                    total_cuda_time = sum(e.cuda_time_total for e in key_avg)
-                    total_cpu_time = sum(e.cpu_time_total for e in key_avg)
+                    total_cuda_time = sum(e.self_cuda_time_total for e in key_avg)
+                    total_cpu_time = sum(e.self_cpu_time_total for e in key_avg)
                     print(f"\n{'='*80}")
                     print(f"📈 SUMMARY:")
-                    print(f"   Total CUDA time: {total_cuda_time / 1000:.2f} ms")
-                    print(f"   Total CPU time:  {total_cpu_time / 1000:.2f} ms")
+                    print(f"   Total CUDA time: {total_cuda_time / 1e6:.2f} s")
+                    print(f"   Total CPU time:  {total_cpu_time / 1e6:.2f} s")
                     print(f"{'='*80}\n")
 
                 break  # Exit training loop after profiling
