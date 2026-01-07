@@ -48,11 +48,13 @@ def _swiglu_fwd_kernel(
         up = tl.load(input_ptr + input_row_start + half_N + offs, mask=mask, other=0.0)
 
         # SiLU activation: x * sigmoid(x)
-        gate_sigmoid = tl.sigmoid(gate)
-        gate_silu = gate * gate_sigmoid
+        # Note: tl.sigmoid only supports fp32/fp64, so cast from bf16 if needed
+        gate_f32 = gate.to(tl.float32)
+        gate_sigmoid = tl.sigmoid(gate_f32)
+        gate_silu = gate_f32 * gate_sigmoid
 
-        # SwiGLU: silu(gate) * up
-        result = gate_silu * up
+        # SwiGLU: silu(gate) * up - cast back to original dtype
+        result = (gate_silu * up.to(tl.float32)).to(gate.dtype)
 
         # Store result
         tl.store(output_ptr + output_row_start + offs, result, mask=mask)
@@ -90,22 +92,30 @@ def _swiglu_bwd_kernel(
         gate = tl.load(input_ptr + input_row + offs, mask=mask, other=0.0)
         up = tl.load(input_ptr + input_row + half_N + offs, mask=mask, other=0.0)
 
+        # Store original dtype for casting back
+        orig_dtype = gate.dtype
+
+        # Cast to fp32 for sigmoid (tl.sigmoid only supports fp32/fp64)
+        gate_f32 = gate.to(tl.float32)
+        up_f32 = up.to(tl.float32)
+        grad_out_f32 = grad_out.to(tl.float32)
+
         # Forward computation for backward
-        gate_sigmoid = tl.sigmoid(gate)
-        gate_silu = gate * gate_sigmoid
+        gate_sigmoid = tl.sigmoid(gate_f32)
+        gate_silu = gate_f32 * gate_sigmoid
 
         # Gradient w.r.t. up: grad_out * silu(gate)
-        grad_up = grad_out * gate_silu
+        grad_up = grad_out_f32 * gate_silu
 
         # Gradient w.r.t. gate: grad_out * up * d_silu/d_gate
         # d_silu/d_gate = sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate))
         #               = sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
-        d_silu = gate_sigmoid * (1.0 + gate * (1.0 - gate_sigmoid))
-        grad_gate = grad_out * up * d_silu
+        d_silu = gate_sigmoid * (1.0 + gate_f32 * (1.0 - gate_sigmoid))
+        grad_gate = grad_out_f32 * up_f32 * d_silu
 
-        # Store gradients
-        tl.store(grad_input_ptr + grad_in_row + offs, grad_gate, mask=mask)
-        tl.store(grad_input_ptr + grad_in_row + half_N + offs, grad_up, mask=mask)
+        # Store gradients (cast back to original dtype)
+        tl.store(grad_input_ptr + grad_in_row + offs, grad_gate.to(orig_dtype), mask=mask)
+        tl.store(grad_input_ptr + grad_in_row + half_N + offs, grad_up.to(orig_dtype), mask=mask)
 
 
 class FusedSwiGLUFunction(torch.autograd.Function):
