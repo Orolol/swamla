@@ -1331,7 +1331,7 @@ def main():
                         help='torch.compile mode')
 
     # FP8 Training (Transformer Engine)
-    parser.add_argument('--use_fp8', action='store_true', default=False,
+    parser.add_argument('--use_fp8', action='store_true', default=True,
                         help='Enable FP8 training via Transformer Engine (requires H100/H200)')
 
     # TensorBoard
