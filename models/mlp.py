@@ -7,6 +7,14 @@ import torch.utils.checkpoint as checkpoint
 
 from normalization import RMSNorm
 
+# Import TE FP8 helper
+try:
+    from optimization.fp8_te import get_te_linear, HAS_TE
+except ImportError:
+    HAS_TE = False
+    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
+        return nn.Linear(in_features, out_features, bias=bias)
+
 # Try to import fused Triton kernels
 try:
     from triton_kernels import fused_swiglu
@@ -29,9 +37,13 @@ class MLP(nn.Module):
         # Default hidden dimension: 4 * n_embd
         hidden_dim = 4 * config.n_embd
 
+        # Check if TE FP8 should be used
+        use_te_fp8 = getattr(config, 'use_te_fp8', False)
+
         # Combined gate+up projection for efficiency
-        self.gate_up_proj = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
-        self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        # Use TE Linear for FP8 if enabled and dimensions are compatible
+        self.gate_up_proj = get_te_linear(config.n_embd, 2 * hidden_dim, bias=config.bias, use_te_fp8=use_te_fp8)
+        self.down_proj = get_te_linear(hidden_dim, config.n_embd, bias=config.bias, use_te_fp8=use_te_fp8)
 
         self.dropout = nn.Dropout(config.dropout)
 

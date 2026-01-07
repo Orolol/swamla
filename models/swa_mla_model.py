@@ -106,6 +106,9 @@ class SWAMLAConfig:
     latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
     resume_from: Optional[str] = None # Checkpoint to resume from
 
+    # Transformer Engine FP8 training
+    use_te_fp8: bool = False  # Use TE Linear layers for FP8 training (requires transformer-engine)
+
     def __post_init__(self) -> None:
         if self.expert_dim is None:
             self.expert_dim = self.n_embd

@@ -65,6 +65,19 @@ try:
 except ImportError:
     pass
 
+# Transformer Engine FP8 imports
+TE_AVAILABLE = False
+te = None
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, DelayedScaling
+    TE_AVAILABLE = True
+except ImportError:
+    pass
+
+# For context manager fallback
+from contextlib import nullcontext
+
 
 def setup_distributed():
     """Setup distributed training if available."""
@@ -80,21 +93,82 @@ def setup_distributed():
     return False, 0, 0, 1
 
 
+def format_params(n):
+    """Format parameter count with appropriate suffix."""
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    elif n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    elif n >= 1e3:
+        return f"{n/1e3:.0f}K"
+    return str(n)
+
+
+def print_training_banner(args, model, world_size, device, resume_step=0, resume_tokens=0):
+    """Print compact training summary banner."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Calculate effective batch size
+    eff_batch = args.batch_size * args.gradient_accumulation_steps * world_size
+
+    # GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_short = gpu_name.split()[-1] if 'NVIDIA' in gpu_name else gpu_name[:20]
+    else:
+        gpu_short = "CPU"
+
+    # Run identifier
+    run_id = args.wandb_run_name or f"swa_mla_{args.size}"
+    timestamp = time.strftime('%Y-%m-%d %H:%M')
+
+    # Build summary
+    print("\n" + "═" * 70)
+    print(f"  SWA-MLA Training │ {run_id}")
+    print("═" * 70)
+
+    # Model line
+    arch_pattern = f"{args.swa_layers_per_cycle}×DeltaNet + {args.mla_layers_per_cycle}×MLA"
+    print(f"  Model: {args.size} ({format_params(total_params)} params) │ {arch_pattern}")
+
+    # MoE line if enabled
+    if args.use_moe:
+        if args.use_latent_moe:
+            eff_experts = args.latent_n_experts or (args.n_experts * args.latent_ratio)
+            eff_active = args.latent_n_activated or (args.n_activated * args.latent_ratio)
+            moe_info = f"LatentMoE {eff_experts}E/{eff_active}A (ratio={args.latent_ratio})"
+        else:
+            moe_info = f"MoE {args.n_experts}E/{args.n_activated}A"
+        if args.n_shared_experts > 0:
+            moe_info += f" +{args.n_shared_experts}shared"
+        print(f"  MoE: {moe_info}")
+
+    # Training config line
+    mode_str = " [WeDLM]" if args.use_wedlm else ""
+    print(f"  Training: bs={eff_batch} (×{args.gradient_accumulation_steps} accum) │ seq={args.block_size} │ lr={args.learning_rate:.0e}{mode_str}")
+
+    # Optimizer and device line
+    compile_str = f"compile={args.compile_mode}" if args.compile else "no-compile"
+    grad_ckpt = " +ckpt" if args.gradient_checkpointing else ""
+    print(f"  Optim: {args.optimizer_type} │ {compile_str}{grad_ckpt} │ {world_size}×{gpu_short}")
+
+    # Resume info if applicable
+    if resume_step > 0:
+        tokens_str = format_params(resume_tokens).replace('.0', '')
+        print(f"  Resume: step {resume_step:,} ({tokens_str} tokens)")
+
+    print("═" * 70)
+    print(f"  Started: {timestamp} │ max_iters: {args.max_iters:,}")
+    print("═" * 70 + "\n")
+
+
 def configure_cuda_optimizations():
     """Configure CUDA optimizations for maximum throughput."""
     if not torch.cuda.is_available():
         return
-
-    # Enable cudnn benchmark for consistent input sizes (fixed batch/seq length)
-    # This finds the fastest convolution algorithms
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-
-    # Enable flash attention memory efficient patterns
-    # torch.backends.cuda.enable_flash_sdp(True)  # Already default in PyTorch 2.0+
-    # torch.backends.cuda.enable_mem_efficient_sdp(True)
-
-    print("✓ CUDA optimizations enabled (cudnn.benchmark=True)")
 
 
 def configure_tf32(enable_tf32=True, verbose=True):
@@ -207,33 +281,22 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
 
 def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw'):
     """Configure optimizer with proper parameter grouping."""
-    
+
     if optimizer_type == 'muon':
         # Use native PyTorch Muon (requires PyTorch 2.6+)
         if not hasattr(torch.optim, 'Muon'):
-            print("PyTorch Muon not available (requires PyTorch 2.6+), falling back to AdamW")
             optimizer_type = 'adamw'
         else:
             Muon = torch.optim.Muon
-            print("Using PyTorch Muon optimizer")
-
-            # Muon typically needs much higher LR than AdamW
-            muon_lr = learning_rate * 200  # e.g., 1e-4 -> 0.02
+            muon_lr = learning_rate * 200
             adamw_lr = learning_rate
 
-            print(f"  Muon LR: {muon_lr:.4f}")
-            print(f"  AdamW LR: {adamw_lr:.6f}")
-
-            # Muon only supports exactly 2D params
             muon_params = []
             adamw_params = []
 
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-
-                # Embeddings/lm_head -> AdamW for stability
-                # Non-2D params -> AdamW (Muon only supports 2D)
                 if any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
                     adamw_params.append(param)
                 elif param.ndim == 2:
@@ -243,7 +306,6 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
 
             optimizers = []
             if muon_params:
-                print(f"  Muon: {len(muon_params)} parameter tensors")
                 optimizers.append(Muon(
                     muon_params,
                     lr=muon_lr,
@@ -253,7 +315,6 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
                     ns_steps=5,
                 ))
             if adamw_params:
-                print(f"  AdamW: {len(adamw_params)} parameter tensors")
                 optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay, fused=True))
 
             return optimizers
@@ -265,7 +326,6 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-
         if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe']):
             no_decay_params.append(param)
         else:
@@ -276,7 +336,6 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0}
     ]
 
-    print("Using AdamW optimizer")
     if device_type == 'cuda':
         optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
     else:
@@ -513,25 +572,14 @@ def train(args):
     master_process = rank == 0
     device = f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'
 
-    if master_process:
-        print(f"Training SWA-MLA model")
-        print(f"Device: {device}")
-        print(f"DDP: {is_ddp}, World size: {world_size}")
+    # Configure CUDA optimizations (silent)
+    configure_cuda_optimizations()
 
-    # Configure CUDA optimizations
-    if master_process:
-        print("\nConfiguring CUDA optimizations...")
-        configure_cuda_optimizations()
-
-    # Configure TF32 precision (only on master process to avoid spam)
-    # enable_tf32 = not args.disable_tf32 if hasattr(args, 'disable_tf32') else True
+    # Configure TF32 precision (silent)
     enable_tf32 = False
-    if master_process:
-        print("\nConfiguring TF32 precision...")
-        configure_tf32(enable_tf32=enable_tf32, verbose=True)
-        print("")
+    configure_tf32(enable_tf32=enable_tf32, verbose=False)
 
-    # Setup wandb (will be updated with model stats later)
+    # Setup wandb
     wandb_run = None
     if master_process and WANDB_AVAILABLE and args.wandb_project and hasattr(wandb, 'init'):
         if hasattr(wandb, 'login'):
@@ -542,14 +590,11 @@ def train(args):
             config=vars(args)
         )
 
-    # Setup TensorBoard
+    # Setup TensorBoard (silent)
     tb_writer = None
     if master_process and TENSORBOARD_AVAILABLE and args.use_tensorboard:
         tb_dir = os.path.join(args.output_dir, 'tensorboard', args.wandb_run_name or f"swa_mla_{args.size}_{time.strftime('%Y%m%d_%H%M%S')}")
         tb_writer = SummaryWriter(tb_dir)
-        print(f"TensorBoard logging enabled: {tb_dir}")
-
-        # Log hyperparameters
         tb_writer.add_text('config', str(vars(args)), 0)
 
     # Load tokenizer
@@ -567,19 +612,11 @@ def train(args):
 
     if args.resume_from:
         # Resume from local checkpoint path
-        if master_process:
-            print("\n" + "="*80)
-            print("RESUMING FROM LOCAL CHECKPOINT")
-            print("="*80)
-            print(f"Path: {args.resume_from}")
-
         checkpoint_path = args.resume_from
-        # If path is a directory, find the latest checkpoint
         if os.path.isdir(checkpoint_path):
             import glob
             checkpoint_files = glob.glob(os.path.join(checkpoint_path, "checkpoint_*.pt"))
             if checkpoint_files:
-                # Sort by step number (extract from filename)
                 def get_step(f):
                     try:
                         return int(os.path.basename(f).replace("checkpoint_", "").replace(".pt", ""))
@@ -587,11 +624,7 @@ def train(args):
                         return 0
                 checkpoint_files.sort(key=get_step, reverse=True)
                 checkpoint_path = checkpoint_files[0]
-                if master_process:
-                    print(f"Found latest checkpoint: {checkpoint_path}")
             else:
-                if master_process:
-                    print(f"⚠ No checkpoint_*.pt files found in {args.resume_from}")
                 checkpoint_path = None
 
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -599,42 +632,34 @@ def train(args):
                 resume_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
                 resume_step = resume_checkpoint.get('step', 0)
                 resume_tokens = resume_checkpoint.get('total_tokens', 0)
-                if master_process:
-                    print(f"✓ Will resume from step {resume_step:,} ({resume_tokens:,} tokens)")
-                    print("="*80 + "\n")
             except Exception as e:
                 if master_process:
                     print(f"⚠ Failed to load checkpoint: {e}")
-                    print("="*80 + "\n")
-        elif checkpoint_path:
-            if master_process:
-                print(f"⚠ Checkpoint not found: {checkpoint_path}")
-                print("="*80 + "\n")
 
     elif args.resume_from_hf and args.hf_repo_id:
         # Resume from HuggingFace
-        if master_process:
-            print("\n" + "="*80)
-            print("RESUMING FROM HUGGINGFACE")
-            print("="*80)
-
         hf_token = os.getenv("HF_TOKEN")
         resume_checkpoint = load_latest_from_huggingface(args.hf_repo_id, hf_token)
-
         if resume_checkpoint:
             resume_step = resume_checkpoint.get('step', 0)
             resume_tokens = resume_checkpoint.get('total_tokens', 0)
-            if master_process:
-                print(f"✓ Will resume from step {resume_step:,} ({resume_tokens:,} tokens)")
-                print("="*80 + "\n")
-        else:
-            if master_process:
-                print("⚠ Failed to load checkpoint from HuggingFace, starting from scratch")
-                print("="*80 + "\n")
 
-    # Create model
-    if master_process:
-        print(f"\nCreating {args.size} SWA-MLA model...")
+    # Setup FP8 training if requested
+    fp8_recipe = None
+    if args.use_fp8:
+        if not TE_AVAILABLE:
+            raise RuntimeError(
+                "--use_fp8 requires transformer-engine. "
+                "Install with: pip install transformer-engine"
+            )
+        # Create FP8 recipe with HYBRID format (E4M3 forward, E5M2 backward)
+        fp8_recipe = DelayedScaling(
+            fp8_format=Format.HYBRID,
+            amax_history_len=16,
+            amax_compute_algo="max",
+        )
+        if master_process:
+            print(f"FP8 training enabled via Transformer Engine (HYBRID format)")
 
     # Prepare MoE kwargs
     moe_kwargs = {}
@@ -661,23 +686,6 @@ def train(args):
             if args.latent_n_activated is not None:
                 moe_kwargs['latent_n_activated'] = args.latent_n_activated
 
-        if master_process:
-            print(f"\nMoE Configuration:")
-            if args.use_latent_moe:
-                # Calculate effective values for LatentMoE
-                eff_n_experts = args.latent_n_experts or (args.n_experts * args.latent_ratio)
-                eff_n_activated = args.latent_n_activated or (args.n_activated * args.latent_ratio)
-                print(f"  Mode: LatentMoE (NVIDIA Nemotron-3 style)")
-                print(f"  Latent ratio: {args.latent_ratio}x compression")
-                print(f"  Latent dim: {args.latent_dim or 'auto (n_embd / ' + str(args.latent_ratio) + ')'}")
-                print(f"  Experts: {eff_n_experts} routed + {args.n_shared_experts} shared (in latent space)")
-                print(f"  Activated per token: {eff_n_activated} routed + {args.n_shared_experts} shared")
-            else:
-                print(f"  Mode: Standard MoE")
-                print(f"  Experts: {args.n_experts} routed + {args.n_shared_experts} shared")
-                print(f"  Activated per token: {args.n_activated} routed + {args.n_shared_experts} shared = {args.n_activated + args.n_shared_experts} total")
-            print(f"  Expert dim: {args.expert_dim or 'same as n_embd'}")
-
     # Common model kwargs
     model_kwargs = dict(
         size=args.size,
@@ -700,6 +708,8 @@ def train(args):
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
         deltanet_share_qk=args.deltanet_share_qk,
+        # FP8 training via Transformer Engine
+        use_te_fp8=args.use_fp8,
         # MoE parameters
         **moe_kwargs,
     )
@@ -709,19 +719,10 @@ def train(args):
 
     # Load model weights if resuming
     if resume_checkpoint:
-        if master_process:
-            print("Loading model weights from checkpoint...")
-
-        # Handle state_dict from compiled models (removes _orig_mod. prefix)
         state_dict = resume_checkpoint['model_state_dict']
         if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
-            if master_process:
-                print("Detected compiled model checkpoint, removing _orig_mod. prefix...")
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
         model.load_state_dict(state_dict)
-        if master_process:
-            print("✓ Model weights loaded")
 
     # Setup WeDLM training if enabled
     wedlm_masker = None
@@ -731,13 +732,7 @@ def train(args):
 
     if args.use_wedlm:
         if not WEDLM_AVAILABLE:
-            raise RuntimeError("WeDLM training requested but wedlm module not found. "
-                             "Make sure the wedlm/ directory is in the Python path.")
-
-        if master_process:
-            print("\n" + "="*60)
-            print("WeDLM TRAINING MODE ENABLED")
-            print("="*60)
+            raise RuntimeError("WeDLM training requested but wedlm module not found.")
 
         # Determine mask token ID
         if args.wedlm_mask_token_id is not None:
@@ -745,12 +740,8 @@ def train(args):
         elif hasattr(tokenizer, 'mask_token_id') and tokenizer.mask_token_id is not None:
             mask_token_id = tokenizer.mask_token_id
         else:
-            # Use last token in vocabulary as mask token
             mask_token_id = vocab_size - 1
-            if master_process:
-                print(f"  Note: Using vocab_size-1 ({mask_token_id}) as [MASK] token")
 
-        # Create WeDLM config
         wedlm_config = WeDLMConfig(
             use_wedlm_training=True,
             block_size=args.wedlm_block_size,
@@ -760,7 +751,6 @@ def train(args):
             mask_token_id=mask_token_id,
         )
 
-        # Create masker and loss function
         wedlm_masker = DualStreamMasker(wedlm_config, mask_token_id)
         wedlm_loss_fn = WeDLMLoss(
             ar_loss_weight=args.wedlm_ar_loss_weight,
@@ -768,71 +758,42 @@ def train(args):
             ignore_index=-100,
         )
 
-        # Adapt DeltaNet blocks for WeDLM (add position embeddings)
         if args.use_gated_deltanet:
-            if master_process:
-                print("  Adapting GatedDeltaNet blocks for WeDLM...")
             model = adapt_deltanet_for_wedlm(model, max_seq_len=args.block_size * 2, d_model=None)
 
-        if master_process:
-            print(f"  Block size: {wedlm_config.block_size}")
-            print(f"  Mask ratio: [{wedlm_config.min_mask_ratio:.1f}, {wedlm_config.max_mask_ratio:.1f}]")
-            print(f"  AR loss weight: {wedlm_config.ar_loss_weight}")
-            print(f"  Mask token ID: {mask_token_id}")
-            print("="*60 + "\n")
-
-    # Print model info and log to wandb
-    if master_process:
+    # Log to wandb (silent)
+    if master_process and wandb_run is not None:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\nModel Statistics:")
-        print(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-        print(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
-
-        # Memory estimation
-        param_memory = total_params * 4 / (1024**3)  # FP32 in GB
-        print(f"  Estimated memory (FP32): {param_memory:.2f} GB")
-        print(f"  Estimated memory (BF16): {param_memory/2:.2f} GB")
-
-        # Log to wandb
-        if wandb_run is not None:
-            wandb.config.update({
-                'total_params': total_params,
-                'total_params_M': total_params / 1e6,
-                'trainable_params': trainable_params,
-                'trainable_params_M': trainable_params / 1e6,
-                'param_memory_fp32_gb': param_memory,
-                'param_memory_bf16_gb': param_memory / 2,
-            }, allow_val_change=True)
+        param_memory = total_params * 4 / (1024**3)
+        wandb.config.update({
+            'total_params': total_params,
+            'total_params_M': total_params / 1e6,
+            'trainable_params': trainable_params,
+            'trainable_params_M': trainable_params / 1e6,
+            'param_memory_fp32_gb': param_memory,
+            'param_memory_bf16_gb': param_memory / 2,
+        }, allow_val_change=True)
 
     # Compile model if requested
     if args.compile:
         compile_mode = args.compile_mode
-        # CUDA graphs (used in max-autotune) are incompatible with gradient accumulation > 1
-        # because tensors get overwritten between forward passes before backward is called.
-        # Fall back to reduce-overhead mode which doesn't use CUDA graphs.
         if args.gradient_accumulation_steps > 1 and compile_mode == 'max-autotune':
             compile_mode = 'reduce-overhead'
-            if master_process:
-                print(f"Note: Using 'reduce-overhead' mode instead of 'max-autotune' due to gradient accumulation > 1")
-                print(f"      (CUDA graphs in max-autotune are incompatible with gradient accumulation)")
-        if master_process:
-            print(f"Compiling model with torch.compile(mode='{compile_mode}')...")
         model = torch.compile(model, mode=compile_mode)
+        # Update args for banner display
+        args.compile_mode = compile_mode
 
     # Wrap with DDP
-    # Note: find_unused_parameters=True is required when using @torch._dynamo.disable
-    # on submodules (like MLA.forward) because DDP can't track gradients through
-    # dynamo-disabled regions during graph construction.
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         raw_model = model.module
     else:
         raw_model = model
 
-    # Setup data loader (single instance for both train and val)
+    # Print compact training banner
     if master_process:
-        print("\nSetting up data loader...")
+        print_training_banner(args, raw_model, world_size, device, resume_step, resume_tokens)
 
     data_loader = PackedFinewebDataset(
         split='train',
@@ -855,31 +816,16 @@ def train(args):
 
     # Load optimizer state if resuming
     if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
-        if master_process:
-            print("Loading optimizer state from checkpoint...")
         try:
             saved_state = resume_checkpoint['optimizer_state_dict']
             if isinstance(optimizer, list) and isinstance(saved_state, list):
-                # Multiple optimizers (e.g., Muon setup)
                 for opt, state in zip(optimizer, saved_state):
                     opt.load_state_dict(state)
-            elif isinstance(optimizer, list):
-                # Optimizer is list but saved state is single - skip
-                if master_process:
-                    print("⚠ Optimizer structure mismatch (list vs single) - using fresh optimizer state")
-            elif isinstance(saved_state, list):
-                # Saved state is list but optimizer is single - skip
-                if master_process:
-                    print("⚠ Optimizer structure mismatch (single vs list) - using fresh optimizer state")
-            else:
-                # Both are single optimizers
+            elif not isinstance(optimizer, list) and not isinstance(saved_state, list):
                 optimizer.load_state_dict(saved_state)
-            if master_process:
-                print("✓ Optimizer state loaded")
-        except Exception as e:
-            if master_process:
-                print(f"⚠ Failed to load optimizer state: {e}")
-                print("  Continuing with fresh optimizer state")
+            # Silently skip mismatched structures
+        except Exception:
+            pass  # Silently continue with fresh optimizer state
 
     # Setup profiler if enabled
     profiler = None
@@ -908,17 +854,6 @@ def train(args):
             with_flops=True,
         )
         profiler.start()
-        print(f"\n🔍 Profiler enabled: {args.profile_warmup} warmup + {args.profile_steps} active steps")
-
-    # Training loop
-    if master_process:
-        print("\nStarting training...")
-        if resume_step > 0:
-            print(f"Resuming from step: {resume_step:,}")
-            print(f"Starting tokens: {resume_tokens:,}")
-        print(f"Max iterations: {args.max_iters:,}")
-        print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
-        print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * world_size:,}")
 
     data_iter = iter(data_loader)
     scaler = torch.amp.GradScaler('cuda', enabled=False)
@@ -1003,48 +938,54 @@ def train(args):
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            # Forward pass with mixed precision (BF16)
+            # Create FP8 autocast context if enabled
+            # For DDP, pass fp8_group for synchronized scaling across GPUs
+            fp8_group = dist.group.WORLD if is_ddp and args.use_fp8 else None
+            fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group) if args.use_fp8 else nullcontext()
+
+            # Forward pass with mixed precision (BF16 + optional FP8 via TE)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                if args.use_wedlm and wedlm_masker is not None:
-                    # WeDLM training: dual-stream forward pass
-                    wedlm_batch = wedlm_masker(input_ids)
+                with fp8_ctx:
+                    if args.use_wedlm and wedlm_masker is not None:
+                        # WeDLM training: dual-stream forward pass
+                        wedlm_batch = wedlm_masker(input_ids)
 
-                    dual_input_ids = wedlm_batch['dual_input_ids']
-                    dual_position_ids = wedlm_batch['dual_position_ids']
-                    dual_attention_mask = wedlm_batch['dual_attention_mask']
-                    target_ids = wedlm_batch['target_ids']
-                    target_mask = wedlm_batch['target_mask']
-                    mask_ratios = wedlm_batch['mask_ratios']
+                        dual_input_ids = wedlm_batch['dual_input_ids']
+                        dual_position_ids = wedlm_batch['dual_position_ids']
+                        dual_attention_mask = wedlm_batch['dual_attention_mask']
+                        target_ids = wedlm_batch['target_ids']
+                        target_mask = wedlm_batch['target_mask']
+                        mask_ratios = wedlm_batch['mask_ratios']
 
-                    # Forward pass with dual-stream inputs
-                    logits, _ = model(
-                        dual_input_ids,
-                        position_ids=dual_position_ids,
-                        attention_mask_2d=dual_attention_mask,
-                        return_all_logits=True,
-                    )
+                        # Forward pass with dual-stream inputs
+                        logits, _ = model(
+                            dual_input_ids,
+                            position_ids=dual_position_ids,
+                            attention_mask_2d=dual_attention_mask,
+                            return_all_logits=True,
+                        )
 
-                    # Extract prediction stream logits (second half)
-                    L = input_ids.size(1)
-                    pred_logits = logits[:, L:, :]  # [B, L, V]
+                        # Extract prediction stream logits (second half)
+                        L = input_ids.size(1)
+                        pred_logits = logits[:, L:, :]  # [B, L, V]
 
-                    # Compute WeDLM loss
-                    loss, loss_dict = wedlm_loss_fn(
-                        pred_logits,
-                        target_ids,
-                        target_mask,
-                        mask_ratios,
-                        wedlm_config.block_size,
-                    )
-                else:
-                    # Standard AR training
-                    logits, loss = model(input_ids, targets=labels)
+                        # Compute WeDLM loss
+                        loss, loss_dict = wedlm_loss_fn(
+                            pred_logits,
+                            target_ids,
+                            target_mask,
+                            mask_ratios,
+                            wedlm_config.block_size,
+                        )
+                    else:
+                        # Standard AR training
+                        logits, loss = model(input_ids, targets=labels)
 
-                # Add MoE auxiliary loss if model has MoE layers
-                if hasattr(raw_model, 'get_moe_aux_loss'):
-                    moe_aux_loss = raw_model.get_moe_aux_loss()
-                    loss = loss + moe_aux_loss
-                loss = loss / args.gradient_accumulation_steps
+                    # Add MoE auxiliary loss if model has MoE layers
+                    if hasattr(raw_model, 'get_moe_aux_loss'):
+                        moe_aux_loss = raw_model.get_moe_aux_loss()
+                        loss = loss + moe_aux_loss
+                    loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(loss).backward()
@@ -1132,36 +1073,40 @@ def train(args):
                     input_ids = batch['input_ids'].to(device, non_blocking=True)
                     labels = batch['labels'].to(device, non_blocking=True)
 
+                    # FP8 context for validation (no DDP sync needed in eval)
+                    val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if args.use_fp8 else nullcontext()
+
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                        if args.use_wedlm and wedlm_masker is not None:
-                            # WeDLM validation
-                            wedlm_batch = wedlm_masker(input_ids)
-                            dual_input_ids = wedlm_batch['dual_input_ids']
-                            dual_position_ids = wedlm_batch['dual_position_ids']
-                            dual_attention_mask = wedlm_batch['dual_attention_mask']
-                            target_ids = wedlm_batch['target_ids']
-                            target_mask = wedlm_batch['target_mask']
-                            mask_ratios = wedlm_batch['mask_ratios']
+                        with val_fp8_ctx:
+                            if args.use_wedlm and wedlm_masker is not None:
+                                # WeDLM validation
+                                wedlm_batch = wedlm_masker(input_ids)
+                                dual_input_ids = wedlm_batch['dual_input_ids']
+                                dual_position_ids = wedlm_batch['dual_position_ids']
+                                dual_attention_mask = wedlm_batch['dual_attention_mask']
+                                target_ids = wedlm_batch['target_ids']
+                                target_mask = wedlm_batch['target_mask']
+                                mask_ratios = wedlm_batch['mask_ratios']
 
-                            logits, _ = model(
-                                dual_input_ids,
-                                position_ids=dual_position_ids,
-                                attention_mask_2d=dual_attention_mask,
-                                return_all_logits=True,
-                            )
+                                logits, _ = model(
+                                    dual_input_ids,
+                                    position_ids=dual_position_ids,
+                                    attention_mask_2d=dual_attention_mask,
+                                    return_all_logits=True,
+                                )
 
-                            L = input_ids.size(1)
-                            pred_logits = logits[:, L:, :]
+                                L = input_ids.size(1)
+                                pred_logits = logits[:, L:, :]
 
-                            loss, _ = wedlm_loss_fn(
-                                pred_logits,
-                                target_ids,
-                                target_mask,
-                                mask_ratios,
-                                wedlm_config.block_size,
-                            )
-                        else:
-                            logits, loss = model(input_ids, targets=labels)
+                                loss, _ = wedlm_loss_fn(
+                                    pred_logits,
+                                    target_ids,
+                                    target_mask,
+                                    mask_ratios,
+                                    wedlm_config.block_size,
+                                )
+                            else:
+                                logits, loss = model(input_ids, targets=labels)
 
                     val_loss += loss.item()
 
@@ -1384,6 +1329,10 @@ def main():
     parser.add_argument('--compile_mode', type=str, default='max-autotune',
                         choices=['reduce-overhead', 'max-autotune', 'default'],
                         help='torch.compile mode')
+
+    # FP8 Training (Transformer Engine)
+    parser.add_argument('--use_fp8', action='store_true', default=False,
+                        help='Enable FP8 training via Transformer Engine (requires H100/H200)')
 
     # TensorBoard
     parser.add_argument('--use_tensorboard', action='store_true', default=True)
