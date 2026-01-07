@@ -1239,7 +1239,7 @@ def main():
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action='store_true', default=True,
                         help='Use Flash Attention for MLA blocks')
-    parser.add_argument('--use_triton_mla', action='store_true', default=False,
+    parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
     parser.add_argument('--use_triton_kernels', action='store_true', default=True,
                         help='Use fused Triton kernels for SwiGLU and RMSNorm (15-25%% speedup)')
