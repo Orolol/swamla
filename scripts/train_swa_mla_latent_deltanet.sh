@@ -27,6 +27,11 @@ HF_REPO_ID=${6:-Orosius/deltanet-mla-latent}  # e.g., "Orosius/deltanet-mla-late
 USE_TENSORBOARD=${7:-true}  # Enable TensorBoard by default
 TENSORBOARD_PORT=${8:-6006}  # Default TensorBoard port
 
+# Profiling configuration (via environment variables)
+PROFILE=${PROFILE:-false}  # Enable profiler
+PROFILE_STEPS=${PROFILE_STEPS:-5}  # Number of steps to profile
+PROFILE_WARMUP=${PROFILE_WARMUP:-2}  # Warmup steps before profiling
+
 # LatentMoE configuration
 LATENT_RATIO=${LATENT_RATIO:-4}  # d_model / latent_dim (default: 4x compression)
 N_EXPERTS=${N_EXPERTS:-32}  # Base experts (will be scaled by latent_ratio -> 128)
@@ -68,6 +73,13 @@ echo ""
 echo "MLA Q LoRA:"
 echo "  Q LoRA rank: $MLA_Q_LORA_RANK (0 = disabled)"
 echo ""
+if [ "$PROFILE" = "true" ]; then
+    echo "Profiling:"
+    echo "  Enabled: yes"
+    echo "  Warmup steps: $PROFILE_WARMUP"
+    echo "  Profile steps: $PROFILE_STEPS"
+    echo ""
+fi
 if [ -n "$HF_REPO_ID" ]; then
     echo "HF Repo: $HF_REPO_ID (automatic push every validation)"
 fi
@@ -104,6 +116,12 @@ fi
 TB_ARG=""
 if [ "$USE_TENSORBOARD" = "true" ]; then
     TB_ARG="--use_tensorboard"
+fi
+
+# Build profiler arguments if enabled
+PROFILE_ARG=""
+if [ "$PROFILE" = "true" ]; then
+    PROFILE_ARG="--profile --profile_steps $PROFILE_STEPS --profile_warmup $PROFILE_WARMUP"
 fi
 
 # Build DeltaNet latent compression arguments
@@ -146,7 +164,8 @@ COMMON_ARGS="--size moe-1b \
     --n_activated $N_ACTIVATED \
     $HF_REPO_ARG \
     $RESUME_ARG \
-    $TB_ARG"
+    $TB_ARG \
+    $PROFILE_ARG"
 
 # Launch training with DDP if multiple GPUs detected
 if [ $NUM_GPUS -gt 1 ]; then
@@ -178,6 +197,15 @@ fi
 #
 # MLA Q LoRA:
 #   MLA_Q_LORA_RANK=256    # Q LoRA rank for MLA blocks (0 = disabled)
+#
+# Profiling:
+#   PROFILE=true           # Enable PyTorch profiler
+#   PROFILE_STEPS=5        # Number of steps to profile (default: 5)
+#   PROFILE_WARMUP=2       # Warmup steps before profiling (default: 2)
+#
+# Example with profiler:
+#   PROFILE=true ./scripts/train_swa_mla_latent_deltanet.sh 4 2048
+#   # Then view results: tensorboard --logdir=outputs/deltanet_mla_latent/profiler
 #
 # Example with custom DeltaNet config:
 #   DELTANET_LATENT_DIM=384 DELTANET_SHARE_QK=false ./scripts/train_swa_mla_latent_deltanet.sh 4 2048

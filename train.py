@@ -881,6 +881,33 @@ def train(args):
                 print(f"⚠ Failed to load optimizer state: {e}")
                 print("  Continuing with fresh optimizer state")
 
+    # Setup profiler if enabled
+    profiler = None
+    if args.profile and master_process:
+        profile_dir = os.path.join(args.output_dir, 'profiler')
+        os.makedirs(profile_dir, exist_ok=True)
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=args.profile_warmup,
+                active=args.profile_steps,
+                repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        )
+        profiler.start()
+        print(f"\n🔍 Profiler enabled: {args.profile_warmup} warmup + {args.profile_steps} active steps")
+        print(f"   Output: {profile_dir}")
+        print(f"   View with: tensorboard --logdir={profile_dir}")
+
     # Training loop
     if master_process:
         print("\nStarting training...")
@@ -1207,6 +1234,24 @@ def train(args):
             torch.save(checkpoint, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
 
+        # Profiler step
+        if profiler is not None:
+            profiler.step()
+            # Check if profiling is complete
+            total_profile_steps = args.profile_warmup + args.profile_steps
+            if step >= start_step + total_profile_steps - 1:
+                profiler.stop()
+                print(f"\n✅ Profiling complete! {args.profile_steps} steps recorded.")
+                print(f"   View results: tensorboard --logdir={os.path.join(args.output_dir, 'profiler')}")
+                break  # Exit training loop after profiling
+
+    # Cleanup profiler if still running
+    if profiler is not None:
+        try:
+            profiler.stop()
+        except Exception:
+            pass  # Already stopped
+
     # Cleanup
     if tb_writer is not None:
         tb_writer.close()
@@ -1326,6 +1371,14 @@ def main():
                         help='Weight for auxiliary AR loss (0 to disable)')
     parser.add_argument('--wedlm_mask_token_id', type=int, default=None,
                         help='Token ID for [MASK] (default: use tokenizer.mask_token_id or vocab_size-1)')
+
+    # Profiling
+    parser.add_argument('--profile', action='store_true', default=False,
+                        help='Enable PyTorch profiler for performance analysis')
+    parser.add_argument('--profile_steps', type=int, default=5,
+                        help='Number of steps to profile (default: 5)')
+    parser.add_argument('--profile_warmup', type=int, default=2,
+                        help='Number of warmup steps before profiling (default: 2)')
 
     args = parser.parse_args()
 

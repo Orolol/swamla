@@ -147,7 +147,7 @@ class PackedFinewebDataset(IterableDataset):
             # 2. Each DDP rank gets different shuffle order
             shuffle_seed = start_offset + self.rank
             print(f"[PackedDataset Rank {self.rank}] Shuffling dataset with seed={shuffle_seed}, buffer_size={shuffle_buffer_size}")
-            self.dataset = self.dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_size)
+            self.dataset = self.dataset.shuffle(buffer_size=shuffle_buffer_size)
 
         # Skip to starting position AFTER shuffle
         if effective_offset > 0:
