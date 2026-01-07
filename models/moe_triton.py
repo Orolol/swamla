@@ -10,49 +10,27 @@ import triton.language as tl
 # Avoids CPU synchronization by keeping everything on GPU
 
 @triton.jit
-def _histogram_kernel(
-    expert_indices_ptr,  # [N] input expert assignments
-    histogram_ptr,       # [E] output histogram (tokens per expert)
-    N,                   # number of tokens
-    E,                   # number of experts
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Count tokens per expert using atomic adds."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < N
-
-    expert_ids = tl.load(expert_indices_ptr + offs, mask=mask, other=0)
-
-    # Atomic increment histogram
-    for i in range(BLOCK_SIZE):
-        if offs[i] < N:
-            idx = tl.load(expert_indices_ptr + offs[i])
-            tl.atomic_add(histogram_ptr + idx, 1)
-
-
-@triton.jit
 def _compute_permutation_kernel(
     expert_indices_ptr,  # [N] input expert assignments
-    offsets_ptr,         # [E] prefix sum of histogram (write positions)
+    offsets_ptr,         # [E] write cursors (starting positions, will be modified)
     permutation_ptr,     # [N] output permutation indices
-    N,
-    BLOCK_SIZE: tl.constexpr,
+    N,                   # number of tokens
 ):
-    """Compute permutation indices using atomic fetch-add for write positions."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < N
+    """
+    Single-token kernel: each program handles one token.
+    Uses pre-computed offsets as starting write positions.
+    """
+    token_idx = tl.program_id(0)
 
-    # Process each token
-    for i in range(BLOCK_SIZE):
-        token_idx = pid * BLOCK_SIZE + i
-        if token_idx < N:
-            expert_id = tl.load(expert_indices_ptr + token_idx)
-            # Atomically get write position and increment
-            write_pos = tl.atomic_add(offsets_ptr + expert_id, 1)
-            # Store: permutation[write_pos] = token_idx
-            tl.store(permutation_ptr + write_pos, token_idx)
+    if token_idx < N:
+        # Load expert assignment for this token
+        expert_id = tl.load(expert_indices_ptr + token_idx)
+
+        # Atomically get write position and increment cursor
+        write_pos = tl.atomic_add(offsets_ptr + expert_id, 1)
+
+        # Store permutation: sorted position -> original token index
+        tl.store(permutation_ptr + write_pos, token_idx)
 
 
 def fused_moe_routing(
@@ -60,9 +38,9 @@ def fused_moe_routing(
     n_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fused routing computation: histogram + permutation in GPU kernels.
+    Fused routing computation: histogram + permutation with minimal sync.
 
-    Replaces: bincount + argsort with fused GPU operations.
+    Replaces: bincount + argsort with optimized GPU operations.
 
     Args:
         expert_indices: [N] or [N, K] tensor of expert assignments
@@ -78,34 +56,26 @@ def fused_moe_routing(
     N = flat_indices.shape[0]
     device = flat_indices.device
 
-    # Allocate outputs
-    histogram = torch.zeros(n_experts, dtype=torch.int32, device=device)
+    # Step 1: Compute histogram using bincount (fast on GPU, no CPU sync needed)
+    tokens_per_expert = torch.bincount(
+        flat_indices.int(), minlength=n_experts
+    ).to(torch.int64)
 
-    # Step 1: Compute histogram (tokens per expert)
-    BLOCK_SIZE = 256
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
-    _histogram_kernel[grid](
-        flat_indices, histogram,
-        N, n_experts,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-    # Step 2: Compute prefix sum (expert offsets) - this is fast on GPU
+    # Step 2: Compute expert offsets (cumsum is fast)
     expert_offsets = torch.zeros(n_experts + 1, dtype=torch.int64, device=device)
-    expert_offsets[1:] = torch.cumsum(histogram.to(torch.int64), dim=0)
+    expert_offsets[1:] = torch.cumsum(tokens_per_expert, dim=0)
 
-    # Step 3: Compute permutation using atomic write positions
-    # We need a copy of offsets as write cursors (will be modified)
+    # Step 3: Compute permutation using Triton kernel with pre-computed offsets
+    # Clone offsets as write cursors (will be modified by atomic adds)
     write_cursors = expert_offsets[:-1].clone()
     permutation = torch.empty(N, dtype=torch.int64, device=device)
 
+    grid = (N,)
     _compute_permutation_kernel[grid](
-        flat_indices, write_cursors, permutation,
-        N,
-        BLOCK_SIZE=BLOCK_SIZE,
+        flat_indices, write_cursors, permutation, N
     )
 
-    return histogram.to(torch.int64), expert_offsets, permutation
+    return tokens_per_expert, expert_offsets, permutation
 
 
 # ============================================================================
