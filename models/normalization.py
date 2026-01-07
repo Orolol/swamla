@@ -4,6 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Try to import Triton RMSNorm
+try:
+    from triton_kernels import TritonRMSNorm, fused_rms_norm
+    TRITON_RMSNORM_AVAILABLE = True
+except ImportError:
+    TRITON_RMSNORM_AVAILABLE = False
+    TritonRMSNorm = None
+    fused_rms_norm = None
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     
@@ -16,22 +26,14 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handle Float8 or other exotic types that might cause issues
-        try:
-            # Always calculate norm in fp32 for stability, then convert back
-            norm_x = self._norm(x.float())
-            # Safely convert back to original type
-            if x.dtype in [torch.float32, torch.float16, torch.bfloat16]:
-                norm_x = norm_x.to(x.dtype)
-            return self.weight * norm_x
-        except Exception as e:
-            # Fallback to a safer implementation if there are dtype issues
-            print(f"Warning: Using fallback normalization due to: {e}")
-            working_type = torch.float32
-            x_float = x.to(working_type)
-            norm_x = self._norm(x_float)
-            result = self.weight.to(working_type) * norm_x
-            return result
+        # Always calculate norm in fp32 for stability, then convert back
+        # This handles Float8 and other exotic dtypes safely
+        input_dtype = x.dtype
+        norm_x = self._norm(x.float())
+        # Convert back to original dtype if it's a standard training dtype
+        if input_dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            norm_x = norm_x.to(input_dtype)
+        return self.weight * norm_x
 
 
 class DynamicTanh(nn.Module):
@@ -82,3 +84,26 @@ class DynamicTanh(nn.Module):
     
     def extra_repr(self) -> str:
         return f'alpha={self.alpha.item():.3f}, elementwise_affine={self.elementwise_affine}'
+
+
+def create_norm_layer(dim: int, norm_type: str = 'rmsnorm', use_triton: bool = True, **kwargs) -> nn.Module:
+    """
+    Factory function to create normalization layers.
+
+    Args:
+        dim: Hidden dimension
+        norm_type: Type of normalization ('rmsnorm', 'dyt', 'layernorm')
+        use_triton: Whether to use Triton kernel when available
+        **kwargs: Additional arguments passed to the norm layer
+
+    Returns:
+        Normalization module
+    """
+    if norm_type == 'dyt':
+        return DynamicTanh(dim, **kwargs)
+    elif norm_type == 'layernorm':
+        return nn.LayerNorm(dim, **kwargs)
+    else:  # Default: rmsnorm
+        if use_triton and TRITON_RMSNORM_AVAILABLE and TritonRMSNorm is not None:
+            return TritonRMSNorm(dim, **kwargs)
+        return RMSNorm(dim, **kwargs)

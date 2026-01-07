@@ -31,6 +31,14 @@ except ImportError:
     flex_attention = None
     create_block_mask = None
 
+# Import custom Triton MLA attention kernel (H100 compatible alternative to FA2)
+try:
+    from triton_kernels import mla_attention_triton
+    TRITON_MLA_AVAILABLE = True
+except ImportError:
+    TRITON_MLA_AVAILABLE = False
+    mla_attention_triton = None
+
 
 class MLA(nn.Module):
     """
@@ -122,6 +130,12 @@ class MLA(nn.Module):
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention")
+
+        # Custom Triton MLA kernel (H100 compatible alternative to FA2)
+        # Use this when FA2 causes CUDA graph issues with torch.compile
+        self.use_triton_mla = getattr(config, 'use_triton_mla', False) and TRITON_MLA_AVAILABLE
+        if self.use_triton_mla:
+            print(f"MLA: Using custom Triton attention kernel")
 
         # FlexAttention support (for WeDLM with custom masks)
         # NOTE: FlexAttention with score_mod doesn't work well with torch.compile
@@ -305,7 +319,14 @@ class MLA(nn.Module):
                 k_to_use = k
                 v_to_use = v
             
-            if self.use_flash_attention and mask is None:
+            if self.use_triton_mla and mask is None and mla_attention_triton is not None:
+                # Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)
+                # Expects B, T, H, D and handles V with different head dim
+                x = mla_attention_triton(
+                    q.contiguous(), k_to_use.contiguous(), v_to_use.contiguous(),
+                    scale=self.softmax_scale, causal=seqlen > 1
+                )
+            elif self.use_flash_attention and mask is None:
                 # Use Flash Attention (expects B, T, H, D)
                 # q, k_to_use, v_to_use are already (B, T, H, D)
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility
@@ -381,7 +402,13 @@ class MLA(nn.Module):
             pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
             k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
 
-            if self.use_flash_attention and mask is None:
+            if self.use_triton_mla and mask is None and mla_attention_triton is not None:
+                # Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)
+                x = mla_attention_triton(
+                    q_full.contiguous(), k_full.contiguous(), v.contiguous(),
+                    scale=self.softmax_scale, causal=seqlen > 1
+                )
+            elif self.use_flash_attention and mask is None:
                 # Use Flash Attention (expects B, T, H, D)
                 # q_full, k_full are (B, T, H, qk_head_dim), v is (B, T, H, v_head_dim)
                 # IMPORTANT: Make tensors contiguous for torch.compile compatibility

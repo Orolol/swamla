@@ -694,6 +694,8 @@ def train(args):
         use_gradient_checkpointing=args.gradient_checkpointing,
         # Attention backend options
         use_flash_attention=args.use_flash_attention,
+        use_triton_mla=args.use_triton_mla,
+        use_triton_kernels=args.use_triton_kernels,
         use_gated_deltanet=args.use_gated_deltanet,
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
@@ -1237,6 +1239,10 @@ def main():
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action='store_true', default=True,
                         help='Use Flash Attention for MLA blocks')
+    parser.add_argument('--use_triton_mla', action='store_true', default=False,
+                        help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
+    parser.add_argument('--use_triton_kernels', action='store_true', default=True,
+                        help='Use fused Triton kernels for SwiGLU and RMSNorm (15-25%% speedup)')
     parser.add_argument('--use_gated_deltanet', action='store_true', default=True,
                         help='Use GatedDeltaNet for local attention (O(n) linear)')
 

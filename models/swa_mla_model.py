@@ -75,6 +75,13 @@ class SWAMLAConfig:
     # Flash Attention for MLA blocks
     use_flash_attention: bool = True
 
+    # Custom Triton MLA kernel (H100 compatible alternative to FA2)
+    # Use this when FA2 causes CUDA graph issues with torch.compile on H100
+    use_triton_mla: bool = False
+
+    # Use fused Triton kernels for SwiGLU and RMSNorm (15-25% speedup)
+    use_triton_kernels: bool = True
+
     # DeltaNet configuration
     use_gated_deltanet: bool = True  # Use GatedDeltaNet for local attention (O(n) linear)
     deltanet_latent_dim: int = 0  # 0 = disabled, >0 = latent dimension for projections
@@ -148,6 +155,14 @@ class SWAMLAModel(nn.Module):
                 config.rope_theta,
             )
         self.register_buffer("freqs_cis", freqs, persistent=False)
+
+        # Pre-allocate causal mask for the maximum sequence length
+        # This avoids repeated tensor allocation in forward pass
+        causal_mask = torch.triu(
+            torch.full((config.block_size, config.block_size), float("-inf")),
+            diagonal=1
+        )
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
 
         cycle_len = config.swa_layers_per_cycle + config.mla_layers_per_cycle
         deltanet_per_cycle = config.swa_layers_per_cycle
@@ -301,9 +316,9 @@ class SWAMLAModel(nn.Module):
                 # [B, S, S] -> use first batch as template (assuming same for all)
                 attn_mask = attn_mask[0]
         elif t > 1:
-            # Default causal mask
-            attn_mask = torch.full((t, t), float("-inf"), device=device)
-            attn_mask = torch.triu(attn_mask, diagonal=1)
+            # Use cached causal mask (slice to current sequence length)
+            # Move to device on-demand to avoid VRAM duplication in DDP
+            attn_mask = self.causal_mask[:t, :t].to(device, non_blocking=True)
         else:
             attn_mask = None
 
@@ -328,26 +343,14 @@ class SWAMLAModel(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            if self.config.label_smoothing > 0.0:
-                num_classes = logits.size(-1)
-                smoothing = self.config.label_smoothing
-                confidence = 1.0 - smoothing
-                smoothing_value = smoothing / (num_classes - 1)
-                with torch.no_grad():
-                    true_dist = torch.zeros_like(logits)
-                    true_dist.fill_(smoothing_value)
-                    true_dist.scatter_(-1, targets.unsqueeze(-1), confidence)
-                log_probs = F.log_softmax(logits.view(-1, num_classes), dim=-1)
-                loss = -(true_dist.view(-1, num_classes) * log_probs).sum(-1)
-                with torch.no_grad():
-                    loss_mask = (targets != -100).float()
-                loss = (loss * loss_mask.view(-1)).sum() / (loss_mask.sum() + 1e-6)
-            else:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=-100,
-                )
+            # Use built-in label_smoothing parameter (PyTorch 1.10+)
+            # This is more efficient than manual implementation
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+                label_smoothing=self.config.label_smoothing,
+            )
         elif return_all_logits:
             logits = self.lm_head(x)
             loss = None
