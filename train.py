@@ -883,9 +883,13 @@ def train(args):
 
     # Setup profiler if enabled
     profiler = None
+    profiler_results = []  # Store results for final summary
+
+    def profiler_trace_handler(prof):
+        """Custom handler that prints summary tables instead of TensorBoard."""
+        profiler_results.append(prof.key_averages())
+
     if args.profile and master_process:
-        profile_dir = os.path.join(args.output_dir, 'profiler')
-        os.makedirs(profile_dir, exist_ok=True)
         profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -897,16 +901,14 @@ def train(args):
                 active=args.profile_steps,
                 repeat=1
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
+            on_trace_ready=profiler_trace_handler,
             record_shapes=True,
             profile_memory=True,
-            with_stack=True,
+            with_stack=False,  # Disable stack for cleaner output
             with_flops=True,
         )
         profiler.start()
         print(f"\n🔍 Profiler enabled: {args.profile_warmup} warmup + {args.profile_steps} active steps")
-        print(f"   Output: {profile_dir}")
-        print(f"   View with: tensorboard --logdir={profile_dir}")
 
     # Training loop
     if master_process:
@@ -1241,8 +1243,38 @@ def train(args):
             total_profile_steps = args.profile_warmup + args.profile_steps
             if step >= start_step + total_profile_steps - 1:
                 profiler.stop()
-                print(f"\n✅ Profiling complete! {args.profile_steps} steps recorded.")
-                print(f"   View results: tensorboard --logdir={os.path.join(args.output_dir, 'profiler')}")
+                print(f"\n{'='*80}")
+                print(f"✅ PROFILING COMPLETE - {args.profile_steps} steps recorded")
+                print(f"{'='*80}\n")
+
+                # Print summary tables from collected results
+                if profiler_results:
+                    key_avg = profiler_results[-1]  # Use last collected results
+
+                    # Table 1: Top operations by CUDA time
+                    print("📊 TOP 20 OPERATIONS BY CUDA TIME:")
+                    print("-" * 80)
+                    print(key_avg.table(sort_by="cuda_time_total", row_limit=20))
+
+                    # Table 2: Top operations by CPU time
+                    print("\n📊 TOP 15 OPERATIONS BY CPU TIME:")
+                    print("-" * 80)
+                    print(key_avg.table(sort_by="cpu_time_total", row_limit=15))
+
+                    # Table 3: Memory usage
+                    print("\n📊 TOP 15 OPERATIONS BY CUDA MEMORY:")
+                    print("-" * 80)
+                    print(key_avg.table(sort_by="cuda_memory_usage", row_limit=15))
+
+                    # Summary statistics
+                    total_cuda_time = sum(e.cuda_time_total for e in key_avg)
+                    total_cpu_time = sum(e.cpu_time_total for e in key_avg)
+                    print(f"\n{'='*80}")
+                    print(f"📈 SUMMARY:")
+                    print(f"   Total CUDA time: {total_cuda_time / 1000:.2f} ms")
+                    print(f"   Total CPU time:  {total_cpu_time / 1000:.2f} ms")
+                    print(f"{'='*80}\n")
+
                 break  # Exit training loop after profiling
 
     # Cleanup profiler if still running
