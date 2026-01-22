@@ -123,6 +123,19 @@ class SWAMLAConfig:
     engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
     engram_lr_multiplier: float = 5.0  # LR multiplier for Engram embeddings
 
+    # μP (Maximal Update Parametrization)
+    use_mup: bool = False
+    mup_base_width: int = 256  # Reference width for LR scaling
+    mup_output_mult: float = 1.0  # Output logits multiplier
+
+    # Progressive Training
+    use_progressive: bool = False
+    progressive_schedule: str = "512:500M,1024:2B,2048:inf"  # seq_len:tokens schedule
+
+    # EMA (Exponential Moving Average)
+    use_ema: bool = False
+    ema_decay: float = 0.9999  # EMA decay factor
+
     def __post_init__(self) -> None:
         if self.expert_dim is None:
             self.expert_dim = self.n_embd
@@ -603,6 +616,24 @@ def create_swa_mla_model(
             engram_d_mem=512,
             engram_n_hash_heads=8,  # Paper: K=8 hash heads for collision attenuation
             engram_ngram_orders=[2, 3],
+        ),
+        # μP (Maximal Update Parametrization) preset with LatentMoE and Engram
+        "mup-1b": dict(
+            n_layer=12,
+            n_embd=1024,
+            n_head=16,
+            use_moe=True,
+            n_experts=64,
+            n_shared_experts=1,
+            n_activated=2,
+            use_latent_moe=True,
+            latent_ratio=4,
+            use_engram=True,
+            engram_layers=[2, 6],
+            engram_d_mem=512,
+            # μP settings
+            use_mup=True,
+            mup_base_width=256,
         ),
     }
     if size not in presets:
