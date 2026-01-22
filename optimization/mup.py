@@ -125,3 +125,88 @@ def get_mup_weight_decay(layer_type: LayerType, base_wd: float) -> float:
     if layer_type in (LayerType.EMBEDDING, LayerType.LM_HEAD, LayerType.ENGRAM_EMBED, LayerType.NORM):
         return 0.0
     return base_wd
+
+
+def mup_init_weight(param: torch.Tensor, layer_type: LayerType, config: MuPConfig) -> None:
+    """
+    Apply μP-compliant initialization to a weight tensor in-place.
+
+    Args:
+        param: Weight tensor to initialize
+        layer_type: Classification of the layer
+        config: μP configuration
+    """
+    width = config.width
+    width_mult = config.width_mult
+
+    if layer_type == LayerType.EMBEDDING:
+        # Embeddings: standard 1/√d
+        std = 1.0 / math.sqrt(width)
+        nn.init.normal_(param, mean=0.0, std=std)
+
+    elif layer_type == LayerType.LM_HEAD:
+        # LM Head: zero init (critical for μP!)
+        nn.init.zeros_(param)
+
+    elif layer_type == LayerType.ATTENTION:
+        # Attention: 1/√d_in
+        fan_in = param.shape[1] if param.dim() >= 2 else param.shape[0]
+        std = 1.0 / math.sqrt(fan_in)
+        nn.init.normal_(param, mean=0.0, std=std)
+
+    elif layer_type == LayerType.MLP_IN:
+        # MLP input: 1/√d_in
+        fan_in = param.shape[1] if param.dim() >= 2 else param.shape[0]
+        std = 1.0 / math.sqrt(fan_in)
+        nn.init.normal_(param, mean=0.0, std=std)
+
+    elif layer_type == LayerType.MLP_OUT:
+        # MLP output: 1/√(width * d_in) - scaled down by width
+        fan_in = param.shape[1] if param.dim() >= 2 else param.shape[0]
+        std = 1.0 / math.sqrt(width_mult * fan_in)
+        nn.init.normal_(param, mean=0.0, std=std)
+
+    elif layer_type == LayerType.ENGRAM_EMBED:
+        # Engram: preserve existing init (1/√d_mem handled in engram.py)
+        pass
+
+    # NORM, OTHER: keep existing init
+
+
+def mup_init(model: nn.Module, config: MuPConfig) -> None:
+    """
+    Apply μP-compliant initialization to all model parameters.
+
+    This should be called AFTER model creation but BEFORE optimizer creation.
+
+    Args:
+        model: The model to initialize
+        config: μP configuration
+    """
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        layer_type = classify_layer(name, param)
+
+        # Only reinitialize weight tensors, not biases
+        if 'bias' not in name.lower() and param.dim() >= 2:
+            mup_init_weight(param, layer_type, config)
+
+
+def mup_scale_output(logits: torch.Tensor, config: MuPConfig) -> torch.Tensor:
+    """
+    Scale output logits for μP.
+
+    In μP, the output logits are scaled by output_mult / width_mult
+    to maintain consistent gradient magnitudes.
+
+    Args:
+        logits: Output logits from lm_head
+        config: μP configuration
+
+    Returns:
+        Scaled logits
+    """
+    scale = config.output_mult / config.width_mult
+    return logits * scale
