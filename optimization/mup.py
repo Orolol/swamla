@@ -210,3 +210,114 @@ def mup_scale_output(logits: torch.Tensor, config: MuPConfig) -> torch.Tensor:
     """
     scale = config.output_mult / config.width_mult
     return logits * scale
+
+
+def configure_mup_optimizer(
+    model: nn.Module,
+    config: MuPConfig,
+    base_lr: float,
+    weight_decay: float = 0.1,
+    betas: Tuple[float, float] = (0.9, 0.95),
+    engram_lr_mult: float = 5.0,
+    device_type: str = 'cuda',
+    optimizer_type: str = 'adamw',
+) -> torch.optim.Optimizer:
+    """
+    Configure optimizer with μP-scaled learning rates per layer.
+
+    Args:
+        model: The model to optimize
+        config: μP configuration
+        base_lr: Base learning rate (will be scaled per layer)
+        weight_decay: Weight decay coefficient
+        betas: Adam betas
+        engram_lr_mult: LR multiplier for Engram embeddings
+        device_type: 'cuda' or 'cpu'
+        optimizer_type: 'adamw' or 'muon'
+
+    Returns:
+        Configured optimizer
+    """
+    # Group parameters by their LR scale and weight decay
+    param_groups: Dict[Tuple[float, float], List[torch.Tensor]] = {}
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        layer_type = classify_layer(name, param)
+        lr_scale = get_mup_lr_scale(layer_type, config, engram_lr_mult)
+        wd = get_mup_weight_decay(layer_type, weight_decay)
+
+        key = (lr_scale, wd)
+        if key not in param_groups:
+            param_groups[key] = []
+        param_groups[key].append(param)
+
+    # Build optimizer param groups
+    optimizer_groups = []
+    for (lr_scale, wd), params in param_groups.items():
+        if params:
+            optimizer_groups.append({
+                'params': params,
+                'lr': base_lr * lr_scale,
+                'weight_decay': wd,
+            })
+
+    # Handle Muon optimizer (requires special treatment)
+    if optimizer_type == 'muon' and hasattr(torch.optim, 'Muon'):
+        # Muon uses different LR scale and only for 2D params
+        # We need to split: Muon for 2D weights, AdamW for rest
+        Muon = torch.optim.Muon
+
+        muon_groups = []
+        adamw_groups = []
+
+        for group in optimizer_groups:
+            muon_params = []
+            adamw_params = []
+
+            for param in group['params']:
+                if param.ndim == 2 and 'embed' not in str(id(param)):
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+
+            if muon_params:
+                # Muon uses 200x base LR internally
+                muon_groups.append({
+                    'params': muon_params,
+                    'lr': group['lr'] * 200,
+                    'weight_decay': group['weight_decay'],
+                })
+            if adamw_params:
+                adamw_groups.append({
+                    'params': adamw_params,
+                    'lr': group['lr'],
+                    'weight_decay': group['weight_decay'],
+                })
+
+        optimizers = []
+        if muon_groups:
+            optimizers.append(Muon(muon_groups, momentum=0.95, nesterov=True, ns_steps=5))
+        if adamw_groups:
+            use_fused = device_type == 'cuda'
+            optimizers.append(torch.optim.AdamW(adamw_groups, betas=betas, fused=use_fused))
+
+        return optimizers  # Returns list for Muon
+
+    # Standard AdamW
+    use_fused = device_type == 'cuda'
+    return torch.optim.AdamW(optimizer_groups, lr=base_lr, betas=betas, fused=use_fused)
+
+
+def get_mup_param_count_by_type(model: nn.Module) -> Dict[str, int]:
+    """Get parameter counts grouped by layer type (for debugging)."""
+    counts: Dict[str, int] = {}
+
+    for name, param in model.named_parameters():
+        layer_type = classify_layer(name, param)
+        type_name = layer_type.value
+        counts[type_name] = counts.get(type_name, 0) + param.numel()
+
+    return counts
