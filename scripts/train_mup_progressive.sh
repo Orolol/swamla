@@ -93,7 +93,7 @@ COMMON_ARGS="--size mup-1b \
     --use_mup \
     --mup_base_width $MUP_BASE_WIDTH \
     --use_progressive \
-    --progressive_schedule $PROGRESSIVE_SCHEDULE \
+    --progressive_schedule "$PROGRESSIVE_SCHEDULE" \
     --use_ema \
     --ema_decay $EMA_DECAY \
     --compile \
@@ -116,4 +116,29 @@ else
     python train.py $COMMON_ARGS
 fi
 
-exit 0
+# Usage examples:
+# ./scripts/train_mup_progressive.sh                                             # Train with defaults (batch=4, block=2048)
+# ./scripts/train_mup_progressive.sh 8 2048                                      # Custom batch/block size
+# ./scripts/train_mup_progressive.sh 4 2048 outputs/exp1                         # Custom output directory
+# ./scripts/train_mup_progressive.sh 4 2048 outputs/exp1 checkpoint.pt           # Resume from local checkpoint
+# ./scripts/train_mup_progressive.sh 4 2048 outputs/exp1 true adamw "user/repo"  # Resume from HF + custom optimizer
+#
+# Parameters:
+#   $1: Batch size [default: 4]
+#   $2: Block size (context length) [default: 2048]
+#   $3: Output directory [default: outputs/mup_progressive]
+#   $4: Resume from (false/true/path) [default: false]
+#       - false: start fresh
+#       - true: resume from HuggingFace (requires $6)
+#       - path: resume from local checkpoint
+#   $5: Optimizer (muon/adamw/lion) [default: muon]
+#   $6: HuggingFace repo ID (e.g., "username/repo") [default: none]
+#   $7: Use TensorBoard (true/false) [default: true]
+#
+# Environment variables:
+#   MUP_BASE_WIDTH: μP base width for LR scaling [default: 256]
+#   PROGRESSIVE_SCHEDULE: Sequence length curriculum [default: "512:500M,1024:2B,2048:inf"]
+#   EMA_DECAY: EMA decay factor [default: 0.9999]
+#
+# Example with custom schedule:
+#   PROGRESSIVE_SCHEDULE="256:100M,512:500M,1024:2B,2048:inf" ./scripts/train_mup_progressive.sh 8 2048
