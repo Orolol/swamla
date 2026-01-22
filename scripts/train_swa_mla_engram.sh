@@ -44,7 +44,7 @@ N_ACTIVATED=${N_ACTIVATED:-2}  # Base activated (will be scaled by latent_ratio)
 # For smaller models (12 layers): layers 2 and 6
 ENGRAM_LAYERS=${ENGRAM_LAYERS:-"2,6"}  # Comma-separated layer indices
 ENGRAM_D_MEM=${ENGRAM_D_MEM:-512}  # Memory embedding dimension
-ENGRAM_N_HASH_HEADS=${ENGRAM_N_HASH_HEADS:-4}  # Hash heads per N-gram order
+ENGRAM_N_HASH_HEADS=${ENGRAM_N_HASH_HEADS:-8}  # Hash heads per N-gram order (paper: K=8)
 ENGRAM_NGRAM_ORDERS=${ENGRAM_NGRAM_ORDERS:-"2,3"}  # N-gram orders (bigrams, trigrams)
 ENGRAM_CONV_KERNEL=${ENGRAM_CONV_KERNEL:-4}  # Causal conv kernel size
 ENGRAM_LR_MULT=${ENGRAM_LR_MULT:-5.0}  # LR multiplier for Engram embeddings (paper: 5x)
@@ -218,7 +218,7 @@ fi
 #
 #   ENGRAM_LAYERS="2,6"        # Layers where Engram is applied (comma-separated)
 #   ENGRAM_D_MEM=512           # Memory embedding dimension
-#   ENGRAM_N_HASH_HEADS=4      # Number of hash heads per N-gram order
+#   ENGRAM_N_HASH_HEADS=8      # Number of hash heads per N-gram order (paper: K=8)
 #   ENGRAM_NGRAM_ORDERS="2,3"  # N-gram orders (bigrams, trigrams)
 #   ENGRAM_CONV_KERNEL=4       # Causal convolution kernel size
 #   ENGRAM_LR_MULT=5.0         # LR multiplier for Engram embeddings (paper: 5x)

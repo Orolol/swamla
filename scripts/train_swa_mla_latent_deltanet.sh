@@ -131,7 +131,7 @@ if [ "$DELTANET_SHARE_QK" = "true" ]; then
 fi
 
 # Common training arguments
-COMMON_ARGS="--size moe-1b \
+COMMON_ARGS="--size moe-2b \
     --batch_size $BATCH_SIZE \
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \

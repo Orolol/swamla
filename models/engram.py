@@ -28,9 +28,10 @@ except ImportError:
 
 def build_tokenizer_compression_mapping(tokenizer) -> torch.Tensor:
     """
-    Build compression mapping V -> V' via NFKC + lowercase + strip markers.
+    Build compression mapping V -> V' via NFKC + NFD + accent removal + lowercase.
 
-    Expected compression ratio: ~23% for vocab ~128k -> ~98k canonical IDs.
+    Expected compression ratio: ~25-30% for vocab ~128k -> ~90-95k canonical IDs.
+    Aligns with DeepSeek paper specification for accent-insensitive hashing.
 
     Args:
         tokenizer: Tokenizer with get_vocab() method
@@ -48,13 +49,23 @@ def build_tokenizer_compression_mapping(tokenizer) -> torch.Tensor:
         # 1. NFKC normalization (decomposition + recomposition)
         normalized = unicodedata.normalize('NFKC', token_str)
 
-        # 2. Lowercase
+        # 2. NFD decomposition for accent handling (separates base chars from accents)
+        normalized = unicodedata.normalize('NFD', normalized)
+
+        # 3. Remove diacritics (accents) - keep only non-combining chars
+        # Mn = Mark, Nonspacing (combining diacritical marks)
+        normalized = ''.join(
+            c for c in normalized
+            if unicodedata.category(c) != 'Mn'
+        )
+
+        # 4. Lowercase
         normalized = normalized.lower()
 
-        # 3. Strip leading space markers (SentencePiece: '▁', GPT-style: 'Ġ')
+        # 5. Strip leading space markers (SentencePiece: '▁', GPT-style: 'Ġ')
         normalized = normalized.lstrip('▁Ġ ')
 
-        # 4. Collapse whitespace
+        # 6. Collapse whitespace
         normalized = ' '.join(normalized.split())
 
         if normalized not in normalized_groups:
@@ -141,14 +152,39 @@ class EngramTableConfig:
     Each (n-gram order, head) pair has its own embedding table.
     Total params = sum over all tables of (table_size * slot_dim)
     where slot_dim = embed_dim / (len(n_gram_orders) * num_heads)
+
+    Supports dynamic table sizing based on vocab_size (paper: vocab_size * 5).
     """
     n_gram_orders: List[int] = field(default_factory=lambda: [2, 3])
     num_heads: int = 8
     embed_dim: int = 1280  # d_mem total
 
+    # Dynamic table sizing based on vocabulary (paper specification)
+    vocab_size: Optional[int] = None  # If provided, tables are scaled to ~vocab_size * vocab_multiplier
+    vocab_multiplier: float = 5.0  # Paper recommends 5x vocabulary size for total table capacity
+
     # Table sizes (prime numbers for better hash distribution)
     # Format: {(n, k): prime_size} where n=ngram order, k=head index
     table_sizes: Optional[Dict[Tuple[int, int], int]] = None
+
+    @staticmethod
+    def _nearest_prime(n: int) -> int:
+        """Find the nearest prime number >= n for better hash distribution."""
+        def is_prime(num: int) -> bool:
+            if num < 2:
+                return False
+            if num == 2:
+                return True
+            if num % 2 == 0:
+                return False
+            for i in range(3, int(num**0.5) + 1, 2):
+                if num % i == 0:
+                    return False
+            return True
+
+        while not is_prime(n):
+            n += 1
+        return n
 
     def __post_init__(self):
         if self.table_sizes is None:
@@ -156,20 +192,30 @@ class EngramTableConfig:
             self.table_sizes = {}
             num_tables = len(self.n_gram_orders) * self.num_heads
 
-            # Pick primes based on embed_dim to get reasonable param count
-            # For smaller configs, use smaller primes
-            if self.embed_dim <= 512:
-                base_primes = DEFAULT_PRIMES[:16]  # Smaller tables
-            elif self.embed_dim <= 1280:
-                base_primes = DEFAULT_PRIMES[8:24]  # Medium tables
-            else:
-                base_primes = DEFAULT_PRIMES[16:32]  # Larger tables
+            if self.vocab_size is not None:
+                # Dynamic scaling based on vocabulary size (paper specification)
+                # Target total table capacity = vocab_size * multiplier
+                target_total_capacity = int(self.vocab_size * self.vocab_multiplier)
+                size_per_table = max(1024, target_total_capacity // num_tables)
 
-            idx = 0
-            for n in self.n_gram_orders:
-                for k in range(self.num_heads):
-                    self.table_sizes[(n, k)] = base_primes[idx % len(base_primes)]
-                    idx += 1
+                for n in self.n_gram_orders:
+                    for k in range(self.num_heads):
+                        # Use prime numbers for better hash distribution
+                        self.table_sizes[(n, k)] = self._nearest_prime(size_per_table)
+            else:
+                # Fallback: pick primes based on embed_dim to get reasonable param count
+                if self.embed_dim <= 512:
+                    base_primes = DEFAULT_PRIMES[:16]  # Smaller tables
+                elif self.embed_dim <= 1280:
+                    base_primes = DEFAULT_PRIMES[8:24]  # Medium tables
+                else:
+                    base_primes = DEFAULT_PRIMES[16:32]  # Larger tables
+
+                idx = 0
+                for n in self.n_gram_orders:
+                    for k in range(self.num_heads):
+                        self.table_sizes[(n, k)] = base_primes[idx % len(base_primes)]
+                        idx += 1
 
     @property
     def slot_dim(self) -> int:
@@ -588,6 +634,40 @@ class Engram(nn.Module):
             f"params={self.get_num_params():,}"
         )
 
+    def get_metrics(self) -> Dict[str, float]:
+        """
+        Return Engram metrics for logging and monitoring.
+
+        Should be called after forward() to get stats from the last batch.
+
+        Returns:
+            Dict with:
+            - engram/gate_mean: Mean norm of gated values
+            - engram/gate_std: Std dev of gate norms
+            - engram/activation_rate: Proportion of gates with normalized norm > 0.5
+            - engram/memory_norm: Mean norm of retrieved memory embeddings
+        """
+        metrics = {}
+
+        if self.last_gate_values is not None:
+            gate_vals = self.last_gate_values
+            # Compute gate norms (relative activation strength)
+            gate_norms = gate_vals.norm(dim=-1)  # [B, T]
+            metrics['engram/gate_mean'] = gate_norms.mean().item()
+            metrics['engram/gate_std'] = gate_norms.std().item()
+
+            # Activation rate: proportion of gates that are "active"
+            # Normalize by expected max norm (sqrt(d) for unit vectors)
+            max_norm = (self.hidden_dim ** 0.5)
+            normalized_gates = gate_norms / max_norm
+            metrics['engram/activation_rate'] = (normalized_gates > 0.5).float().mean().item()
+
+        if self.last_memory is not None:
+            memory_norms = self.last_memory.norm(dim=-1)  # [B, T]
+            metrics['engram/memory_norm'] = memory_norms.mean().item()
+
+        return metrics
+
 
 # =============================================================================
 # Factory Functions
@@ -597,7 +677,7 @@ def create_engram(
     hidden_dim: int,
     d_mem: int = 512,
     n_gram_orders: List[int] = None,
-    num_heads: int = 4,
+    num_heads: int = 8,
     num_branches: int = 1,
     conv_kernel_size: int = 4,
     table_sizes: Optional[Dict[Tuple[int, int], int]] = None,
@@ -663,14 +743,18 @@ def create_engram_for_config(config, layer_id: int) -> Optional[Engram]:
     # Get Engram configuration from model config
     d_mem = getattr(config, 'engram_d_mem', 512)
     n_gram_orders = getattr(config, 'engram_ngram_orders', [2, 3])
-    num_heads = getattr(config, 'engram_n_hash_heads', 4)
+    num_heads = getattr(config, 'engram_n_hash_heads', 8)
     conv_kernel_size = getattr(config, 'engram_conv_kernel', 4)
     table_sizes = getattr(config, 'engram_table_sizes', None)
+
+    # Get vocab_size for dynamic table scaling (paper specification)
+    vocab_size = getattr(config, 'vocab_size', None)
 
     engram_config = EngramTableConfig(
         n_gram_orders=n_gram_orders,
         num_heads=num_heads,
         embed_dim=d_mem,
+        vocab_size=vocab_size,
         table_sizes=table_sizes,
     )
 

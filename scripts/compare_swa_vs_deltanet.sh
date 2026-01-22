@@ -106,9 +106,44 @@ python train.py \
     --log_interval 50 \
     --eval_interval 500 \
     --save_interval 10000 \
+python train.py \
+    --size small \
+    --batch_size 4 \
+    --block_size 2048 \
+    --output_dir outputs/compare_deltanet_flash_2000steps \
+    --optimizer_type lion \
+    --learning_rate 1e-4 \
+    --weight_decay 0.1 \
+    --warmup_iters 200 \
+    --max_iters 2000 \
+    --grad_clip 1.0 \
+    --num_workers 4 \
+    --swa_layers_per_cycle 2 \
+    --mla_layers_per_cycle 1 \
+    --tokenizer_name "openai-community/gpt2" \
+    --log_interval 50 \
+    --eval_interval 500 \
     --use_flash_attention \
     --use_gated_deltanet \
-    --no_moe \
+    --use_tensorboardpython train.py \
+    --size small \
+    --batch_size 4 \
+    --block_size 2048 \
+    --output_dir outputs/compare_deltanet_flash_2000steps \
+    --optimizer_type lion \
+    --learning_rate 1e-4 \
+    --weight_decay 0.1 \
+    --warmup_iters 200 \
+    --max_iters 2000 \
+    --grad_clip 1.0 \
+    --num_workers 4 \
+    --swa_layers_per_cycle 2 \
+    --mla_layers_per_cycle 1 \
+    --tokenizer_name "openai-community/gpt2" \
+    --log_interval 50 \
+    --eval_interval 500 \
+    --use_flash_attention \
+    --use_gated_deltanet \
     --use_tensorboard
 
 END_DELTANET=$(date +%s)

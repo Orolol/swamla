@@ -23,8 +23,8 @@ if [ -d "$FA3_PATH" ]; then
 fi
 
 # Basic parameters
-BATCH_SIZE=${1:-12}
-BLOCK_SIZE=${2:-1048}
+BATCH_SIZE=${1:-}
+BLOCK_SIZE=${2:-2048}
 OUTPUT_DIR=${3:-outputs/wedlm}
 RESUME_FROM=${4:-false}  # 'true' = resume from HF, 'false' = no resume, or path to local checkpoint
 OPTIMIZER=${5:-muon}  # adamw or muon
@@ -141,6 +141,7 @@ COMMON_ARGS="--size moe-1b \
     --max_iters 100000 \
     --grad_clip 1.0 \
     --gradient_accumulation_steps 1 \
+    --gradient_checkpointing \
     --num_workers 8 \
     --swa_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \

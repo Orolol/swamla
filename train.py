@@ -1116,6 +1116,28 @@ def train(args):
                 tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
                 tb_writer.add_scalar('train/perplexity', math.exp(lossf) if lossf < 10 else float('inf'), step)
 
+            # Log Engram metrics if enabled
+            if args.use_engram:
+                engram_metrics = {}
+                # Get the raw model (unwrap DDP if needed)
+                raw_model = model.module if hasattr(model, 'module') else model
+                for block in raw_model.transformer.h:
+                    if hasattr(block, 'engram') and block.engram is not None:
+                        layer_metrics = block.engram.get_metrics()
+                        for k, v in layer_metrics.items():
+                            if k not in engram_metrics:
+                                engram_metrics[k] = []
+                            engram_metrics[k].append(v)
+
+                # Average metrics across all Engram layers and log
+                if engram_metrics:
+                    for k, values in engram_metrics.items():
+                        avg_value = sum(values) / len(values)
+                        if wandb_run is not None:
+                            wandb.log({k: avg_value, 'step': step})
+                        if tb_writer is not None:
+                            tb_writer.add_scalar(k, avg_value, step)
+
         # Validation (using next batches from same data loader)
         # Skip validation at the exact resume step to avoid immediate validation after loading
         if step % args.eval_interval == 0 and step > start_step and master_process:

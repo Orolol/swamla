@@ -117,7 +117,7 @@ class SWAMLAConfig:
     use_engram: bool = False
     engram_layers: List[int] = field(default_factory=lambda: [2, 6])  # Layers with Engram
     engram_d_mem: int = 512  # Memory embedding dimension
-    engram_n_hash_heads: int = 4  # Hash heads per N-gram order
+    engram_n_hash_heads: int = 8  # Hash heads per N-gram order (paper: K=8)
     engram_ngram_orders: List[int] = field(default_factory=lambda: [2, 3])  # N-gram orders
     engram_conv_kernel: int = 4  # Causal conv kernel size
     engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
@@ -601,7 +601,7 @@ def create_swa_mla_model(
             use_engram=True,
             engram_layers=[2, 6],  # Apply Engram at layers 2 and 6
             engram_d_mem=512,
-            engram_n_hash_heads=4,
+            engram_n_hash_heads=8,  # Paper: K=8 hash heads for collision attenuation
             engram_ngram_orders=[2, 3],
         ),
     }
