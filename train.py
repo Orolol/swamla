@@ -1441,7 +1441,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train DeltaNet-MLA model with LatentMoE')
 
     # Model parameters
-    parser.add_argument('--size', type=str, default='moe-1b', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b', 'engram-moe-1b'])
+    parser.add_argument('--size', type=str, default='moe-1b', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b', 'engram-moe-1b', 'mup-1b'])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--block_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.0)
