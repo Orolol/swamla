@@ -78,6 +78,16 @@ except ImportError:
 # For context manager fallback
 from contextlib import nullcontext
 
+# μP, Progressive Training, and EMA imports
+try:
+    sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
+    from mup import MuPConfig, mup_init, configure_mup_optimizer, mup_scale_output
+    from progressive import ProgressiveScheduler
+    from swa import EMAModel
+    MUP_AVAILABLE = True
+except ImportError:
+    MUP_AVAILABLE = False
+
 
 def setup_distributed():
     """Setup distributed training if available."""
@@ -821,6 +831,35 @@ def train(args):
         if args.use_gated_deltanet:
             model = adapt_deltanet_for_wedlm(model, max_seq_len=args.block_size * 2, d_model=None)
 
+    # Initialize μP if enabled
+    mup_config = None
+    if args.use_mup and MUP_AVAILABLE:
+        mup_config = MuPConfig(
+            base_width=args.mup_base_width,
+            width=model.config.n_embd,
+        )
+        mup_init(model, mup_config)
+        if rank == 0:
+            print(f"μP initialized: base_width={mup_config.base_width}, width_mult={mup_config.width_mult:.1f}x")
+
+    # Initialize Progressive Scheduler if enabled
+    progressive = None
+    if args.use_progressive and MUP_AVAILABLE:
+        progressive = ProgressiveScheduler.from_schedule(
+            args.progressive_schedule,
+            base_batch_size=args.batch_size,
+            target_seq_len=args.block_size,
+        )
+        if rank == 0:
+            print(f"Progressive training: {args.progressive_schedule}")
+
+    # Initialize EMA if enabled
+    ema = None
+    if args.use_ema and MUP_AVAILABLE:
+        ema = EMAModel(model, decay=args.ema_decay)
+        if rank == 0:
+            print(f"EMA enabled: decay={args.ema_decay}")
+
     # Log to wandb (silent)
     if master_process and wandb_run is not None:
         total_params = sum(p.numel() for p in model.parameters())
@@ -864,16 +903,27 @@ def train(args):
         num_workers=args.num_workers,
     )
 
-    # Setup optimizer
-    optimizer = configure_optimizer(
-        raw_model,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        betas=(args.beta1, args.beta2),
-        device_type='cuda' if torch.cuda.is_available() else 'cpu',
-        optimizer_type=args.optimizer_type,
-        engram_lr_multiplier=args.engram_lr_multiplier if args.use_engram else 1.0,
-    )
+    # Configure optimizer (μP-aware if enabled)
+    if mup_config is not None:
+        optimizer = configure_mup_optimizer(
+            raw_model, mup_config,
+            base_lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2),
+            engram_lr_mult=args.engram_lr_multiplier if args.use_engram else 1.0,
+            device_type='cuda' if torch.cuda.is_available() else 'cpu',
+            optimizer_type=args.optimizer_type,
+        )
+    else:
+        optimizer = configure_optimizer(
+            raw_model,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2),
+            device_type='cuda' if torch.cuda.is_available() else 'cpu',
+            optimizer_type=args.optimizer_type,
+            engram_lr_multiplier=args.engram_lr_multiplier if args.use_engram else 1.0,
+        )
 
     # Load optimizer state if resuming
     if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
@@ -949,6 +999,13 @@ def train(args):
         next_batch = next(data_iter)
 
     for step in range(start_step, args.max_iters):
+        # Progressive training: check for phase transition
+        if progressive is not None:
+            new_seq_len, new_batch_size = progressive.get_current_config(total_tokens_seen)
+            if progressive.check_phase_transition(total_tokens_seen):
+                if rank == 0:
+                    print(f"\n>>> Progressive transition: seq_len={new_seq_len}, batch_size={new_batch_size}")
+
         # Update learning rate - compute the schedule ratio
         scheduled_lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
         lr_ratio = scheduled_lr / args.learning_rate if args.learning_rate > 0 else 1.0
@@ -1073,6 +1130,10 @@ def train(args):
         else:
             scaler.step(optimizer)
         scaler.update()
+
+        # Update EMA weights
+        if ema is not None:
+            ema.update(raw_model)
 
         running_loss += accum_loss
 
@@ -1348,6 +1409,19 @@ def main():
                         help='Engram causal convolution kernel size')
     parser.add_argument('--engram_lr_multiplier', type=float, default=5.0,
                         help='Learning rate multiplier for Engram embedding tables')
+
+    # μP arguments
+    parser.add_argument('--use_mup', action='store_true', help='Enable μP (Maximal Update Parametrization)')
+    parser.add_argument('--mup_base_width', type=int, default=256, help='μP base width for LR scaling')
+
+    # Progressive training arguments
+    parser.add_argument('--use_progressive', action='store_true', help='Enable progressive sequence length training')
+    parser.add_argument('--progressive_schedule', type=str, default='512:500M,1024:2B,2048:inf',
+                        help='Progressive schedule: seq_len:tokens,... (e.g., "512:500M,1024:2B,2048:inf")')
+
+    # EMA arguments
+    parser.add_argument('--use_ema', action='store_true', help='Enable EMA weight averaging')
+    parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay factor')
 
     # LatentMoE parameters (always enabled for moe-* sizes)
     parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
