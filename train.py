@@ -894,10 +894,18 @@ def train(args):
     if master_process:
         print_training_banner(args, raw_model, world_size, device, resume_step, resume_tokens)
 
+    # Get initial seq_len and batch_size (may be from progressive scheduler)
+    initial_seq_len = args.block_size
+    initial_batch_size = args.batch_size
+    if progressive is not None:
+        initial_seq_len, initial_batch_size = progressive.get_current_config(resume_tokens)
+        if rank == 0:
+            print(f"Progressive training: starting at seq_len={initial_seq_len}, batch_size={initial_batch_size}")
+
     data_loader = PackedFinewebDataset(
         split='train',
-        max_length=args.block_size,
-        batch_size=args.batch_size,
+        max_length=initial_seq_len,
+        batch_size=initial_batch_size,
         tokenizer=tokenizer,
         shuffle=True,
         num_workers=args.num_workers,
@@ -937,6 +945,28 @@ def train(args):
             # Silently skip mismatched structures
         except Exception:
             pass  # Silently continue with fresh optimizer state
+
+    # Load EMA state if resuming
+    if resume_checkpoint and 'ema' in resume_checkpoint and ema is not None:
+        try:
+            ema.load_state_dict(resume_checkpoint['ema'])
+            if rank == 0:
+                print("Restored EMA state from checkpoint")
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Could not restore EMA state: {e}")
+
+    # Load progressive scheduler state if resuming
+    if resume_checkpoint and 'progressive' in resume_checkpoint and progressive is not None:
+        try:
+            prog_state = resume_checkpoint['progressive']
+            progressive.current_phase_idx = prog_state.get('current_phase_idx', 0)
+            progressive._last_phase_idx = prog_state.get('_last_phase_idx', 0)
+            if rank == 0:
+                print(f"Restored progressive scheduler state: phase {progressive.current_phase_idx}")
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Could not restore progressive state: {e}")
 
     # Setup profiler if enabled
     profiler = None
@@ -998,6 +1028,10 @@ def train(args):
         data_iter = iter(data_loader)
         next_batch = next(data_iter)
 
+    # Track current progressive config for detecting changes
+    current_seq_len = args.block_size
+    current_batch_size = args.batch_size
+
     for step in range(start_step, args.max_iters):
         # Progressive training: check for phase transition
         if progressive is not None:
@@ -1005,6 +1039,35 @@ def train(args):
             if progressive.check_phase_transition(total_tokens_seen):
                 if rank == 0:
                     print(f"\n>>> Progressive transition: seq_len={new_seq_len}, batch_size={new_batch_size}")
+
+                # Recreate data loader with new configuration
+                try:
+                    data_loader.close()  # Clean up existing data loader
+                except Exception:
+                    pass
+
+                data_loader = PackedFinewebDataset(
+                    split='train',
+                    max_length=new_seq_len,
+                    batch_size=new_batch_size,
+                    tokenizer=tokenizer,
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                    start_offset=total_tokens_seen // new_seq_len,  # Approximate position
+                )
+                data_iter = iter(data_loader)
+                current_seq_len = new_seq_len
+                current_batch_size = new_batch_size
+
+                # Prefetch first batch from new loader
+                try:
+                    next_batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(data_loader)
+                    next_batch = next(data_iter)
+
+                if rank == 0:
+                    print(f">>> Data loader reconfigured: seq_len={new_seq_len}, batch_size={new_batch_size}")
 
         # Update learning rate - compute the schedule ratio
         scheduled_lr = get_lr(step, args.warmup_iters, args.max_iters, args.learning_rate, args.min_lr)
@@ -1184,7 +1247,9 @@ def train(args):
             val_loss = 0.0
             val_steps = 50
 
-            with torch.no_grad():
+            # Use EMA weights for validation if available
+            ema_ctx = ema.apply(raw_model) if ema is not None else nullcontext()
+            with ema_ctx, torch.no_grad():
                 for _ in range(val_steps):
                     try:
                         batch = next(data_iter)
@@ -1297,7 +1362,19 @@ def train(args):
                 'optimizer': optimizer_state,
                 'step': step,
                 'config': config_dict,
+                'total_tokens_seen': total_tokens_seen,
             }
+
+            # Save EMA state if enabled
+            if ema is not None:
+                checkpoint['ema'] = ema.state_dict()
+
+            # Save progressive scheduler state if enabled
+            if progressive is not None:
+                checkpoint['progressive'] = {
+                    'current_phase_idx': progressive.current_phase_idx,
+                    '_last_phase_idx': progressive._last_phase_idx,
+                }
 
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{step}.pt')
             torch.save(checkpoint, checkpoint_path)

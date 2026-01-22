@@ -239,7 +239,8 @@ def configure_mup_optimizer(
         Configured optimizer
     """
     # Group parameters by their LR scale and weight decay
-    param_groups: Dict[Tuple[float, float], List[torch.Tensor]] = {}
+    # Also track layer types for Muon optimizer (needs to exclude embeddings)
+    param_groups: Dict[Tuple[float, float], List[Tuple[torch.Tensor, LayerType]]] = {}
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -252,14 +253,16 @@ def configure_mup_optimizer(
         key = (lr_scale, wd)
         if key not in param_groups:
             param_groups[key] = []
-        param_groups[key].append(param)
+        param_groups[key].append((param, layer_type))
 
     # Build optimizer param groups
     optimizer_groups = []
-    for (lr_scale, wd), params in param_groups.items():
+    for (lr_scale, wd), param_type_list in param_groups.items():
+        params = [p for p, _ in param_type_list]
         if params:
             optimizer_groups.append({
                 'params': params,
+                'param_types': [lt for _, lt in param_type_list],  # Store types for Muon
                 'lr': base_lr * lr_scale,
                 'weight_decay': wd,
             })
@@ -267,7 +270,7 @@ def configure_mup_optimizer(
     # Handle Muon optimizer (requires special treatment)
     if optimizer_type == 'muon' and hasattr(torch.optim, 'Muon'):
         # Muon uses different LR scale and only for 2D params
-        # We need to split: Muon for 2D weights, AdamW for rest
+        # We need to split: Muon for 2D weights (non-embedding), AdamW for rest
         Muon = torch.optim.Muon
 
         muon_groups = []
@@ -276,9 +279,13 @@ def configure_mup_optimizer(
         for group in optimizer_groups:
             muon_params = []
             adamw_params = []
+            param_types = group.get('param_types', [])
 
-            for param in group['params']:
-                if param.ndim == 2 and 'embed' not in str(id(param)):
+            for i, param in enumerate(group['params']):
+                layer_type = param_types[i] if i < len(param_types) else LayerType.OTHER
+                # Muon only for 2D params that are NOT embeddings
+                is_embedding = layer_type in (LayerType.EMBEDDING, LayerType.ENGRAM_EMBED)
+                if param.ndim == 2 and not is_embedding:
                     muon_params.append(param)
                 else:
                     adamw_params.append(param)
@@ -305,6 +312,10 @@ def configure_mup_optimizer(
             optimizers.append(torch.optim.AdamW(adamw_groups, betas=betas, fused=use_fused))
 
         return optimizers  # Returns list for Muon
+
+    # Clean up param_types before passing to standard optimizer (it doesn't need them)
+    for group in optimizer_groups:
+        group.pop('param_types', None)
 
     # Standard AdamW
     use_fused = device_type == 'cuda'
