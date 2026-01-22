@@ -626,6 +626,27 @@ This codebase is **completely self-contained**:
 4. Compare tokens/sec before and after changes
 5. Verify memory usage doesn't increase unexpectedly
 
+## Engram Module (Conditional Memory)
+
+**Location**: `models/engram.py`
+
+Engram performs O(1) N-gram lookups to complement MoE. Key implementation details:
+
+- **Placement**: Applied BEFORE attention with residual: `H = H + Engram(H, input_ids)`
+- **Zero-init conv**: Critical for stability - causal conv initialized to zeros for identity mapping
+- **Optimizer settings**: Embedding tables use 5x LR, no weight decay (paper spec)
+- **Forward requires input_ids**: MLABlock.forward() accepts `input_ids` parameter for Engram
+- **Tokenizer compression**: Call `model.set_engram_tokenizer_compression(tokenizer)` after creation
+
+Configuration in SWAMLAConfig:
+- `use_engram`: Enable/disable
+- `engram_layers`: Layer indices (default: [2, 6])
+- `engram_d_mem`: Memory dimension (default: 512)
+- `engram_n_hash_heads`: Hash heads per N-gram order (default: 4)
+- `engram_ngram_orders`: N-gram orders (default: [2, 3])
+
+Training script: `./scripts/train_swa_mla_engram.sh`
+
 ## Critical Code Patterns
 
 ### Block Type Detection in Forward Pass
@@ -644,6 +665,10 @@ Weight decay is selectively applied:
 - Applied: Linear weights in attention and MLP
 - Excluded: Biases, normalization layers, embeddings
 Pattern: `if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe'])`
+
+**Engram special handling** (in `configure_optimizer`):
+- Engram embedding tables (`engram.*embeddings.*tables`): 5x LR, no weight decay
+- Engram projections (w_k, w_v, conv): normal LR, with weight decay
 
 ### DDP-Safe Buffer Management
 Frequency buffers registered as non-persistent:

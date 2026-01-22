@@ -279,8 +279,13 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     return get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr)
 
 
-def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw'):
-    """Configure optimizer with proper parameter grouping."""
+def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', engram_lr_multiplier=5.0):
+    """Configure optimizer with proper parameter grouping.
+
+    Engram parameters are handled specially:
+    - Engram embedding tables: 5x LR (engram_lr_multiplier), no weight decay
+    - Engram other params (w_k, w_v, conv): normal LR, weight decay
+    """
 
     if optimizer_type == 'muon':
         # Use native PyTorch Muon (requires PyTorch 2.6+)
@@ -290,14 +295,19 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             Muon = torch.optim.Muon
             muon_lr = learning_rate * 200
             adamw_lr = learning_rate
+            engram_embed_lr = learning_rate * engram_lr_multiplier
 
             muon_params = []
             adamw_params = []
+            engram_embed_params = []  # Engram embeddings: high LR, no decay
 
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
+                # Engram embedding tables: special treatment (5x LR, no decay)
+                if 'engram' in name and 'embeddings' in name and 'tables' in name:
+                    engram_embed_params.append(param)
+                elif any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
                     adamw_params.append(param)
                 elif param.ndim == 2:
                     muon_params.append(param)
@@ -316,25 +326,57 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
                 ))
             if adamw_params:
                 optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay, fused=True))
+            # Engram embeddings: separate optimizer with high LR and no weight decay
+            if engram_embed_params:
+                optimizers.append(torch.optim.AdamW(
+                    [{'params': engram_embed_params, 'weight_decay': 0.0}],
+                    lr=engram_embed_lr, betas=betas, fused=True
+                ))
 
             return optimizers
 
-    # Standard AdamW configuration
+    # Standard AdamW configuration with Engram support
     decay_params = []
     no_decay_params = []
+    engram_embed_params = []  # Engram embeddings: high LR, no decay
+    engram_other_params = []  # Engram w_k, w_v, conv: normal LR, with decay
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe']):
+        # Engram embedding tables: 5x LR, no weight decay (paper spec)
+        if 'engram' in name and 'embeddings' in name and 'tables' in name:
+            engram_embed_params.append(param)
+        # Engram other params (w_k, w_v, conv weights): normal LR with decay
+        elif 'engram' in name:
+            if any(nd in name for nd in ['.bias', 'norm']):
+                no_decay_params.append(param)
+            else:
+                engram_other_params.append(param)
+        # Standard no-decay params
+        elif any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe']):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
 
     param_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
+        {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+        {'params': no_decay_params, 'weight_decay': 0.0, 'lr': learning_rate},
     ]
+
+    # Add Engram param groups
+    if engram_embed_params:
+        param_groups.append({
+            'params': engram_embed_params,
+            'weight_decay': 0.0,  # No weight decay for embeddings
+            'lr': learning_rate * engram_lr_multiplier,  # 5x LR
+        })
+    if engram_other_params:
+        param_groups.append({
+            'params': engram_other_params,
+            'weight_decay': weight_decay,
+            'lr': learning_rate,
+        })
 
     if device_type == 'cuda':
         optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, betas=betas, fused=True)
@@ -686,6 +728,13 @@ def train(args):
             if args.latent_n_activated is not None:
                 moe_kwargs['latent_n_activated'] = args.latent_n_activated
 
+    # Parse Engram arguments
+    engram_layers = []
+    engram_ngram_orders = []
+    if args.use_engram:
+        engram_layers = [int(x.strip()) for x in args.engram_layers.split(',') if x.strip()]
+        engram_ngram_orders = [int(x.strip()) for x in args.engram_ngram_orders.split(',') if x.strip()]
+
     # Common model kwargs
     model_kwargs = dict(
         size=args.size,
@@ -710,12 +759,23 @@ def train(args):
         deltanet_share_qk=args.deltanet_share_qk,
         # FP8 training via Transformer Engine
         use_te_fp8=args.use_fp8,
+        # Engram: Conditional Memory via N-gram Lookup
+        use_engram=args.use_engram,
+        engram_layers=engram_layers,
+        engram_d_mem=args.engram_d_mem,
+        engram_n_hash_heads=args.engram_n_hash_heads,
+        engram_ngram_orders=engram_ngram_orders,
+        engram_conv_kernel=args.engram_conv_kernel,
         # MoE parameters
         **moe_kwargs,
     )
 
     model = create_swa_mla_model(**model_kwargs)
     model = model.to(device)
+
+    # Set tokenizer compression for Engram if enabled (must be done on all processes)
+    if args.use_engram:
+        model.set_engram_tokenizer_compression(tokenizer)
 
     # Load model weights if resuming
     if resume_checkpoint:
@@ -812,6 +872,7 @@ def train(args):
         betas=(args.beta1, args.beta2),
         device_type='cuda' if torch.cuda.is_available() else 'cpu',
         optimizer_type=args.optimizer_type,
+        engram_lr_multiplier=args.engram_lr_multiplier if args.use_engram else 1.0,
     )
 
     # Load optimizer state if resuming
@@ -1242,7 +1303,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train DeltaNet-MLA model with LatentMoE')
 
     # Model parameters
-    parser.add_argument('--size', type=str, default='moe-1b', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b'])
+    parser.add_argument('--size', type=str, default='moe-1b', choices=['small', 'base', 'large', 'xl', 'moe-1b', 'moe-2b', 'engram-moe-1b'])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--block_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -1271,6 +1332,22 @@ def main():
                         help='Latent dimension for DeltaNet projections (0=disabled, >0=compress Q/K/V/O)')
     parser.add_argument('--deltanet_share_qk', action='store_true', default=False,
                         help='Share Q and K projection in DeltaNet (K is normalized Q)')
+
+    # Engram: Conditional Memory via N-gram Lookup
+    parser.add_argument('--use_engram', action='store_true', default=False,
+                        help='Enable Engram conditional memory module')
+    parser.add_argument('--engram_layers', type=str, default='2,6',
+                        help='Comma-separated layer indices for Engram (e.g., "2,6")')
+    parser.add_argument('--engram_d_mem', type=int, default=512,
+                        help='Engram memory embedding dimension')
+    parser.add_argument('--engram_n_hash_heads', type=int, default=4,
+                        help='Number of hash heads per N-gram order')
+    parser.add_argument('--engram_ngram_orders', type=str, default='2,3',
+                        help='Comma-separated N-gram orders (e.g., "2,3")')
+    parser.add_argument('--engram_conv_kernel', type=int, default=4,
+                        help='Engram causal convolution kernel size')
+    parser.add_argument('--engram_lr_multiplier', type=float, default=5.0,
+                        help='Learning rate multiplier for Engram embedding tables')
 
     # LatentMoE parameters (always enabled for moe-* sizes)
     parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')

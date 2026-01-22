@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -105,9 +105,23 @@ class SWAMLAConfig:
     latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
     latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
     resume_from: Optional[str] = None # Checkpoint to resume from
+    use_wedlm: bool = False  # WeDLM (Weight-Decomposed Linear Module) for memory efficiency
+    wedlm_min_mask_ratio: float = 0.5  # Minimum ratio of tokens to mask in WeDLM
+    wedlm_max_mask_ratio: float = 0.8  # Maximum ratio of tokens to mask in WeDLM
 
     # Transformer Engine FP8 training
     use_te_fp8: bool = False  # Use TE Linear layers for FP8 training (requires transformer-engine)
+
+    # Engram: Conditional Memory via Scalable N-gram Lookup
+    # Complements MoE by performing O(1) lookups in N-gram embedding tables
+    use_engram: bool = False
+    engram_layers: List[int] = field(default_factory=lambda: [2, 6])  # Layers with Engram
+    engram_d_mem: int = 512  # Memory embedding dimension
+    engram_n_hash_heads: int = 4  # Hash heads per N-gram order
+    engram_ngram_orders: List[int] = field(default_factory=lambda: [2, 3])  # N-gram orders
+    engram_conv_kernel: int = 4  # Causal conv kernel size
+    engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
+    engram_lr_multiplier: float = 5.0  # LR multiplier for Engram embeddings
 
     def __post_init__(self) -> None:
         if self.expert_dim is None:
@@ -244,14 +258,29 @@ class SWAMLAModel(nn.Module):
             non_moe_params = self.param_count - all_moe_params
             active_param_count = non_moe_params + moe_active_params
 
+        # Count Engram modules
+        engram_count = sum(
+            1 for block in self.transformer.h
+            if isinstance(block, MLABlock) and getattr(block, 'engram', None) is not None
+        )
+        engram_params = sum(
+            block.engram.get_num_params()
+            for block in self.transformer.h
+            if isinstance(block, MLABlock) and getattr(block, 'engram', None) is not None
+        )
+
         model_type = "DeltaNet-MLA"
         if config.use_moe:
             model_type += "-MoE"
+        if config.use_engram:
+            model_type += "-Engram"
 
         print(f"{model_type} Model - Number of parameters: {self.param_count / 1e6:.2f}M")
         if active_param_count is not None:
             print(f"  - Active parameters per forward: {active_param_count / 1e6:.2f}M ({100 * active_param_count / self.param_count:.1f}%)")
         print(f"  - {deltanet_count} DeltaNet blocks, {mla_count} MLA blocks")
+        if engram_count > 0:
+            print(f"  - {engram_count} Engram modules ({engram_params / 1e6:.2f}M params)")
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -336,8 +365,8 @@ class SWAMLAModel(nn.Module):
                 else:
                     x = block(x)
             elif isinstance(block, MLABlock):
-                # MLA: pass position_ids for WeDLM topological reordering
-                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids)
+                # MLA: pass position_ids for WeDLM and input_ids for Engram
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)
@@ -399,6 +428,44 @@ class SWAMLAModel(nn.Module):
                 router = ffn.router
                 if hasattr(router, 'update_bias_from_last_forward'):
                     router.update_bias_from_last_forward()
+
+    def set_engram_tokenizer_compression(self, tokenizer):
+        """Set tokenizer compression for all Engram modules.
+
+        This must be called after model creation if using Engram.
+        The tokenizer compression maps original token IDs to canonical
+        IDs for consistent N-gram hashing.
+
+        Args:
+            tokenizer: Tokenizer with get_vocab() method
+        """
+        from engram import TokenizerCompression
+
+        compression = TokenizerCompression.from_tokenizer(tokenizer)
+        engram_count = 0
+
+        for block in self.transformer.h:
+            if isinstance(block, MLABlock) and block.engram is not None:
+                block.engram.set_tokenizer_compression(compression)
+                engram_count += 1
+
+        if engram_count > 0:
+            print(f"Engram: Set tokenizer compression for {engram_count} layers")
+            print(f"  - Original vocab: {compression.original_vocab_size:,}")
+            print(f"  - Compressed vocab: {compression.compressed_vocab_size:,} "
+                  f"({100 * compression.compressed_vocab_size / compression.original_vocab_size:.1f}%)")
+
+    def get_engram_modules(self):
+        """Get all Engram modules in the model.
+
+        Returns:
+            List of (layer_id, engram_module) tuples
+        """
+        engram_modules = []
+        for block in self.transformer.h:
+            if isinstance(block, MLABlock) and block.engram is not None:
+                engram_modules.append((block.layer_id, block.engram))
+        return engram_modules
 
     @torch.no_grad()
     def generate(
@@ -490,6 +557,14 @@ def _create_mla_block_config(config: SWAMLAConfig):
         latent_preserve_expert_dim: bool = config.latent_preserve_expert_dim
         # Flash Attention for MLA
         use_flash_attention: bool = config.use_flash_attention
+        # Engram parameters
+        use_engram: bool = config.use_engram
+        engram_layers: List[int] = field(default_factory=lambda: config.engram_layers.copy())
+        engram_d_mem: int = config.engram_d_mem
+        engram_n_hash_heads: int = config.engram_n_hash_heads
+        engram_ngram_orders: List[int] = field(default_factory=lambda: config.engram_ngram_orders.copy())
+        engram_conv_kernel: int = config.engram_conv_kernel
+        engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = config.engram_table_sizes
 
     return _Config()
 
@@ -518,6 +593,17 @@ def create_swa_mla_model(
             swa_layers_per_cycle=2, mla_layers_per_cycle=1,
             use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=1024 * 3,
         ),
+        # Engram+MoE preset - MoE with N-gram conditional memory
+        "engram-moe-1b": dict(  # MoE + Engram for N-gram memory lookup
+            n_layer=12, n_embd=1024, n_head=12,
+            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            use_moe=True, n_experts=64, n_shared_experts=1, n_activated=2, expert_dim=512 * 2,
+            use_engram=True,
+            engram_layers=[2, 6],  # Apply Engram at layers 2 and 6
+            engram_d_mem=512,
+            engram_n_hash_heads=4,
+            engram_ngram_orders=[2, 3],
+        ),
     }
     if size not in presets:
         raise ValueError(f"Unknown SWAMLA model size: {size}. Available: {list(presets.keys())}")
@@ -529,5 +615,8 @@ def create_swa_mla_model(
     cfg_kwargs.pop("compile_mode", None)
     cfg_kwargs.pop("use_tensorboard", None)
     cfg_kwargs.pop("use_fp8", None)
+    cfg_kwargs.pop("wedlm_block_size", None)
+    cfg_kwargs.pop("wedlm_ar_loss_weight", None)
+    cfg_kwargs.pop("wedlm_mask_token_id", None)
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)
