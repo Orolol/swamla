@@ -44,4 +44,7 @@ logs/
 .DS_Store
 Thumbs.db
 .env
-install.txt.worktrees/
+install.txt
+
+
+.worktrees/
