@@ -1250,16 +1250,22 @@ def train(args):
             else:
                 tokens_str = f"{total_tokens_seen / 1_000_000_000:.2f}B"
 
-            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}")
+            # Include current seq_len/batch_size for progressive training tracking
+            prog_info = f" | BS={current_batch_size}x{current_seq_len}" if progressive is not None else ""
+            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}{prog_info}")
 
             if wandb_run is not None:
-                wandb.log({
+                log_dict = {
                     'train/loss': lossf,
                     'train/lr': lr,
                     'train/tokens_per_sec': tokens_per_sec,
                     'train/total_tokens': total_tokens_seen,
                     'step': step
-                })
+                }
+                if progressive is not None:
+                    log_dict['train/seq_len'] = current_seq_len
+                    log_dict['train/batch_size'] = current_batch_size
+                wandb.log(log_dict)
             
             if tb_writer is not None:
                 tb_writer.add_scalar('train/loss', lossf, step)
@@ -1267,6 +1273,9 @@ def train(args):
                 tb_writer.add_scalar('train/tokens_per_sec', tokens_per_sec, step)
                 tb_writer.add_scalar('train/total_tokens', total_tokens_seen, step)
                 tb_writer.add_scalar('train/perplexity', math.exp(lossf) if lossf < 10 else float('inf'), step)
+                if progressive is not None:
+                    tb_writer.add_scalar('train/seq_len', current_seq_len, step)
+                    tb_writer.add_scalar('train/batch_size', current_batch_size, step)
 
             # Log Engram metrics if enabled
             if args.use_engram:
@@ -1521,7 +1530,7 @@ def main():
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action='store_true', default=True,
                         help='Use Flash Attention for MLA blocks')
-    parser.add_argument('--use_varlen_attn', action='store_true', default=False,
+    parser.add_argument('--use_varlen_attn', action='store_true', default=True,
                         help='Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
