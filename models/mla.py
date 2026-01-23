@@ -31,6 +31,14 @@ except ImportError:
     flex_attention = None
     create_block_mask = None
 
+# Import varlen_attn (PyTorch 2.10+)
+try:
+    from torch.nn.attention import varlen_attn
+    VARLEN_ATTN_AVAILABLE = True
+except ImportError:
+    VARLEN_ATTN_AVAILABLE = False
+    varlen_attn = None
+
 # Import custom Triton MLA attention kernel (H100 compatible alternative to FA2)
 try:
     from triton_kernels import mla_attention_triton
@@ -142,6 +150,12 @@ class MLA(nn.Module):
         # when using dynamic tensor closures. Disabled by default, use SDPA instead.
         self.use_flex_attention = getattr(config, 'use_flex_attention', False) and FLEX_ATTENTION_AVAILABLE
         self._flex_attention_compiled = None  # Will be compiled on first use
+
+        # Varlen attention support (PyTorch 2.10+)
+        # Eliminates padding waste by using packed sequences with variable lengths
+        self.use_varlen_attn = getattr(config, 'use_varlen_attn', False) and VARLEN_ATTN_AVAILABLE
+        if self.use_varlen_attn:
+            print(f"MLA: Using varlen_attn (PyTorch 2.10+)")
         
         # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
@@ -212,6 +226,8 @@ class MLA(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -236,6 +252,10 @@ class MLA(nn.Module):
             position_ids (Optional[torch.Tensor]): Explicit position IDs for RoPE [B, T].
                 If provided, allows physical position to differ from logical position
                 (used for WeDLM topological reordering).
+            cu_seqlens (Optional[torch.Tensor]): Cumulative sequence lengths for varlen_attn.
+                Shape [num_docs + 1], dtype int32. When provided with max_seqlen,
+                enables variable-length attention without padding waste.
+            max_seqlen (Optional[int]): Maximum sequence length in the batch for varlen_attn.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
@@ -319,7 +339,13 @@ class MLA(nn.Module):
                 k_to_use = k
                 v_to_use = v
             
-            if self.use_triton_mla and mask is None and mla_attention_triton is not None:
+            if self.use_varlen_attn and cu_seqlens is not None and max_seqlen is not None and mask is None:
+                # Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste
+                x = self._varlen_attention(
+                    q.contiguous(), k_to_use.contiguous(), v_to_use.contiguous(),
+                    cu_seqlens, max_seqlen
+                )
+            elif self.use_triton_mla and mask is None and mla_attention_triton is not None:
                 # Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)
                 # Expects B, T, H, D and handles V with different head dim
                 x = mla_attention_triton(
@@ -402,7 +428,13 @@ class MLA(nn.Module):
             pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
             k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
 
-            if self.use_triton_mla and mask is None and mla_attention_triton is not None:
+            if self.use_varlen_attn and cu_seqlens is not None and max_seqlen is not None and mask is None:
+                # Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste
+                x = self._varlen_attention(
+                    q_full.contiguous(), k_full.contiguous(), v.contiguous(),
+                    cu_seqlens, max_seqlen
+                )
+            elif self.use_triton_mla and mask is None and mla_attention_triton is not None:
                 # Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)
                 x = mla_attention_triton(
                     q_full.contiguous(), k_full.contiguous(), v.contiguous(),
@@ -512,6 +544,88 @@ class MLA(nn.Module):
         if d_v != d_qk:
             # Slicing creates a view, make contiguous
             attn_output = attn_output[..., :d_v].contiguous()
+
+        # Convert back to original dtype
+        if attn_output.dtype != orig_dtype:
+            attn_output = attn_output.to(orig_dtype).contiguous()
+
+        return attn_output
+
+    def _varlen_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """
+        Run variable-length attention using PyTorch 2.10+ varlen_attn.
+
+        This eliminates padding waste by computing attention only over real tokens.
+
+        Args:
+            q: (B, T, H, D_qk) queries
+            k: (B, T, H, D_qk) keys
+            v: (B, T, H, D_v) values - may have different head dim
+            cu_seqlens: (num_docs + 1,) cumulative sequence lengths
+            max_seqlen: maximum sequence length in the batch
+
+        Returns:
+            output: (B, T, H, D_v)
+        """
+        if not VARLEN_ATTN_AVAILABLE:
+            raise RuntimeError("varlen_attn not available (requires PyTorch 2.10+)")
+
+        B, T, H, D_qk = q.shape
+        D_v = v.shape[-1]
+
+        # Ensure inputs are contiguous
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        # varlen_attn requires bf16 or fp16
+        orig_dtype = q.dtype
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+
+        # Handle V dimension mismatch by padding if necessary
+        need_v_padding = D_v != D_qk
+        if need_v_padding:
+            pad_size = D_qk - D_v
+            v_padded = F.pad(v, (0, pad_size), value=0.0).contiguous()
+        else:
+            v_padded = v
+
+        # Flatten batch and sequence dimensions for varlen_attn
+        # Input: [B, T, H, D] -> [B*T, H, D]
+        q_flat = q.view(B * T, H, D_qk)
+        k_flat = k.view(B * T, H, D_qk)
+        v_flat = v_padded.view(B * T, H, D_qk if need_v_padding else D_v)
+
+        # Run varlen_attn
+        # varlen_attn expects [total_tokens, H, D]
+        attn_output = varlen_attn(
+            query=q_flat,
+            key=k_flat,
+            value=v_flat,
+            cu_seq_q=cu_seqlens,
+            cu_seq_k=cu_seqlens,
+            max_q=max_seqlen,
+            max_k=max_seqlen,
+            is_causal=True,
+            scale=self.softmax_scale,
+        )
+
+        # Reshape back to [B, T, H, D]
+        attn_output = attn_output.view(B, T, H, -1)
+
+        # Remove padding from output if we padded V
+        if need_v_padding:
+            attn_output = attn_output[..., :D_v].contiguous()
 
         # Convert back to original dtype
         if attn_output.dtype != orig_dtype:

@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SWA-MLA is a **standalone, self-contained** implementation of a hybrid language model architecture that interleaves Sliding Window Attention (SWA) blocks with Multi-head Latent Attention (MLA) blocks. This is a production-ready extraction focused on efficiency and ease of deployment.
+DeltaNet-MLA is a **standalone, self-contained** implementation of a hybrid language model architecture that interleaves GatedDeltaNet (O(n) linear attention) blocks with Multi-head Latent Attention (MLA) blocks. This is a production-ready extraction focused on efficiency and ease of deployment.
+
+**Note**: The project name "SWA-MLA" is historical. The local attention mechanism now uses DeltaNet (O(n) linear attention) instead of sliding window attention.
 
 ## Key Commands
 
@@ -21,23 +23,29 @@ python test_setup.py
 
 ### Training
 ```bash
-# Using the shell script (recommended - auto-detects GPUs and launches DDP)
-./scripts/train_swa_mla.sh small 8 2048
+# Using the consolidated training script (recommended - auto-detects GPUs and launches DDP)
+./scripts/train.sh --preset engram-moe 8 2048
+
+# Available presets:
+#   base        - Basic DeltaNet+MLA training
+#   moe         - DeltaNet+MLA with LatentMoE
+#   engram      - DeltaNet+MLA with Engram
+#   engram-moe  - DeltaNet+MLA with Engram + LatentMoE (recommended)
+#   full        - All features (μP, Progressive, EMA, Engram, MoE)
 
 # The script automatically:
 #   - Detects available GPUs using nvidia-smi
 #   - Launches DDP training with torchrun if multiple GPUs are detected
 #   - Launches single-GPU training if only one GPU is detected
-#   - Configures TF32 for optimal performance on Ampere+ GPUs
 
 # Using Python directly (for manual control)
-python train.py --size small --batch_size 8 --block_size 2048
+python train.py --size engram-moe-1b --batch_size 8 --block_size 2048
 
 # Manual multi-GPU training with torchrun
-torchrun --nproc_per_node=4 train.py --size medium --batch_size 4 --block_size 2048
+torchrun --nproc_per_node=4 train.py --size moe-1b --batch_size 4 --block_size 2048
 
-# Disable TF32 for full IEEE FP32 precision (slower but more accurate)
-python train.py --size small --disable_tf32
+# Enable specific features
+./scripts/train.sh --features mup,progressive,ema 4 2048
 ```
 
 ### Testing
@@ -53,23 +61,23 @@ python test_tf32_config.py
 
 ### Hybrid Block Structure
 The model uses a **cyclic pattern** of attention blocks:
-- **SWA blocks**: Local sliding window attention with RoPE, optimized for capturing short-range dependencies
+- **DeltaNet blocks**: O(n) linear attention (GatedDeltaNet), optimized for capturing local dependencies with constant memory
 - **MLA blocks**: Global attention with low-rank KV compression, efficient for long-range context
 
 The cycle pattern is controlled by:
-- `swa_layers_per_cycle` (default: 2) - Number of SWA blocks per cycle
+- `local_layers_per_cycle` (default: 2) - Number of DeltaNet blocks per cycle
 - `mla_layers_per_cycle` (default: 1) - Number of MLA blocks per cycle
 
-Example: With defaults (2 SWA + 1 MLA), a 12-layer model has the pattern:
-`[SWA, SWA, MLA, SWA, SWA, MLA, SWA, SWA, MLA, SWA, SWA, MLA]`
+Example: With defaults (2 DeltaNet + 1 MLA), a 12-layer model has the pattern:
+`[DeltaNet, DeltaNet, MLA, DeltaNet, DeltaNet, MLA, DeltaNet, DeltaNet, MLA, DeltaNet, DeltaNet, MLA]`
 
 ### Key Components
 
-**SWA (Sliding Window Attention) Blocks** ([models/attention.py](models/attention.py)):
-- Causal self-attention with configurable window size (default: 256 tokens)
-- **Attention sink**: Always attends to first N tokens (default: 4) for stability
-- Uses RoPE positional embeddings
-- Efficient for local patterns without memory overhead
+**GatedDeltaNet Blocks** ([models/gated_deltanet.py](models/gated_deltanet.py)):
+- O(n) linear attention with recurrent state
+- Constant memory regardless of sequence length
+- Supports latent compression for parameter efficiency
+- Optional Q/K sharing for further compression
 
 **MLA (Multi-head Latent Attention) Blocks** ([models/mla.py](models/mla.py), [models/mla_block.py](models/mla_block.py)):
 - Global attention with low-rank compression via LoRA
@@ -111,19 +119,23 @@ swamla/
 ├── test_setup.py                      # Setup verification
 ├── models/
 │   ├── swa_mla_model.py              # Main hybrid model + config
-│   ├── attention.py                   # SWA attention implementation
+│   ├── gated_deltanet.py             # GatedDeltaNet (O(n) linear attention)
 │   ├── mla.py                         # MLA attention core
 │   ├── mla_block.py                   # MLA transformer block
-│   ├── mlp.py                         # Feed-forward networks
+│   ├── mlp.py                         # Feed-forward networks (SwiGLU)
+│   ├── engram.py                      # Engram (N-gram conditional memory)
 │   ├── normalization.py               # RMSNorm, DynamicTanh
 │   └── positional_encoding.py         # RoPE implementation
 ├── data/
 │   └── data_loader_packed.py          # Packed sequence data loader
 ├── optimization/
 │   ├── fp8_native.py                  # Native PyTorch FP8 implementation
-│   └── fp8_trainer.py                 # Legacy FP8 optimizers (deprecated)
+│   ├── mup.py                         # μP (Maximal Update Parametrization)
+│   ├── progressive.py                 # Progressive sequence length training
+│   └── swa.py                         # EMA model wrapper
 └── scripts/
-    └── train_swa_mla.sh               # Training launch script
+    ├── train.sh                       # Consolidated training script
+    └── train_unified.sh               # Reference implementation with all features
 ```
 
 ## Model Configuration
@@ -140,10 +152,9 @@ Defined in `create_swa_mla_model()` ([models/swa_mla_model.py:448-469](models/sw
 
 ### Critical Parameters
 
-**SWA Configuration**:
-- `swa_window`: Window size for sliding attention (default: 256)
-- `swa_sink_size`: Number of initial tokens always attended to (default: 4)
-- Important: The attention sink prevents loss instability by maintaining access to early tokens
+**DeltaNet Configuration**:
+- `deltanet_latent_dim`: Latent dimension for Q/K/V compression (default: 0 = disabled)
+- `deltanet_share_qk`: Share Q and K projections (default: false)
 
 **MLA Configuration**:
 - `mla_kv_lora_rank`: KV compression rank (default: 256) - higher = more capacity, more memory
@@ -151,7 +162,7 @@ Defined in `create_swa_mla_model()` ([models/swa_mla_model.py:448-469](models/sw
 - Head dimensions must satisfy: `n_embd` is compatible with the head configuration
 
 **Training Stability**:
-- `grad_clip`: Always use 1.0 for SWA-MLA (essential for stability)
+- `grad_clip`: Always use 1.0 for DeltaNet-MLA (essential for stability)
 - `warmup_iters`: Minimum 400 iterations recommended
 - `learning_rate`: Start with 1e-4, adjust based on model size
 
@@ -179,7 +190,7 @@ The training script **enables TF32 by default** on supported GPUs for optimal pe
 
 ```bash
 # TF32 is automatically enabled
-./scripts/train_swa_mla.sh small 8 2048
+./scripts/train.sh --preset base 8 2048
 ```
 
 #### Disabling TF32 (Full IEEE FP32 Precision)
@@ -241,7 +252,7 @@ RuntimeError: you have used mix of the legacy and new APIs to set the TF32 statu
 ### Accuracy Considerations
 
 **When TF32 is safe to use:**
-- Large language model training (like SWA-MLA)
+- Large language model training (like DeltaNet-MLA)
 - Most deep learning workloads
 - When ~2 orders of magnitude larger relative error vs FP64 is acceptable
 
@@ -278,7 +289,7 @@ TF32 works seamlessly with other optimizations:
 
 ```bash
 # TF32 + FP8 training (maximum speed on H100/H200)
-./scripts/train_swa_mla.sh small 8 2048  # Both auto-enabled
+./scripts/train.sh --preset base 8 2048  # Both auto-enabled
 
 # TF32 + torch.compile (recommended for production)
 python train.py --size small --compile
@@ -299,7 +310,7 @@ The training script **automatically detects available GPUs** and launches the ap
 
 ### How It Works
 
-The shell script [scripts/train_swa_mla.sh](scripts/train_swa_mla.sh) uses `nvidia-smi` to detect GPUs:
+The shell script [scripts/train.sh](scripts/train.sh) uses `nvidia-smi` to detect GPUs:
 
 ```bash
 # Auto-detect number of GPUs
@@ -323,7 +334,7 @@ Just run the script normally - it will automatically use all available GPUs:
 
 ```bash
 # Automatically uses all GPUs if multiple are detected
-./scripts/train_swa_mla.sh small 8 2048
+./scripts/train.sh --preset base 8 2048
 
 # The script will print:
 # "Detected GPUs: N"
@@ -337,10 +348,10 @@ If you need manual control over GPU selection:
 
 ```bash
 # Use specific GPUs via CUDA_VISIBLE_DEVICES
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./scripts/train_swa_mla.sh medium 4 2048
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./scripts/train.sh --preset moe 4 2048
 
 # Use only GPU 0
-CUDA_VISIBLE_DEVICES=0 ./scripts/train_swa_mla.sh small 16 2048
+CUDA_VISIBLE_DEVICES=0 ./scripts/train.sh --preset base 16 2048
 
 # Manual torchrun launch
 torchrun --nproc_per_node=8 train.py --size large --batch_size 2
@@ -400,13 +411,11 @@ Implemented in `configure_optimizer()` ([train.py:80-119](train.py#L80-L119)):
 
 ## Important Implementation Details
 
-### Attention Sink Pattern
-SWA blocks use an "attention sink" ([models/attention.py](models/attention.py)):
-```python
-# First swa_sink_size tokens are always attended to
-# Prevents catastrophic forgetting of early context
-```
-This is critical for training stability and must not be removed.
+### DeltaNet Linear Attention
+DeltaNet blocks use O(n) linear attention via the `fla` library. The implementation supports:
+- Gated linear attention with recurrent state
+- Optional latent compression for parameter efficiency
+- Q/K sharing for further compression
 
 ### RoPE Frequency Computation
 Precomputed once in model init ([models/swa_mla_model.py:213-233](models/swa_mla_model.py#L213-L233)):
@@ -439,7 +448,7 @@ Key implementation details:
 ## Native FP8 Training Guide
 
 ### Overview
-The SWA-MLA model uses a **custom native FP8 implementation** built on PyTorch's `float8_e4m3fn` type and `_scaled_mm` function. This provides fine-grained control over FP8 quantization while maintaining compatibility with standard PyTorch training workflows.
+The DeltaNet-MLA model uses a **custom native FP8 implementation** built on PyTorch's `float8_e4m3fn` type and `_scaled_mm` function. This provides fine-grained control over FP8 quantization while maintaining compatibility with standard PyTorch training workflows.
 
 ### Key Features
 - **Custom autograd**: FP8LinearFunction with manual forward/backward passes
@@ -492,7 +501,7 @@ scaler.update()
 ```
 
 #### What Gets Converted to FP8
-- ✅ Linear layers in SWA attention (Q, K, V, output projections)
+- ✅ Linear layers in DeltaNet attention (Q, K, V, output projections)
 - ✅ Linear layers in MLA attention (Q, K, V, LoRA projections)
 - ✅ MLP feed-forward layers (gate_up_proj, down_proj)
 - ❌ **lm_head** - Excluded (vocab_size not divisible by 16)
@@ -576,7 +585,7 @@ See [optimization/fp8_native.py](optimization/fp8_native.py) for the full implem
 5. Use `--use_fp8` on H100/H200
 
 **NaN Loss**:
-1. Verify `--grad_clip 1.0` is set (critical for SWA-MLA)
+1. Verify `--grad_clip 1.0` is set (critical for DeltaNet-MLA)
 2. Reduce `--learning_rate`
 3. Increase `--warmup_iters`
 4. Check data quality (run test_setup.py)
@@ -607,7 +616,7 @@ This codebase is **completely self-contained**:
 
 ### When Adding Features:
 1. Maintain self-contained nature - no external project dependencies
-2. Preserve the hybrid SWA+MLA architecture pattern
+2. Preserve the hybrid DeltaNet+MLA architecture pattern
 3. Keep FP8 compatibility in mind
 4. Test with `test_setup.py` after changes
 5. Update model parameter counts if architecture changes
@@ -642,10 +651,29 @@ Configuration in SWAMLAConfig:
 - `use_engram`: Enable/disable
 - `engram_layers`: Layer indices (default: [2, 6])
 - `engram_d_mem`: Memory dimension (default: 512)
-- `engram_n_hash_heads`: Hash heads per N-gram order (default: 4)
+- `engram_n_hash_heads`: Hash heads per N-gram order (default: 8, paper: K=8)
 - `engram_ngram_orders`: N-gram orders (default: [2, 3])
 
-Training script: `./scripts/train_swa_mla_engram.sh`
+Training script: `./scripts/train.sh --preset engram-moe`
+
+### Paper-Aligned Settings (arXiv 2601.07372)
+- Hash heads: K=8 per N-gram order (not 4) for collision attenuation
+- Tokenizer compression: NFKC + NFD + accent removal + lowercase (café → cafe)
+- Table sizing: vocab_size * 5 distributed across all tables (use `vocab_size` param in EngramTableConfig)
+- LR multiplier: 5x for embedding tables, no weight decay
+
+### Engram Metrics Logging
+Call `engram.get_metrics()` after forward pass to get:
+- `engram/gate_mean`: Mean norm of gated values
+- `engram/gate_std`: Std dev of gate norms
+- `engram/activation_rate`: Proportion of gates with normalized norm > 0.5
+- `engram/memory_norm`: Mean norm of retrieved memory embeddings
+
+### Testing Engram Components
+Run tests from models directory to avoid import issues:
+```bash
+cd models && python -c "from engram import EngramTableConfig; ..."
+```
 
 ## Critical Code Patterns
 
@@ -653,8 +681,8 @@ Training script: `./scripts/train_swa_mla_engram.sh`
 In `SWAMLAModel.forward()` ([models/swa_mla_model.py:326-333](models/swa_mla_model.py#L326-L333)):
 ```python
 for block in self.transformer.h:
-    if isinstance(block, SWALocalBlock):
-        x = block(x)  # SWA blocks don't need freqs_cis
+    if isinstance(block, GatedDeltaNetBlock):
+        x = block(x)  # DeltaNet blocks handle their own attention
     elif isinstance(block, (MLASelectiveBlock, MLABlock)):
         x = block(x, 0, freqs_cis, mask)  # MLA blocks need RoPE freqs
 ```
@@ -686,7 +714,50 @@ The following instructions from the user's global configuration apply to this pr
 2. **Go deep on problems**: If a model is intended to work in a certain way, follow the rules and specifications exactly. Don't change to something simpler just because it's difficult to implement.
 
 These principles are especially important for this project because:
-- The hybrid SWA+MLA architecture has precise mathematical requirements
+- The hybrid DeltaNet+MLA architecture has precise mathematical requirements
 - The attention sink pattern is critical for stability
 - FP8 integration requires exact dtype management
 - The cyclic block pattern must be preserved exactly
+
+## Shell Script Patterns
+
+### Argument Quoting in Training Scripts
+When building argument strings with variables, avoid nested quotes that get passed literally:
+```bash
+# WRONG - quotes become part of the value
+ARGS="--schedule \"$SCHEDULE\""  # Results in: --schedule "512:500M"
+
+# CORRECT - no nested quotes needed
+ARGS="--schedule $SCHEDULE"      # Results in: --schedule 512:500M
+```
+
+## Unified Training Script
+
+`scripts/train_unified.sh` combines all features:
+- μP, Progressive Training, EMA (from mup-progressive-swa worktree)
+- Engram, LatentMoE, DeltaNet (from main)
+
+Toggle features via environment variables:
+```bash
+USE_MUP=false USE_PROGRESSIVE=false ./scripts/train_unified.sh 8 2048
+```
+
+## Varlen Attention (PyTorch 2.10+)
+
+`--use_varlen_attn` enables variable-length attention without padding waste:
+- Data loader returns `cu_seqlens` (cumulative document lengths) and `max_seqlen`
+- Metadata flows: batch → train.py → SWAMLAModel → MLABlock → MLA
+- Only affects MLA blocks (DeltaNet blocks use their own linear attention)
+
+## Adding New Attention Features
+
+When adding new attention backends or features that need batch metadata:
+1. Add config field to `SWAMLAConfig` in `models/swa_mla_model.py`
+2. Add import/availability check in `models/mla.py`
+3. Update `MLA.__init__()` to read config
+4. Update `MLA.forward()` signature and implementation
+5. Update `MLABlock._attn_block()` and `MLABlock.forward()` to pass through
+6. Update `SWAMLAModel.forward()` signature and block calls
+7. Add CLI argument in `train.py` argparser
+8. Add to model_kwargs dict in `train.py`
+9. Extract from batch and pass in training/validation loops

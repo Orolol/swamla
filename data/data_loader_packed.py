@@ -3,7 +3,7 @@ import time
 import random
 import threading
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import signal
 import atexit
 import weakref
@@ -215,22 +215,30 @@ class PackedFinewebDataset(IterableDataset):
             start = end
         return chunks
 
-    def _fill_sequence(self, docs: deque) -> torch.Tensor:
-        # Returns 1D tensor length = max_length
+    def _fill_sequence(self, docs: deque) -> Tuple[torch.Tensor, List[int]]:
+        """
+        Fill a sequence with documents from the buffer.
+
+        Returns:
+            out: 1D tensor of length max_length with packed documents
+            doc_lengths: List of document lengths packed into this sequence
+        """
         out = torch.full((self.max_length,), self.pad_id, dtype=torch.long)
+        doc_lengths = []
         pos = 0
         while docs and pos < self.max_length:
             cur = docs[0]
             remaining = self.max_length - pos
             if cur.numel() <= remaining:
                 out[pos : pos + cur.numel()] = cur
+                doc_lengths.append(cur.numel())
                 pos += cur.numel()
                 docs.popleft()
             else:
                 # Do not split the current document/chunk across sequences.
                 # Finish this sequence (leave remaining padded) and keep the full chunk for the next sequence.
                 break
-        return out
+        return out, doc_lengths
 
     def _build_batch(self, docs_buffer: deque) -> Optional[Dict[str, torch.Tensor]]:
         if len(docs_buffer) == 0:
@@ -239,10 +247,18 @@ class PackedFinewebDataset(IterableDataset):
         input_ids = torch.full((self.batch_size, self.max_length), self.pad_id, dtype=torch.long)
         attention_mask = torch.zeros((self.batch_size, self.max_length), dtype=torch.long)
 
+        # Track document lengths per sequence for varlen_attn
+        all_doc_lengths: List[List[int]] = []
+        max_seqlen = 0
+
         for i in range(self.batch_size):
-            seq = self._fill_sequence(docs_buffer)
+            seq, doc_lengths = self._fill_sequence(docs_buffer)
             input_ids[i] = seq
             attention_mask[i] = (seq != self.pad_id).long()
+            all_doc_lengths.append(doc_lengths)
+            # Track max document length across entire batch
+            if doc_lengths:
+                max_seqlen = max(max_seqlen, max(doc_lengths))
 
         labels = input_ids.clone()
         labels[:, :-1] = input_ids[:, 1:]
@@ -257,11 +273,21 @@ class PackedFinewebDataset(IterableDataset):
         if self.stats["total_tokens"] > 0:
             self.stats["avg_padding_ratio"] = self.stats["total_padding"] / self.stats["total_tokens"]
 
+        # Build cu_seqlens for varlen_attn: cumulative sum of document lengths
+        # For a batch with documents [d1, d2, d3] per sequence, cu_seqlens = [0, d1, d1+d2, d1+d2+d3]
+        # We flatten all documents across the batch for packed varlen attention
+        cu_seqlens = [0]
+        for doc_lengths in all_doc_lengths:
+            for doc_len in doc_lengths:
+                cu_seqlens.append(cu_seqlens[-1] + doc_len)
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+
         # Pin memory for faster CPU->GPU transfer
         if self.pin_memory:
             input_ids = input_ids.pin_memory()
             attention_mask = attention_mask.pin_memory()
             labels = labels.pin_memory()
+            cu_seqlens = cu_seqlens.pin_memory()
 
         return {
             "input_ids": input_ids.contiguous(),  # [B, L]
@@ -269,6 +295,9 @@ class PackedFinewebDataset(IterableDataset):
             "decoder_input_ids": input_ids.clone().contiguous(),
             "decoder_attention_mask": attention_mask.clone().contiguous(),
             "labels": labels.contiguous(),
+            # Varlen attention metadata
+            "cu_seqlens": cu_seqlens.contiguous(),  # [num_docs + 1]
+            "max_seqlen": max_seqlen,  # scalar
         }
 
     def _producer(self):

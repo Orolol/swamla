@@ -362,7 +362,7 @@ Hybrid architecture combining:
 ## Model Configuration
 - Size: {config_args.get('size', 'unknown')}
 - Block size (context length): {config_args.get('block_size', 'unknown')}
-- SWA layers per cycle: {config_args.get('swa_layers_per_cycle', 'unknown')}
+- Local layers per cycle: {config_args.get('local_layers_per_cycle', 'unknown')}
 - MLA layers per cycle: {config_args.get('mla_layers_per_cycle', 'unknown')}
 - SWA window size: {config_args.get('swa_window', 'unknown')}
 - MLA KV LoRA rank: {config_args.get('mla_kv_lora_rank', 'unknown')}
@@ -537,7 +537,7 @@ def train(args):
         vocab_size=model_vocab_size,
         block_size=args.block_size,
         dropout=args.dropout,
-        swa_layers_per_cycle=args.swa_layers_per_cycle,
+        local_layers_per_cycle=args.local_layers_per_cycle,
         mla_layers_per_cycle=args.mla_layers_per_cycle,
         swa_window=args.swa_window,
         swa_sink_size=args.swa_sink_size,
@@ -1038,7 +1038,8 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.0)
 
     # SWA-MLA specific parameters
-    parser.add_argument('--swa_layers_per_cycle', type=int, default=2)
+    parser.add_argument('--local_layers_per_cycle', '--swa_layers_per_cycle', type=int, default=2,
+                        dest='local_layers_per_cycle')
     parser.add_argument('--mla_layers_per_cycle', type=int, default=1)
     parser.add_argument('--swa_window', type=int, default=256)
     parser.add_argument('--swa_sink_size', type=int, default=4)

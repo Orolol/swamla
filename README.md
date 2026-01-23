@@ -55,14 +55,14 @@ pip install fla
 
 ```bash
 # Train with defaults (auto-detects GPUs, uses DDP if multiple)
-./scripts/train_swa_mla_latent_deltanet.sh 8 2048
+./scripts/train.sh --preset engram-moe 8 2048
 
 # Custom output directory
-./scripts/train_swa_mla_latent_deltanet.sh 8 2048 outputs/my_model
+./scripts/train.sh --preset engram-moe 8 2048 outputs/my_model
 
 # With HuggingFace auto-push
 export HF_TOKEN="your_token"
-./scripts/train_swa_mla_latent_deltanet.sh 8 2048 outputs/my_model false muon "YourUser/your-repo"
+./scripts/train.sh --preset engram-moe 8 2048 outputs/my_model false muon "YourUser/your-repo"
 ```
 
 ### Advanced Training
@@ -86,7 +86,7 @@ python train.py \
 
 ```bash
 # Auto-detected by the script
-./scripts/train_swa_mla_latent_deltanet.sh 8 2048
+./scripts/train.sh --preset engram-moe 8 2048
 
 # Or manual with torchrun
 torchrun --nproc_per_node=4 train.py \
@@ -109,7 +109,7 @@ torchrun --nproc_per_node=4 train.py \
 
 ### DeltaNet Parameters
 
-- `--swa_layers_per_cycle`: DeltaNet blocks per cycle (default: 2)
+- `--local_layers_per_cycle`: DeltaNet blocks per cycle (default: 2)
 - `--deltanet_latent_dim`: Latent dimension for projections (0=disabled, default: 256)
 - `--deltanet_share_qk`: Share Q/K projection (K is normalized Q)
 

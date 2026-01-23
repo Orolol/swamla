@@ -78,15 +78,30 @@ except ImportError:
 # For context manager fallback
 from contextlib import nullcontext
 
-# μP, Progressive Training, and EMA imports
+# μP imports
+MUP_AVAILABLE = False
 try:
     sys.path.insert(0, str(Path(__file__).parent / 'optimization'))
     from mup import MuPConfig, mup_init, configure_mup_optimizer, mup_scale_output
-    from progressive import ProgressiveScheduler
-    from swa import EMAModel
     MUP_AVAILABLE = True
 except ImportError:
-    MUP_AVAILABLE = False
+    pass
+
+# Progressive Training imports (independent of μP)
+PROGRESSIVE_AVAILABLE = False
+try:
+    from progressive import ProgressiveScheduler
+    PROGRESSIVE_AVAILABLE = True
+except ImportError:
+    pass
+
+# EMA imports (independent of μP)
+EMA_AVAILABLE = False
+try:
+    from swa import EMAModel
+    EMA_AVAILABLE = True
+except ImportError:
+    pass
 
 
 def setup_distributed():
@@ -139,7 +154,7 @@ def print_training_banner(args, model, world_size, device, resume_step=0, resume
     print("═" * 70)
 
     # Model line
-    arch_pattern = f"{args.swa_layers_per_cycle}×DeltaNet + {args.mla_layers_per_cycle}×MLA"
+    arch_pattern = f"{args.local_layers_per_cycle}×DeltaNet + {args.mla_layers_per_cycle}×MLA"
     print(f"  Model: {args.size} ({format_params(total_params)} params) │ {arch_pattern}")
 
     # MoE line if enabled
@@ -558,7 +573,7 @@ Hybrid architecture combining:
 ## Model Configuration
 - Size: {config_args.get('size', 'unknown')}
 - Block size (context length): {config_args.get('block_size', 'unknown')}
-- DeltaNet layers per cycle: {config_args.get('swa_layers_per_cycle', 'unknown')}
+- DeltaNet layers per cycle: {config_args.get('local_layers_per_cycle', 'unknown')}
 - MLA layers per cycle: {config_args.get('mla_layers_per_cycle', 'unknown')}
 - MLA KV LoRA rank: {config_args.get('mla_kv_lora_rank', 'unknown')}
 
@@ -751,7 +766,7 @@ def train(args):
         vocab_size=vocab_size,
         block_size=args.block_size,
         dropout=args.dropout,
-        swa_layers_per_cycle=args.swa_layers_per_cycle,
+        local_layers_per_cycle=args.local_layers_per_cycle,
         mla_layers_per_cycle=args.mla_layers_per_cycle,
         q_lora_rank=args.mla_q_lora_rank,
         kv_lora_rank=args.mla_kv_lora_rank,
@@ -761,6 +776,7 @@ def train(args):
         use_gradient_checkpointing=args.gradient_checkpointing,
         # Attention backend options
         use_flash_attention=args.use_flash_attention,
+        use_varlen_attn=args.use_varlen_attn,
         use_triton_mla=args.use_triton_mla,
         use_triton_kernels=args.use_triton_kernels,
         use_gated_deltanet=args.use_gated_deltanet,
@@ -844,7 +860,7 @@ def train(args):
 
     # Initialize Progressive Scheduler if enabled
     progressive = None
-    if args.use_progressive and MUP_AVAILABLE:
+    if args.use_progressive and PROGRESSIVE_AVAILABLE:
         progressive = ProgressiveScheduler.from_schedule(
             args.progressive_schedule,
             base_batch_size=args.batch_size,
@@ -855,7 +871,7 @@ def train(args):
 
     # Initialize EMA if enabled
     ema = None
-    if args.use_ema and MUP_AVAILABLE:
+    if args.use_ema and EMA_AVAILABLE:
         ema = EMAModel(model, decay=args.ema_decay)
         if rank == 0:
             print(f"EMA enabled: decay={args.ema_decay}")
@@ -1119,6 +1135,13 @@ def train(args):
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
+            # Extract varlen metadata if available
+            cu_seqlens = None
+            max_seqlen = None
+            if args.use_varlen_attn and 'cu_seqlens' in batch:
+                cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
+                max_seqlen = batch.get('max_seqlen', None)
+
             # Create FP8 autocast context if enabled
             # For DDP, pass fp8_group for synchronized scaling across GPUs
             fp8_group = dist.group.WORLD if is_ddp and args.use_fp8 else None
@@ -1160,7 +1183,12 @@ def train(args):
                         )
                     else:
                         # Standard AR training
-                        logits, loss = model(input_ids, targets=labels)
+                        logits, loss = model(
+                            input_ids,
+                            targets=labels,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=max_seqlen,
+                        )
 
                     # Add MoE auxiliary loss if model has MoE layers
                     if hasattr(raw_model, 'get_moe_aux_loss'):
@@ -1282,6 +1310,13 @@ def train(args):
                     input_ids = batch['input_ids'].to(device, non_blocking=True)
                     labels = batch['labels'].to(device, non_blocking=True)
 
+                    # Extract varlen metadata if available
+                    val_cu_seqlens = None
+                    val_max_seqlen = None
+                    if args.use_varlen_attn and 'cu_seqlens' in batch:
+                        val_cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
+                        val_max_seqlen = batch.get('max_seqlen', None)
+
                     # FP8 context for validation (no DDP sync needed in eval)
                     val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if args.use_fp8 else nullcontext()
 
@@ -1315,7 +1350,12 @@ def train(args):
                                     wedlm_config.block_size,
                                 )
                             else:
-                                logits, loss = model(input_ids, targets=labels)
+                                logits, loss = model(
+                                    input_ids,
+                                    targets=labels,
+                                    cu_seqlens=val_cu_seqlens,
+                                    max_seqlen=val_max_seqlen,
+                                )
 
                     val_loss += loss.item()
 
@@ -1380,11 +1420,11 @@ def train(args):
                 config_dict['wedlm_mask_token_id'] = mask_token_id
 
             checkpoint = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer_state,
+                'model_state_dict': raw_model.state_dict(),
+                'optimizer_state_dict': optimizer_state,
                 'step': step,
                 'config': config_dict,
-                'total_tokens_seen': total_tokens_seen,
+                'total_tokens': total_tokens_seen,
             }
 
             # Save EMA state if enabled
@@ -1469,7 +1509,8 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.0)
 
     # DeltaNet-MLA architecture parameters
-    parser.add_argument('--swa_layers_per_cycle', type=int, default=2, help='DeltaNet blocks per cycle')
+    parser.add_argument('--local_layers_per_cycle', '--swa_layers_per_cycle', type=int, default=2,
+                        help='DeltaNet/local attention blocks per cycle', dest='local_layers_per_cycle')
     parser.add_argument('--mla_layers_per_cycle', type=int, default=1, help='MLA blocks per cycle')
     parser.add_argument('--mla_q_lora_rank', type=int, default=0, help='MLA Q LoRA rank (0=disabled)')
     parser.add_argument('--mla_kv_lora_rank', type=int, default=256, help='MLA KV LoRA rank')
@@ -1480,6 +1521,8 @@ def main():
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action='store_true', default=True,
                         help='Use Flash Attention for MLA blocks')
+    parser.add_argument('--use_varlen_attn', action='store_true', default=False,
+                        help='Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
     parser.add_argument('--use_triton_kernels', action='store_true', default=True,

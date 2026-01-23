@@ -272,7 +272,7 @@ class TestSWAMLAWithMemory:
             n_layer=4,
             n_head=4,
             n_embd=128,
-            swa_layers_per_cycle=2,
+            local_layers_per_cycle=2,
             mla_layers_per_cycle=1,
             kv_lora_rank=32,
             use_neural_memory=True,

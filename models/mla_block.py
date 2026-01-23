@@ -74,16 +74,16 @@ class MLABlock(nn.Module):
             return self.engram(x, input_ids)
         return torch.zeros_like(x)
 
-    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None):
+    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, cu_seqlens=None, max_seqlen=None):
         """Attention portion of the block with appropriate normalization"""
         x_norm = self.attn_norm(x)
-        return self.attn(x_norm, start_pos, freqs_cis, mask, position_ids=position_ids)
+        return self.attn(x_norm, start_pos, freqs_cis, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
     def _ffn_block(self, x):
         """Feed-forward portion of the block with appropriate normalization"""
         return self.ffn(self.ffn_norm(x))
 
-    def forward(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, input_ids=None):
+    def forward(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, input_ids=None, cu_seqlens=None, max_seqlen=None):
         """
         Forward pass for the MLABlock.
 
@@ -94,6 +94,8 @@ class MLABlock(nn.Module):
             mask (torch.Tensor, optional): Attention mask tensor. Defaults to None.
             position_ids (torch.Tensor, optional): Explicit position IDs for WeDLM. Defaults to None.
             input_ids (torch.Tensor, optional): Original token IDs for Engram lookup. Defaults to None.
+            cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths for varlen_attn. Defaults to None.
+            max_seqlen (int, optional): Maximum sequence length for varlen_attn. Defaults to None.
 
         Returns:
             torch.Tensor: Processed tensor with same shape as input
@@ -129,6 +131,8 @@ class MLABlock(nn.Module):
                     freqs_cis,
                     mask,
                     position_ids,
+                    cu_seqlens,
+                    max_seqlen,
                     use_te_fp8=True
                 )
             else:
@@ -139,6 +143,8 @@ class MLABlock(nn.Module):
                     freqs_cis,
                     mask,
                     position_ids,
+                    cu_seqlens,
+                    max_seqlen,
                     use_reentrant=False
                 )
             # First residual connection
@@ -158,7 +164,7 @@ class MLABlock(nn.Module):
         else:
             # Standard forward pass without checkpoint
             # First residual connection
-            x = x + self._attn_block(x, start_pos, freqs_cis, mask, position_ids)
+            x = x + self._attn_block(x, start_pos, freqs_cis, mask, position_ids, cu_seqlens, max_seqlen)
             # Second residual connection
             x = x + self._ffn_block(x)
 

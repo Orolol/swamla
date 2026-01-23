@@ -64,7 +64,7 @@ if [ $NUM_GPUS -gt 1 ]; then
     --grad_clip 1.0 \
     --gradient_accumulation_steps 1 \
     --num_workers 8 \
-    --swa_layers_per_cycle 2 \
+    --local_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
     --swa_window 256 \
     --swa_sink_size 4 \
@@ -98,7 +98,7 @@ else
     --grad_clip 1.0 \
     --gradient_accumulation_steps 1 \
     --num_workers 8 \
-    --swa_layers_per_cycle 2 \
+    --local_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
     --swa_window 256 \
     --swa_sink_size 4 \

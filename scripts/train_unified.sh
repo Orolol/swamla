@@ -250,7 +250,7 @@ fi
 # Progressive Training
 PROGRESSIVE_ARGS=""
 if [ "$USE_PROGRESSIVE" = "true" ]; then
-    PROGRESSIVE_ARGS="--use_progressive --progressive_schedule \"$PROGRESSIVE_SCHEDULE\""
+    PROGRESSIVE_ARGS="--use_progressive --progressive_schedule $PROGRESSIVE_SCHEDULE"
 fi
 
 # EMA
@@ -302,7 +302,7 @@ COMMON_ARGS="--size engram-moe-1b \
     --gradient_accumulation_steps 1 \
     --gradient_checkpointing \
     --num_workers 8 \
-    --swa_layers_per_cycle 2 \
+    --local_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
     --mla_q_lora_rank $MLA_Q_LORA_RANK \
     --mla_kv_lora_rank 256 \

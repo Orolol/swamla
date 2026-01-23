@@ -32,7 +32,7 @@ def verify_scaling():
         n_head=4,
         swa_window=base_window,
         kv_lora_rank=base_rank,
-        swa_layers_per_cycle=1,
+        local_layers_per_cycle=1,
         mla_layers_per_cycle=1
     )
     

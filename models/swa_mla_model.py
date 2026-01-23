@@ -56,8 +56,8 @@ class SWAMLAConfig:
     dyt_alpha_init: float = 0.5
 
     # Architecture: DeltaNet + MLA interleaving
-    swa_layers_per_cycle: int = 2  # DeltaNet blocks per cycle (kept name for compatibility)
-    mla_layers_per_cycle: int = 1  # MLA blocks per cycle
+    local_layers_per_cycle: int = 2  # DeltaNet blocks per cycle (local attention)
+    mla_layers_per_cycle: int = 1  # MLA blocks per cycle (global attention)
     rope_theta: float = 10000.0
 
     # MLA specific parameters
@@ -74,6 +74,10 @@ class SWAMLAConfig:
 
     # Flash Attention for MLA blocks
     use_flash_attention: bool = True
+
+    # Variable-length attention (PyTorch 2.10+)
+    # Eliminates padding waste for packed sequences with document boundaries
+    use_varlen_attn: bool = False
 
     # Custom Triton MLA kernel (H100 compatible alternative to FA2)
     # Use this when FA2 causes CUDA graph issues with torch.compile on H100
@@ -104,10 +108,6 @@ class SWAMLAConfig:
     latent_n_experts: Optional[int] = None  # Override: total experts for LatentMoE
     latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
     latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
-    resume_from: Optional[str] = None # Checkpoint to resume from
-    use_wedlm: bool = False  # WeDLM (Weight-Decomposed Linear Module) for memory efficiency
-    wedlm_min_mask_ratio: float = 0.5  # Minimum ratio of tokens to mask in WeDLM
-    wedlm_max_mask_ratio: float = 0.8  # Maximum ratio of tokens to mask in WeDLM
 
     # Transformer Engine FP8 training
     use_te_fp8: bool = False  # Use TE Linear layers for FP8 training (requires transformer-engine)
@@ -139,10 +139,21 @@ class SWAMLAConfig:
     def __post_init__(self) -> None:
         if self.expert_dim is None:
             self.expert_dim = self.n_embd
-        if self.swa_layers_per_cycle < 0 or self.mla_layers_per_cycle < 0:
+        if self.local_layers_per_cycle < 0 or self.mla_layers_per_cycle < 0:
             raise ValueError("Layer counts per cycle must be non-negative")
-        if self.swa_layers_per_cycle + self.mla_layers_per_cycle == 0:
+        if self.local_layers_per_cycle + self.mla_layers_per_cycle == 0:
             raise ValueError("At least one DeltaNet or MLA layer per cycle is required")
+
+    @property
+    def swa_layers_per_cycle(self) -> int:
+        """Deprecated alias for local_layers_per_cycle. Use local_layers_per_cycle instead."""
+        import warnings
+        warnings.warn(
+            "swa_layers_per_cycle is deprecated, use local_layers_per_cycle instead",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return self.local_layers_per_cycle
 
 
 class SWAMLAModel(nn.Module):
@@ -194,8 +205,8 @@ class SWAMLAModel(nn.Module):
         )
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-        cycle_len = config.swa_layers_per_cycle + config.mla_layers_per_cycle
-        deltanet_per_cycle = config.swa_layers_per_cycle
+        cycle_len = config.local_layers_per_cycle + config.mla_layers_per_cycle
+        deltanet_per_cycle = config.local_layers_per_cycle
 
         for layer_idx in range(config.n_layer):
             # Calculate scaling factor for this layer: 0.5x at first layer to 2.0x at last layer
@@ -310,6 +321,8 @@ class SWAMLAModel(nn.Module):
         return_all_logits: bool = False,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask_2d: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ):
         """Forward pass.
 
@@ -323,6 +336,9 @@ class SWAMLAModel(nn.Module):
             attention_mask_2d: Custom 2D attention mask [S, S] or [B, S, S].
                 If provided, overrides the default causal mask.
                 Used for WeDLM dual-stream masking.
+            cu_seqlens: Cumulative sequence lengths for varlen_attn [num_docs + 1].
+                Used for variable-length attention without padding waste.
+            max_seqlen: Maximum sequence length in the batch for varlen_attn.
 
         Returns:
             (logits, loss) tuple
@@ -378,8 +394,8 @@ class SWAMLAModel(nn.Module):
                 else:
                     x = block(x)
             elif isinstance(block, MLABlock):
-                # MLA: pass position_ids for WeDLM and input_ids for Engram
-                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx)
+                # MLA: pass position_ids for WeDLM, input_ids for Engram, and varlen metadata
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)
@@ -598,18 +614,18 @@ def create_swa_mla_model(
         # MoE presets - params are total, active params are much smaller
         "moe-1b": dict(  # ~770M total, ~250M active
             n_layer=12, n_embd=1024, n_head=12,
-            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            local_layers_per_cycle=2, mla_layers_per_cycle=1,
             use_moe=True, n_experts=32, n_shared_experts=1, n_activated=2, expert_dim=512 * 2,
         ),
         "moe-2b": dict(  # ~1.5B total, ~400M active
             n_layer=18, n_embd=1024, n_head=16,
-            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            local_layers_per_cycle=2, mla_layers_per_cycle=1,
             use_moe=True, n_experts=32, n_shared_experts=1, n_activated=3, expert_dim=1024 * 3,
         ),
         # Engram+MoE preset - MoE with N-gram conditional memory
         "engram-moe-1b": dict(  # MoE + Engram for N-gram memory lookup
             n_layer=12, n_embd=1024, n_head=12,
-            swa_layers_per_cycle=2, mla_layers_per_cycle=1,
+            local_layers_per_cycle=2, mla_layers_per_cycle=1,
             use_moe=True, n_experts=64, n_shared_experts=1, n_activated=2, expert_dim=512 * 2,
             use_engram=True,
             engram_layers=[2, 6],  # Apply Engram at layers 2 and 6
@@ -646,8 +662,27 @@ def create_swa_mla_model(
     cfg_kwargs.pop("compile_mode", None)
     cfg_kwargs.pop("use_tensorboard", None)
     cfg_kwargs.pop("use_fp8", None)
+    # WeDLM parameters are handled in train.py, not in model config
+    cfg_kwargs.pop("use_wedlm", None)
     cfg_kwargs.pop("wedlm_block_size", None)
+    cfg_kwargs.pop("wedlm_min_mask_ratio", None)
+    cfg_kwargs.pop("wedlm_max_mask_ratio", None)
     cfg_kwargs.pop("wedlm_ar_loss_weight", None)
     cfg_kwargs.pop("wedlm_mask_token_id", None)
+    # resume_from is handled in train.py, not in model config
+    cfg_kwargs.pop("resume_from", None)
+    cfg_kwargs.pop("resume_from_hf", None)
+    # Backward compatibility: map swa_layers_per_cycle to local_layers_per_cycle
+    if "swa_layers_per_cycle" in cfg_kwargs:
+        import warnings
+        warnings.warn(
+            "swa_layers_per_cycle is deprecated, use local_layers_per_cycle instead",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        if "local_layers_per_cycle" not in cfg_kwargs:
+            cfg_kwargs["local_layers_per_cycle"] = cfg_kwargs.pop("swa_layers_per_cycle")
+        else:
+            cfg_kwargs.pop("swa_layers_per_cycle")
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)

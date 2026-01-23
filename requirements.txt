@@ -1,11 +1,23 @@
-torch>=2.0.0
+# Core dependencies
+torch>=2.10.0  # Required for varlen_attn API
 transformers>=4.30.0
 datasets>=2.14.0
+huggingface_hub>=0.16.0
+
+# Training utilities
 wandb>=0.15.0
 tensorboard>=2.13.0
+
+# Optimizers
 lion-pytorch>=0.1.2
+# Muon optimizer is native in PyTorch 2.6+, no external package needed
+
+# Quantized optimizers (optional, for memory optimization)
 bitsandbytes>=0.41.0
-huggingface_hub>=0.16.0
-transformer-engine[pytorch]>=1.0.0
+
+# Flash Linear Attention (required for GatedDeltaNet)
 flash-linear-attention
+
+# Optional: FP8 training on H100/H200 (requires CUDA 12.6+)
+# transformer-engine[pytorch]>=1.0.0
 
