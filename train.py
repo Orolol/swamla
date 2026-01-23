@@ -1045,8 +1045,9 @@ def train(args):
         next_batch = next(data_iter)
 
     # Track current progressive config for detecting changes
-    current_seq_len = args.block_size
-    current_batch_size = args.batch_size
+    # Use initial values from progressive scheduler if enabled
+    current_seq_len = initial_seq_len
+    current_batch_size = initial_batch_size
 
     for step in range(start_step, args.max_iters):
         # Progressive training: check for phase transition
