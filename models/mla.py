@@ -218,7 +218,6 @@ class MLA(nn.Module):
     
 
 
-    @torch._dynamo.disable
     def forward(
         self,
         x: torch.Tensor,
