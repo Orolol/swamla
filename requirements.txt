@@ -19,5 +19,5 @@ bitsandbytes>=0.41.0
 flash-linear-attention
 
 # Optional: FP8 training on H100/H200 (requires CUDA 12.6+)
-transformer-engine[pytorch]>=1.0.0
+transformer-engine[pytorch]>=2.0.0
 

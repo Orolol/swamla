@@ -1013,7 +1013,9 @@ def train(args):
         profiler.start()
 
     data_iter = iter(data_loader)
-    scaler = torch.amp.GradScaler('cuda', enabled=False)
+    # CRITICAL FIX: GradScaler MUST be enabled for FP8 training
+    # Without this, FP8 gradients will have incorrect magnitudes and loss won't converge
+    scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
 
     # Create a separate CUDA stream for async data prefetching
     prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -1303,6 +1305,11 @@ def train(args):
         # Validation (using next batches from same data loader)
         # Skip validation at the exact resume step to avoid immediate validation after loading
         if step % args.eval_interval == 0 and step > start_step and master_process:
+            # CRITICAL: Synchronize all DDP ranks before validation
+            # Without this, non-master ranks may timeout waiting for communication
+            if is_ddp:
+                dist.barrier()
+
             model.eval()
             val_loss = 0.0
             val_steps = 50
@@ -1413,6 +1420,11 @@ def train(args):
                     )
                 else:
                     print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
+
+            # CRITICAL: Synchronize all DDP ranks after validation
+            # Ensures all ranks continue training together
+            if is_ddp:
+                dist.barrier()
 
         # Checkpointing
         if step % args.save_interval == 0 and step > 0 and master_process:
