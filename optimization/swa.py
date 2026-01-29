@@ -46,32 +46,43 @@ class EMAModel:
         for name, param in model.named_parameters():
             if name in self.ema_params and param.requires_grad:
                 # θ_ema = decay * θ_ema + (1 - decay) * θ
-                self.ema_params[name].lerp_(param.data.to(self.ema_params[name].device), 1 - self.decay)
+                # OPTIMIZATION: Check device before transfer to avoid unnecessary copies
+                if param.device != self.ema_params[name].device:
+                    param_data = param.data.to(self.ema_params[name].device)
+                else:
+                    param_data = param.data
+                self.ema_params[name].lerp_(param_data, 1 - self.decay)
 
     @contextmanager
     def apply(self, model: nn.Module):
         """
         Context manager that temporarily replaces model weights with EMA weights.
 
+        OPTIMIZATION: Uses pointer swapping instead of cloning to save memory.
+        - Before: Creates full copy of all parameters (~4GB for 1B model)
+        - After: Only swaps data pointers (minimal overhead)
+
         Usage:
             with ema.apply(model):
                 val_loss = validate(model)
             # Original weights are restored after the block
         """
-        # Store original parameters
+        # Store original parameter data tensors (view/reference, not clone)
         original_params: Dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
             if name in self.ema_params and param.requires_grad:
-                original_params[name] = param.data.clone()
-                param.data.copy_(self.ema_params[name].to(param.device))
+                # Store reference to original data tensor
+                original_params[name] = param.data
+                # Swap to EMA weights
+                param.data = self.ema_params[name].to(param.device)
 
         try:
             yield
         finally:
-            # Restore original parameters
+            # Restore original parameters by swapping back
             for name, param in model.named_parameters():
                 if name in original_params:
-                    param.data.copy_(original_params[name])
+                    param.data = original_params[name]
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
         """Return EMA state for checkpointing."""

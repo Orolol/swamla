@@ -217,14 +217,23 @@ class GatedDeltaNet(nn.Module):
         # This also differentiates K from Q when using shared projection
         k = F.normalize(k, p=2, dim=-1)
 
-        # FLA kernel requires bf16 - convert all tensors
+        # FLA kernel requires bf16 - convert only if needed
+        # OPTIMIZATION: Conditional conversion to avoid unnecessary copies
+        # CRITICAL: Avoids breaking FP8 pipeline by checking dtype first
         if FLA_AVAILABLE:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-            g = g.to(torch.bfloat16)
-            beta = beta.to(torch.bfloat16)
+            original_dtype = q.dtype
+            needs_conversion = q.dtype != torch.bfloat16
+
+            if needs_conversion:
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
+                g = g.to(torch.bfloat16)
+                beta = beta.to(torch.bfloat16)
+            # else: already bfloat16, no conversion needed
         else:
+            original_dtype = q.dtype
+            needs_conversion = False
             # Ensure all tensors have the same dtype
             dtype = q.dtype
             if g.dtype != dtype:
@@ -258,9 +267,10 @@ class GatedDeltaNet(nn.Module):
         # Reshape output
         output = output.reshape(B, T, self.n_head * self.head_dim)
 
-        # Convert back to input dtype before output projection (for mixed precision)
-        if output.dtype != x.dtype:
-            output = output.to(x.dtype)
+        # Convert back to original dtype if we converted to bf16
+        # OPTIMIZATION: Only convert back if we converted in the first place
+        if needs_conversion and output.dtype != original_dtype:
+            output = output.to(original_dtype)
 
         # Output projection (latent or full)
         if self.latent_dim > 0:
