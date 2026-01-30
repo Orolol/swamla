@@ -475,7 +475,7 @@ class SWAMLAModel(nn.Module):
         engram_count = 0
 
         for block in self.transformer.h:
-            if isinstance(block, MLABlock) and block.engram is not None:
+            if isinstance(block, MLABlock) and getattr(block, 'has_engram', False):
                 block.engram.set_tokenizer_compression(compression)
                 engram_count += 1
 
@@ -493,7 +493,7 @@ class SWAMLAModel(nn.Module):
         """
         engram_modules = []
         for block in self.transformer.h:
-            if isinstance(block, MLABlock) and block.engram is not None:
+            if isinstance(block, MLABlock) and getattr(block, 'has_engram', False):
                 engram_modules.append((block.layer_id, block.engram))
         return engram_modules
 

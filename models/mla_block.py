@@ -61,18 +61,19 @@ class MLABlock(nn.Module):
         self.use_te_fp8 = getattr(config, 'use_te_fp8', False)
 
         # Engram: Conditional Memory via N-gram Lookup (applied BEFORE attention)
-        self.engram = None
+        # Use a bool flag instead of checking `self.engram is not None` to avoid
+        # torch.compile recompilation due to different _modules dict structures.
+        self.has_engram = False
         if getattr(config, 'use_engram', False):
             engram_layers = getattr(config, 'engram_layers', [])
             if layer_id is not None and layer_id in engram_layers:
                 from engram import create_engram_for_config
                 self.engram = create_engram_for_config(config, layer_id)
+                self.has_engram = True
 
     def _engram_block(self, x, input_ids):
         """Engram conditional memory lookup (applied BEFORE attention)"""
-        if self.engram is not None and input_ids is not None:
-            return self.engram(x, input_ids)
-        return torch.zeros_like(x)
+        return self.engram(x, input_ids)
 
     def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, cu_seqlens=None, max_seqlen=None):
         """Attention portion of the block with appropriate normalization"""
@@ -108,7 +109,7 @@ class MLABlock(nn.Module):
 
         # 1. Engram: Conditional memory lookup BEFORE attention
         # Position: H = H + Engram(H, input_ids)
-        if self.engram is not None and input_ids is not None:
+        if self.has_engram and input_ids is not None:
             if use_ckpt:
                 engram_out = checkpoint.checkpoint(
                     self._engram_block,
