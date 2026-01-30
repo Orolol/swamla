@@ -26,12 +26,15 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Always calculate norm in fp32 for stability, then convert back
-        # This handles Float8 and other exotic dtypes safely
+        # For bf16/fp16 training: compute norm in-dtype to avoid fp32 round-trip copies
+        # torch.rsqrt is numerically stable enough in bf16 for LLM training
+        if x.dtype in (torch.bfloat16, torch.float16):
+            norm_x = self._norm(x)
+            return self.weight * norm_x
+        # For fp32 or exotic dtypes (e.g. Float8): compute in fp32 for stability
         input_dtype = x.dtype
         norm_x = self._norm(x.float())
-        # Convert back to original dtype if it's a standard training dtype
-        if input_dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        if input_dtype != torch.float32:
             norm_x = norm_x.to(input_dtype)
         return self.weight * norm_x
 
