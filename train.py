@@ -222,30 +222,13 @@ def configure_tf32(enable_tf32=True, verbose=True):
     device_capability = torch.cuda.get_device_capability()
     supports_tf32 = device_capability[0] >= 8
 
-    # Detect which API is available (new fp32_precision or legacy allow_tf32)
-    # Try to access fp32_precision to check if new API exists
-    has_new_api = False
-    try:
-        # Just try to read the attribute to see if it exists
-        _ = torch.backends.cuda.matmul.fp32_precision
-        has_new_api = True
-    except AttributeError:
-        has_new_api = False
-
+    # IMPORTANT: Always use legacy API (allow_tf32) because torch.compile/inductor
+    # internally reads allow_tf32, which triggers "mixed API" error if we set
+    # fp32_precision (new API). See PyTorch issue with torch._inductor.
     if enable_tf32 and supports_tf32:
-        if has_new_api:
-            # Use ONLY new PyTorch 2.9+ API
-            # DO NOT touch allow_tf32 (legacy API) to avoid mixing
-            torch.backends.cuda.matmul.fp32_precision = "tf32"
-            torch.backends.cudnn.fp32_precision = "tf32"
-            api_used = "new API (fp32_precision)"
-            
-        else:
-            # Use ONLY legacy API for PyTorch < 2.9
-            # DO NOT touch fp32_precision to avoid mixing
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            api_used = "legacy API (allow_tf32)"
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        api_used = "legacy API (allow_tf32)"
 
         if verbose:
             print(f"✓ TF32 enabled for FP32 operations ({api_used})")
@@ -261,19 +244,11 @@ def configure_tf32(enable_tf32=True, verbose=True):
 
     else:
         # Disable TF32 for full IEEE FP32 precision
-        if has_new_api:
-            # Use ONLY new API
-            torch.backends.cuda.matmul.fp32_precision = "ieee"
-            torch.backends.cudnn.fp32_precision = "ieee"
-            api_used = "new API"
-        else:
-            # Use ONLY legacy API
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
-            api_used = "legacy API"
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
         if verbose:
-            print(f"✓ TF32 disabled - using full IEEE FP32 precision ({api_used})")
+            print("✓ TF32 disabled - using full IEEE FP32 precision")
 
 
 def get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr, stable_ratio=0.8):
