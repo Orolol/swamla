@@ -107,21 +107,10 @@ class MLABlock(nn.Module):
 
         use_ckpt = self.use_checkpoint and self.training
 
-        # 1. Engram: Conditional memory lookup BEFORE attention
-        # Position: H = H + Engram(H, input_ids)
-        if self.has_engram and input_ids is not None:
-            if use_ckpt:
-                engram_out = checkpoint.checkpoint(
-                    self._engram_block,
-                    x,
-                    input_ids,
-                    use_reentrant=False
-                )
-            else:
-                engram_out = self._engram_block(x, input_ids)
-            x = x + engram_out
+        # Note: Engram is now called from SWAMLAModel.forward() before this block,
+        # to avoid torch.compile recompilation due to different control flow paths.
 
-        # 2. Standard residual transformer block implementation
+        # Standard residual transformer block implementation
         if use_ckpt:
             # Use TE checkpoint for FP8-aware checkpointing (handles FP8 states properly)
             if self.use_te_fp8 and te_checkpoint is not None:

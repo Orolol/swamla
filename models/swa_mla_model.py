@@ -395,8 +395,11 @@ class SWAMLAModel(nn.Module):
                 else:
                     x = block(x)
             elif isinstance(block, MLABlock):
-                # MLA: pass position_ids for WeDLM, input_ids for Engram, and varlen metadata
-                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                # Engram: run BEFORE attention, outside compiled block to avoid recompilation
+                if getattr(block, 'has_engram', False) and idx is not None:
+                    x = x + block.engram(x, idx)
+                # MLA: pass position_ids for WeDLM and varlen metadata
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)
