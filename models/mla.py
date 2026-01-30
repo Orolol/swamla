@@ -132,13 +132,7 @@ class MLA(nn.Module):
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
 
         # Flash Attention support
-        # On Blackwell (sm120+), flash_attn only has sm80 CUTLASS kernels — prefer SDPA+cuDNN
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
-        if self.use_flash_attention and torch.cuda.is_available():
-            cc = torch.cuda.get_device_capability()
-            if cc[0] >= 12:  # Blackwell or newer
-                print(f"MLA: Disabling Flash Attention on sm{cc[0]}{cc[1]} (only has sm80 kernels), using SDPA+cuDNN instead")
-                self.use_flash_attention = False
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention")
 
@@ -160,15 +154,17 @@ class MLA(nn.Module):
         if self.use_varlen_attn:
             print(f"MLA: Using varlen_attn (PyTorch 2.10+)")
 
-        # cuDNN SDPA backend: native Blackwell/Hopper kernels instead of sm80 CUTLASS
-        # Enabled by default on H100+ when SDPA kernel API is available
+        # cuDNN SDPA backend: native Hopper/Blackwell kernels instead of sm80 CUTLASS
+        # Requires head_dim <= 128 (cuDNN constraint) and GPU CC >= 9.0
         self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
         if self.use_cudnn_sdpa:
-            # Check GPU compute capability at init
-            if torch.cuda.is_available():
+            if self.qk_head_dim > 128:
+                # MLA has qk_head_dim=192 (128 nope + 64 rope) which exceeds cuDNN's 128 limit
+                self.use_cudnn_sdpa = False
+            elif torch.cuda.is_available():
                 cc = torch.cuda.get_device_capability()
-                if cc[0] >= 9:  # Hopper (H100) or newer (Blackwell B200)
-                    print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]})")
+                if cc[0] >= 9:
+                    print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
                 else:
                     self.use_cudnn_sdpa = False
         
