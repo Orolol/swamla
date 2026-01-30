@@ -56,10 +56,12 @@ def fused_moe_routing(
     N = flat_indices.shape[0]
     device = flat_indices.device
 
-    # Step 1: Compute histogram using bincount (fast on GPU, no CPU sync needed)
-    tokens_per_expert = torch.bincount(
-        flat_indices.int(), minlength=n_experts
-    ).to(torch.int64)
+    # Step 1: Compute histogram using scatter_add_ (fully async, no CPU sync)
+    tokens_per_expert = torch.zeros(n_experts, dtype=torch.int64, device=device)
+    tokens_per_expert.scatter_add_(
+        0, flat_indices.long(),
+        torch.ones(N, dtype=torch.int64, device=device)
+    )
 
     # Step 2: Compute expert offsets (cumsum is fast)
     expert_offsets = torch.zeros(n_experts + 1, dtype=torch.int64, device=device)

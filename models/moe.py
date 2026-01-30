@@ -469,8 +469,13 @@ class MoELayer(nn.Module):
         weights_sorted = weights_flat[sorted_indices]
 
         # 4. Compute expert outputs using Triton grouped GEMM
+        # Use upper bound for max tokens per expert to avoid launching
+        # millions of empty thread blocks (99%+ waste without this)
+        max_tokens_hint = (B_S * K) // self.n_experts * 3  # 3x average for load imbalance
+
         outputs_sorted = self._compute_experts_triton(
-            x_sorted, weights_sorted, expert_offsets, device, dtype
+            x_sorted, weights_sorted, expert_offsets, device, dtype,
+            max_tokens_hint=max_tokens_hint,
         )
 
         # 5. Scatter back to original order
@@ -489,6 +494,7 @@ class MoELayer(nn.Module):
         expert_offsets: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        max_tokens_hint: int = None,
     ) -> torch.Tensor:
         """
         Compute expert outputs using Triton grouped GEMM kernel.
@@ -507,9 +513,7 @@ class MoELayer(nn.Module):
         down_w = self.experts.down_weight if self.experts.down_weight.dtype == dtype else self.experts.down_weight.to(dtype)
 
         # Gate+Up projection: x_sorted @ gate_up_weight
-        # x_sorted: [Total, d_model]
-        # gate_up_weight: [E, d_model, 2*d_ff] (Triton format)
-        combined = moe_gemm(x_sorted, gate_up_w, expert_offsets)
+        combined = moe_gemm(x_sorted, gate_up_w, expert_offsets, max_tokens_hint=max_tokens_hint)
 
         # Add bias if present
         if self.experts.gate_up_bias is not None:
@@ -521,9 +525,7 @@ class MoELayer(nn.Module):
         hidden = F.silu(gate) * up
 
         # Down projection: hidden @ down_weight
-        # hidden: [Total, d_ff]
-        # down_weight: [E, d_ff, d_model] (Triton format)
-        expert_outputs = moe_gemm(hidden, down_w, expert_offsets)
+        expert_outputs = moe_gemm(hidden, down_w, expert_offsets, max_tokens_hint=max_tokens_hint)
 
         # Add bias if present
         if self.experts.down_bias is not None:
@@ -543,8 +545,6 @@ class MoELayer(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         """Convert expert_offsets to per-token expert IDs efficiently."""
-        # expert_offsets: [E+1] with cumulative sums
-        # We need expert_ids: [total_tokens] where expert_ids[i] = expert index for token i
         token_indices = torch.arange(total_tokens, device=device)
         expert_ids = torch.searchsorted(expert_offsets[1:], token_indices, right=True)
         expert_ids = expert_ids.clamp(0, self.n_experts - 1)
@@ -769,9 +769,13 @@ class LatentMoELayer(nn.Module):
         # expert_offsets already contains [0, count0, count0+count1, ...]
 
         # 5. Compute expert outputs using Triton grouped GEMM
-        # This is much more GPU-efficient than padded BMM
+        # Use upper bound for max tokens per expert to avoid launching
+        # millions of empty thread blocks (99%+ waste without this)
+        max_tokens_hint = (B_S * K) // self.n_experts * 3  # 3x average for load imbalance
+
         outputs_sorted = self._compute_experts_triton(
-            x_sorted, weights_sorted, expert_offsets, device, dtype
+            x_sorted, weights_sorted, expert_offsets, device, dtype,
+            max_tokens_hint=max_tokens_hint,
         )
 
         # 6. Scatter back to original order
@@ -790,6 +794,7 @@ class LatentMoELayer(nn.Module):
         expert_offsets: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        max_tokens_hint: int = None,
     ) -> torch.Tensor:
         """
         Compute expert outputs using Triton grouped GEMM kernel.
@@ -808,10 +813,7 @@ class LatentMoELayer(nn.Module):
         down_w = self.experts.down_weight if self.experts.down_weight.dtype == dtype else self.experts.down_weight.to(dtype)
 
         # Gate+Up projection: x_sorted @ gate_up_weight
-        # x_sorted: [Total, latent_dim]
-        # gate_up_weight: [E, latent_dim, 2*d_ff] (already in Triton format)
-        # moe_gemm: A[Total, K] @ B[E, K, N] -> C[Total, N]
-        combined = moe_gemm(x_sorted, gate_up_w, expert_offsets)
+        combined = moe_gemm(x_sorted, gate_up_w, expert_offsets, max_tokens_hint=max_tokens_hint)
 
         # Add bias if present
         if self.experts.gate_up_bias is not None:
@@ -823,9 +825,7 @@ class LatentMoELayer(nn.Module):
         hidden = F.silu(gate) * up
 
         # Down projection: hidden @ down_weight
-        # hidden: [Total, d_ff]
-        # down_weight: [E, d_ff, latent_dim] (already in Triton format)
-        expert_outputs = moe_gemm(hidden, down_w, expert_offsets)
+        expert_outputs = moe_gemm(hidden, down_w, expert_offsets, max_tokens_hint=max_tokens_hint)
 
         # Add bias if present
         if self.experts.down_bias is not None:
