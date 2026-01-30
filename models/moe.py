@@ -471,7 +471,7 @@ class MoELayer(nn.Module):
         # 4. Compute expert outputs using Triton grouped GEMM
         # Use upper bound for max tokens per expert to avoid launching
         # millions of empty thread blocks (99%+ waste without this)
-        max_tokens_hint = (B_S * K) // self.n_experts * 3  # 3x average for load imbalance
+        max_tokens_hint = (B_S * K) // self.n_experts * 6  # 6x average for load imbalance safety
 
         outputs_sorted = self._compute_experts_triton(
             x_sorted, weights_sorted, expert_offsets, device, dtype,
@@ -771,7 +771,7 @@ class LatentMoELayer(nn.Module):
         # 5. Compute expert outputs using Triton grouped GEMM
         # Use upper bound for max tokens per expert to avoid launching
         # millions of empty thread blocks (99%+ waste without this)
-        max_tokens_hint = (B_S * K) // self.n_experts * 3  # 3x average for load imbalance
+        max_tokens_hint = (B_S * K) // self.n_experts * 6  # 6x average for load imbalance safety
 
         outputs_sorted = self._compute_experts_triton(
             x_sorted, weights_sorted, expert_offsets, device, dtype,

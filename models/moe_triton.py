@@ -214,8 +214,9 @@ def moe_gemm(a, b, expert_offsets, activation="", max_tokens_hint=None):
     total_tokens, K = a.shape
     num_experts, _, N = b.shape
 
-    # Output
-    c = torch.empty((total_tokens, N), device=a.device, dtype=a.dtype)
+    # Output - zero-init for safety when using max_tokens_hint
+    # (if hint is too low, uncomputed positions stay zero instead of garbage/NaN)
+    c = torch.zeros((total_tokens, N), device=a.device, dtype=a.dtype)
 
     # Grid
     # To avoid CPU sync (.item()) which breaks cudagraphs, we use a safe upper bound.
