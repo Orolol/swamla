@@ -1563,8 +1563,8 @@ def main():
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
 
     # DeltaNet options (always enabled)
-    parser.add_argument('--use_flash_attention', action='store_true', default=True,
-                        help='Use Flash Attention for MLA blocks')
+    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
     parser.add_argument('--use_varlen_attn', action='store_true', default=True,
                         help='Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
