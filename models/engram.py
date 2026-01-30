@@ -300,21 +300,22 @@ class EngramEmbeddings(nn.Module):
         """
         Multiplicative-XOR hash for N-grams.
 
-        h = (sum_i seed_i * id_i) XOR'd together, then mod table_size
+        h = XOR_i(seed_i * id_i) mod table_size
 
         Returns:
             indices: [batch, seq_len] indices into the embedding table
         """
         # Get seeds for this head
-        seeds = self.hash_seeds[:n, head]  # [n]
+        seeds = self.hash_seeds[:n, head]  # [n], on same device via register_buffer
 
-        # Initialize hash value
-        hash_val = torch.zeros(ngram_ids.shape[:-1], dtype=torch.long, device=ngram_ids.device)
-
-        # Multiplicative-XOR hash
-        for i in range(n):
-            term = ngram_ids[..., i].long() * seeds[i]
-            hash_val = hash_val ^ term
+        # Vectorized: [B, T, n] * [n] -> [B, T, n], then XOR-reduce
+        terms = ngram_ids.long() * seeds
+        # XOR-fold: reduce over last dim via cumulative XOR
+        hash_val = terms[..., 0]
+        if n > 1:
+            hash_val = hash_val ^ terms[..., 1]
+        if n > 2:
+            hash_val = hash_val ^ terms[..., 2]
 
         # Modulo by table size (prime for good distribution)
         indices = hash_val % table_size
@@ -550,6 +551,12 @@ class Engram(nn.Module):
 
         # Tokenizer compression (can be set later via set_tokenizer_compression)
         self._tokenizer_compression = tokenizer_compression
+        # Register mapping as buffer so it moves with model.to(device)
+        # Avoids DeviceCopy in forward() that breaks CUDA graphs
+        if tokenizer_compression is not None:
+            self.register_buffer('_compression_mapping', tokenizer_compression.mapping, persistent=False)
+        else:
+            self.register_buffer('_compression_mapping', None, persistent=False)
 
         # 1. Embedding tables with multi-head hashing
         self.embeddings = EngramEmbeddings(config)
@@ -585,7 +592,10 @@ class Engram(nn.Module):
     def set_tokenizer_compression(self, compression: TokenizerCompression):
         """Set tokenizer compression (can be done after model creation)."""
         self._tokenizer_compression = compression
+        # Update buffer so mapping moves with model.to(device)
+        self._compression_mapping = compression.mapping
 
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,  # [B, T, d] or list for multi-branch
@@ -598,7 +608,8 @@ class Engram(nn.Module):
             output: [B, T, d] or list for multi-branch
         """
         # 1. Compress token IDs to canonical form
-        canonical_ids = self.tokenizer_compression.compress(input_ids)
+        # Use the registered buffer (already on correct device) to avoid DeviceCopy
+        canonical_ids = self._compression_mapping[input_ids]
 
         # 2. Retrieve N-gram embeddings
         memory = self.embeddings.retrieve(canonical_ids)  # [B, T, d_mem]

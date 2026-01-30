@@ -441,6 +441,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --mla_layers_per_cycle 1 \
     --mla_q_lora_rank $MLA_Q_LORA_RANK \
     --mla_kv_lora_rank 256 \
+    --cudnn_compatible_heads \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
