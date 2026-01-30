@@ -592,8 +592,10 @@ class Engram(nn.Module):
     def set_tokenizer_compression(self, compression: TokenizerCompression):
         """Set tokenizer compression (can be done after model creation)."""
         self._tokenizer_compression = compression
-        # Update buffer so mapping moves with model.to(device)
-        self._compression_mapping = compression.mapping
+        # Move mapping to the module's current device (set_tokenizer_compression
+        # is called after model.to(device), so we must explicitly move)
+        device = next(self.parameters()).device
+        self._compression_mapping = compression.mapping.to(device)
 
     @torch.compiler.disable
     def forward(
