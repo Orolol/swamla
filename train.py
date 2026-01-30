@@ -816,6 +816,17 @@ def train(args):
     model = create_swa_mla_model(**model_kwargs)
     model = model.to(device)
 
+    # Convert MoE expert weights to bfloat16 to avoid per-step dtype casts
+    # (Triton kernels don't benefit from autocast, so weights must be pre-cast)
+    for module in model.modules():
+        if hasattr(module, 'gate_up_weight') and hasattr(module, 'down_weight'):
+            module.gate_up_weight.data = module.gate_up_weight.data.to(torch.bfloat16)
+            module.down_weight.data = module.down_weight.data.to(torch.bfloat16)
+            if hasattr(module, 'gate_up_bias') and module.gate_up_bias is not None:
+                module.gate_up_bias.data = module.gate_up_bias.data.to(torch.bfloat16)
+            if hasattr(module, 'down_bias') and module.down_bias is not None:
+                module.down_bias.data = module.down_bias.data.to(torch.bfloat16)
+
     # Convert to native FP8 if enabled (must be after .to(device), before compile)
     if use_native_fp8:
         convert_model_to_fp8(model)

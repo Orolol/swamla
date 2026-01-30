@@ -502,8 +502,9 @@ class MoELayer(nn.Module):
         D = x_sorted.shape[-1]  # d_model
 
         # Ensure weights are in the same dtype as input for Triton
-        gate_up_w = self.experts.gate_up_weight.to(dtype)
-        down_w = self.experts.down_weight.to(dtype)
+        # Use .data to avoid autograd overhead, and check dtype to skip no-op casts
+        gate_up_w = self.experts.gate_up_weight if self.experts.gate_up_weight.dtype == dtype else self.experts.gate_up_weight.to(dtype)
+        down_w = self.experts.down_weight if self.experts.down_weight.dtype == dtype else self.experts.down_weight.to(dtype)
 
         # Gate+Up projection: x_sorted @ gate_up_weight
         # x_sorted: [Total, d_model]
@@ -802,9 +803,9 @@ class LatentMoELayer(nn.Module):
         D = x_sorted.shape[-1]  # latent_dim
 
         # Ensure weights are in the same dtype as input for Triton
-        # (Triton requires both operands to have same dtype)
-        gate_up_w = self.experts.gate_up_weight.to(dtype)
-        down_w = self.experts.down_weight.to(dtype)
+        # Use dtype check to skip no-op casts (avoids 11s+ cudaMemcpyAsync overhead)
+        gate_up_w = self.experts.gate_up_weight if self.experts.gate_up_weight.dtype == dtype else self.experts.gate_up_weight.to(dtype)
+        down_w = self.experts.down_weight if self.experts.down_weight.dtype == dtype else self.experts.down_weight.to(dtype)
 
         # Gate+Up projection: x_sorted @ gate_up_weight
         # x_sorted: [Total, latent_dim]
