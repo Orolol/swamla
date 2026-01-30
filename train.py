@@ -776,6 +776,13 @@ def train(args):
         engram_layers = [int(x.strip()) for x in args.engram_layers.split(',') if x.strip()]
         engram_ngram_orders = [int(x.strip()) for x in args.engram_ngram_orders.split(',') if x.strip()]
 
+    # cuDNN-compatible heads: double n_heads, halve qk_nope_head_dim
+    if args.cudnn_compatible_heads:
+        args.mla_qk_nope_head_dim = 64
+        if is_main:
+            print(f"[cuDNN compat] qk_nope_head_dim → {args.mla_qk_nope_head_dim}, "
+                  f"n_heads will be doubled by preset (cudnn_compatible_heads=True)")
+
     # Common model kwargs
     model_kwargs = dict(
         size=args.size,
@@ -809,6 +816,8 @@ def train(args):
         engram_n_hash_heads=args.engram_n_hash_heads,
         engram_ngram_orders=engram_ngram_orders,
         engram_conv_kernel=args.engram_conv_kernel,
+        # cuDNN-compatible heads
+        cudnn_compatible_heads=args.cudnn_compatible_heads,
         # MoE parameters
         **moe_kwargs,
     )
@@ -1572,6 +1581,8 @@ def main():
     parser.add_argument('--mla_qk_nope_head_dim', type=int, default=128)
     parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64)
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
+    parser.add_argument('--cudnn_compatible_heads', action='store_true', default=False,
+                        help='Double n_heads and halve qk_nope_head_dim (128→64) for cuDNN SDPA compatibility')
 
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,

@@ -67,6 +67,7 @@ class SWAMLAConfig:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     attn_impl: str = "absorb"
+    cudnn_compatible_heads: bool = False  # Double n_heads, halve qk_nope_head_dim for cuDNN SDPA
     world_size: int = 1
     rope_scaling: Optional[Dict[str, float]] = None
     rope_factor: float = 1.0
@@ -691,5 +692,9 @@ def create_swa_mla_model(
             cfg_kwargs["local_layers_per_cycle"] = cfg_kwargs.pop("swa_layers_per_cycle")
         else:
             cfg_kwargs.pop("swa_layers_per_cycle")
+    # cuDNN-compatible heads: double n_heads so qk_head_dim = 64+64 = 128 ≤ 128
+    if cfg_kwargs.get("cudnn_compatible_heads", False):
+        cfg_kwargs["n_head"] = cfg_kwargs.get("n_head", 16) * 2
+        cfg_kwargs["qk_nope_head_dim"] = 64
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)
