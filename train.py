@@ -779,9 +779,8 @@ def train(args):
     # cuDNN-compatible heads: double n_heads, halve qk_nope_head_dim
     if args.cudnn_compatible_heads:
         args.mla_qk_nope_head_dim = 64
-        if is_main:
-            print(f"[cuDNN compat] qk_nope_head_dim → {args.mla_qk_nope_head_dim}, "
-                  f"n_heads will be doubled by preset (cudnn_compatible_heads=True)")
+        print(f"[cuDNN compat] qk_nope_head_dim → {args.mla_qk_nope_head_dim}, "
+              f"n_heads will be doubled by preset (cudnn_compatible_heads=True)")
 
     # Common model kwargs
     model_kwargs = dict(
