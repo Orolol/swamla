@@ -651,7 +651,7 @@ def train(args):
     configure_cuda_optimizations()
 
     # Configure TF32 precision (silent)
-    enable_tf32 = False
+    enable_tf32 = True
     configure_tf32(enable_tf32=enable_tf32, verbose=False)
 
     # Setup wandb
