@@ -1147,7 +1147,7 @@ def train(args):
         else:
             optimizer.zero_grad(set_to_none=True)
 
-        accum_loss = 0.0
+        accum_loss = torch.tensor(0.0, device=device)
 
         for micro_step in range(args.gradient_accumulation_steps):
             # Use prefetched batch
@@ -1234,7 +1234,7 @@ def train(args):
 
             # Backward pass
             scaler.scale(loss).backward()
-            accum_loss += loss.item()
+            accum_loss += loss.detach()
 
         # Update MoE router biases after backward (must be after backward for checkpoint compatibility)
         if hasattr(raw_model, 'update_moe_bias'):
@@ -1273,7 +1273,7 @@ def train(args):
             dt = t1 - t0
             t0 = t1
 
-            lossf = running_loss / args.log_interval if step > 0 else accum_loss
+            lossf = (running_loss / args.log_interval).item() if step > 0 else accum_loss.item()
             running_loss = 0.0
 
             tokens_per_sec = (args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size * args.log_interval) / dt

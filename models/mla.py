@@ -32,6 +32,15 @@ except ImportError:
     VARLEN_ATTN_AVAILABLE = False
     varlen_attn = None
 
+# Import SDPA kernel selection (PyTorch 2.5+)
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    SDPA_KERNEL_AVAILABLE = True
+except ImportError:
+    SDPA_KERNEL_AVAILABLE = False
+    sdpa_kernel = None
+    SDPBackend = None
+
 # Import custom Triton MLA attention kernel (H100 compatible alternative to FA2)
 try:
     from triton_kernels import mla_attention_triton
@@ -123,7 +132,13 @@ class MLA(nn.Module):
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
 
         # Flash Attention support
+        # On Blackwell (sm120+), flash_attn only has sm80 CUTLASS kernels — prefer SDPA+cuDNN
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
+        if self.use_flash_attention and torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability()
+            if cc[0] >= 12:  # Blackwell or newer
+                print(f"MLA: Disabling Flash Attention on sm{cc[0]}{cc[1]} (only has sm80 kernels), using SDPA+cuDNN instead")
+                self.use_flash_attention = False
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention")
 
@@ -144,6 +159,18 @@ class MLA(nn.Module):
         self.use_varlen_attn = getattr(config, 'use_varlen_attn', False) and VARLEN_ATTN_AVAILABLE
         if self.use_varlen_attn:
             print(f"MLA: Using varlen_attn (PyTorch 2.10+)")
+
+        # cuDNN SDPA backend: native Blackwell/Hopper kernels instead of sm80 CUTLASS
+        # Enabled by default on H100+ when SDPA kernel API is available
+        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
+        if self.use_cudnn_sdpa:
+            # Check GPU compute capability at init
+            if torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability()
+                if cc[0] >= 9:  # Hopper (H100) or newer (Blackwell B200)
+                    print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]})")
+                else:
+                    self.use_cudnn_sdpa = False
         
         # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
@@ -368,12 +395,10 @@ class MLA(nn.Module):
                     # Ensure mask has the same dtype as query tensor for SDPA compatibility
                     attn_mask = attn_mask.to(q_sdpa.dtype)
 
-                attn_output = F.scaled_dot_product_attention(
+                attn_output = self._sdpa_attention(
                     q_sdpa, k_sdpa, v_sdpa,
                     attn_mask=attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=mask is None and seqlen > 1,  # Use causal mask if no explicit mask provided
-                    scale=self.softmax_scale
+                    is_causal=mask is None and seqlen > 1,
                 )
 
                 # Transpose back to [B, S, H, D]
@@ -456,12 +481,10 @@ class MLA(nn.Module):
                     # Ensure mask has the same dtype as query tensor for SDPA compatibility
                     attn_mask = attn_mask.to(q_sdpa.dtype)
 
-                attn_output = F.scaled_dot_product_attention(
+                attn_output = self._sdpa_attention(
                     q_sdpa, k_sdpa, v_sdpa,
                     attn_mask=attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0,
                     is_causal=mask is None and seqlen > 1,
-                    scale=self.softmax_scale
                 )
 
                 # Transpose back to [B, S, H, D]
@@ -530,6 +553,54 @@ class MLA(nn.Module):
         # Convert back to original dtype
         if attn_output.dtype != orig_dtype:
             attn_output = attn_output.to(orig_dtype).contiguous()
+
+        return attn_output
+
+    def _sdpa_attention(self, q, k, v, attn_mask=None, is_causal=False):
+        """
+        Run SDPA with cuDNN backend when available, handling V dimension padding.
+
+        cuDNN attention requires Q/K/V to have the same head dimension.
+        MLA has Q/K head_dim=192 but V head_dim=128, so we pad V.
+
+        Args:
+            q: [B, H, S, D_qk] queries
+            k: [B, H, T, D_qk] keys
+            v: [B, H, T, D_v] values (may have different head dim)
+            attn_mask: optional attention mask [B, H, S, T]
+            is_causal: whether to use causal masking
+        Returns:
+            output: [B, H, S, D_v]
+        """
+        d_qk = q.shape[-1]
+        d_v = v.shape[-1]
+        v_padded = v
+
+        if self.use_cudnn_sdpa and d_v != d_qk:
+            # Pad V to match Q/K dimension for cuDNN compatibility
+            v_padded = F.pad(v, (0, d_qk - d_v), value=0.0).contiguous()
+
+        if self.use_cudnn_sdpa:
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v_padded,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=is_causal,
+                    scale=self.softmax_scale
+                )
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v_padded,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=is_causal,
+                scale=self.softmax_scale
+            )
+
+        # Remove padding from output if we padded V
+        if self.use_cudnn_sdpa and d_v != d_qk:
+            attn_output = attn_output[..., :d_v].contiguous()
 
         return attn_output
 

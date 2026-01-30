@@ -75,6 +75,9 @@ class SWAMLAConfig:
     # Flash Attention for MLA blocks
     use_flash_attention: bool = True
 
+    # cuDNN SDPA backend: uses native Hopper/Blackwell kernels instead of sm80 CUTLASS
+    use_cudnn_sdpa: bool = True
+
     # Variable-length attention (PyTorch 2.10+)
     # Eliminates padding waste for packed sequences with document boundaries
     use_varlen_attn: bool = False
