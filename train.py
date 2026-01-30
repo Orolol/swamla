@@ -1678,8 +1678,8 @@ def main():
     parser.add_argument('--resume_from', type=str, default=None, help='Resume from local checkpoint path')
 
     # Performance
-    parser.add_argument('--compile', action='store_true', default=True)
-    parser.add_argument('--compile_mode', type=str, default='max-autotune',
+    parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
                         choices=['reduce-overhead', 'max-autotune', 'default'],
                         help='torch.compile mode')
 
