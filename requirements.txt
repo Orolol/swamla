@@ -18,6 +18,9 @@ bitsandbytes>=0.41.0
 # Flash Linear Attention (required for GatedDeltaNet)
 flash-linear-attention
 
+# Native FP8 training via torchao (recommended, easy install)
+torchao>=0.5.0
+
 # Optional: FP8 training with Transformer Engine on H100/H200 (requires CUDA 12.6+)
 # Install manually if needed: pip install transformer-engine[pytorch]>=2.0.0
 # The native FP8 backend (optimization/fp8_native.py) works without this dependency.

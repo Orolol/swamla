@@ -75,6 +75,14 @@ try:
 except ImportError:
     pass
 
+# Native FP8 imports (torchao)
+NATIVE_FP8_AVAILABLE = False
+try:
+    from optimization.fp8_native import convert_model_to_fp8, HAS_NATIVE_FP8
+    NATIVE_FP8_AVAILABLE = HAS_NATIVE_FP8
+except ImportError:
+    pass
+
 # For context manager fallback
 from contextlib import nullcontext
 
@@ -711,15 +719,36 @@ def train(args):
             resume_step = resume_checkpoint.get('step', 0)
             resume_tokens = resume_checkpoint.get('total_tokens', 0)
 
-    # Setup FP8 training if requested
+    # Resolve FP8 backend
+    fp8_backend = args.fp8_backend
     fp8_recipe = None
-    if args.use_fp8:
+    use_native_fp8 = False
+    use_te_fp8 = False
+
+    if fp8_backend == "auto":
+        if NATIVE_FP8_AVAILABLE:
+            fp8_backend = "native"
+        elif TE_AVAILABLE:
+            fp8_backend = "te"
+        else:
+            fp8_backend = "none"
+
+    if fp8_backend == "native":
+        if not NATIVE_FP8_AVAILABLE:
+            raise RuntimeError(
+                "--fp8_backend native requires torchao. "
+                "Install with: pip install torchao>=0.5.0"
+            )
+        use_native_fp8 = True
+        if master_process:
+            print(f"FP8 training enabled via torchao native (torch.compile recommended)")
+    elif fp8_backend == "te":
         if not TE_AVAILABLE:
             raise RuntimeError(
-                "--use_fp8 requires transformer-engine. "
+                "--fp8_backend te requires transformer-engine. "
                 "Install with: pip install transformer-engine"
             )
-        # Create FP8 recipe with HYBRID format (E4M3 forward, E5M2 backward)
+        use_te_fp8 = True
         fp8_recipe = DelayedScaling(
             fp8_format=Format.HYBRID,
             amax_history_len=16,
@@ -727,6 +756,18 @@ def train(args):
         )
         if master_process:
             print(f"FP8 training enabled via Transformer Engine (HYBRID format)")
+
+    # Legacy compat: if --use_fp8 was passed, treat as --fp8_backend te
+    if args.use_fp8 and fp8_backend == "none":
+        if TE_AVAILABLE:
+            use_te_fp8 = True
+            fp8_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID,
+                amax_history_len=16,
+                amax_compute_algo="max",
+            )
+            if master_process:
+                print(f"FP8 training enabled via Transformer Engine (legacy --use_fp8)")
 
     # Prepare MoE kwargs
     moe_kwargs = {}
@@ -783,8 +824,9 @@ def train(args):
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
         deltanet_share_qk=args.deltanet_share_qk,
-        # FP8 training via Transformer Engine
-        use_te_fp8=args.use_fp8,
+        # FP8 training via Transformer Engine (only when TE backend is active)
+        use_te_fp8=use_te_fp8,
+        fp8_backend=fp8_backend,
         # Engram: Conditional Memory via N-gram Lookup
         use_engram=args.use_engram,
         engram_layers=engram_layers,
@@ -798,6 +840,12 @@ def train(args):
 
     model = create_swa_mla_model(**model_kwargs)
     model = model.to(device)
+
+    # Convert to native FP8 if enabled (must be after .to(device), before compile)
+    if use_native_fp8:
+        convert_model_to_fp8(model)
+        if master_process:
+            print("Model converted to native FP8 (Float8Linear)")
 
     # Set tokenizer compression for Engram if enabled (must be done on all processes)
     if args.use_engram:
@@ -1013,9 +1061,8 @@ def train(args):
         profiler.start()
 
     data_iter = iter(data_loader)
-    # CRITICAL FIX: GradScaler MUST be enabled for FP8 training
-    # Without this, FP8 gradients will have incorrect magnitudes and loss won't converge
-    scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
+    # GradScaler is required for TE FP8, but NOT for native FP8 (torchao handles scaling internally)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_te_fp8)
 
     # Create a separate CUDA stream for async data prefetching
     prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -1145,10 +1192,10 @@ def train(args):
                 cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
                 max_seqlen = batch.get('max_seqlen', None)
 
-            # Create FP8 autocast context if enabled
-            # For DDP, pass fp8_group for synchronized scaling across GPUs
-            fp8_group = dist.group.WORLD if is_ddp and args.use_fp8 else None
-            fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group) if args.use_fp8 else nullcontext()
+            # Create FP8 autocast context if using TE backend
+            # Native FP8 (torchao) doesn't need a context manager — Float8Linear handles it
+            fp8_group = dist.group.WORLD if is_ddp and use_te_fp8 else None
+            fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group) if use_te_fp8 else nullcontext()
 
             # Forward pass with mixed precision (BF16 + optional FP8 via TE)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
@@ -1334,8 +1381,8 @@ def train(args):
                         val_cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
                         val_max_seqlen = batch.get('max_seqlen', None)
 
-                    # FP8 context for validation (no DDP sync needed in eval)
-                    val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if args.use_fp8 else nullcontext()
+                    # FP8 context for validation (TE only; native FP8 doesn't need context)
+                    val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if use_te_fp8 else nullcontext()
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                         with val_fp8_ctx:
@@ -1645,9 +1692,12 @@ def main():
                         choices=['reduce-overhead', 'max-autotune', 'default'],
                         help='torch.compile mode')
 
-    # FP8 Training (Transformer Engine)
-    parser.add_argument('--use_fp8', action='store_true', default=True,
-                        help='Enable FP8 training via Transformer Engine (requires H100/H200)')
+    # FP8 Training
+    parser.add_argument('--fp8_backend', type=str, default='none',
+                        choices=['auto', 'native', 'te', 'none'],
+                        help='FP8 backend: auto (native>te), native (torchao), te (Transformer Engine), none')
+    parser.add_argument('--use_fp8', action='store_true', default=False,
+                        help='Legacy: enable FP8 via Transformer Engine (prefer --fp8_backend)')
 
     # TensorBoard
     parser.add_argument('--use_tensorboard', action='store_true', default=True)

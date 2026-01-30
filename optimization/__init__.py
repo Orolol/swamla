@@ -9,6 +9,13 @@ from .fp8_te import (
     check_fp8_support,
 )
 
+# Native PyTorch FP8 via torchao
+from .fp8_native import (
+    HAS_NATIVE_FP8,
+    convert_model_to_fp8,
+    check_native_fp8_support,
+)
+
 # μP (Maximal Update Parametrization)
 from .mup import (
     MuPConfig,
@@ -35,6 +42,10 @@ __all__ = [
     "te_checkpoint",
     "is_fp8_compatible",
     "check_fp8_support",
+    # Native FP8
+    "HAS_NATIVE_FP8",
+    "convert_model_to_fp8",
+    "check_native_fp8_support",
     # μP
     "MuPConfig",
     "LayerType",

@@ -448,6 +448,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --log_interval 50 \
     --eval_interval 5000 \
     --save_interval 5000 \
+    --fp8_backend auto \
     --compile \
     --compile_mode max-autotune \
     $MUP_ARGS \

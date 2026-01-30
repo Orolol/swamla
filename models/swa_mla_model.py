@@ -109,8 +109,9 @@ class SWAMLAConfig:
     latent_n_activated: Optional[int] = None  # Override: activated experts for LatentMoE
     latent_preserve_expert_dim: bool = False  # If True, keep full expert_dim
 
-    # Transformer Engine FP8 training
-    use_te_fp8: bool = False  # Use TE Linear layers for FP8 training (requires transformer-engine)
+    # FP8 training
+    use_te_fp8: bool = False  # Legacy: Use TE Linear layers (kept for checkpoint compat, now a no-op)
+    fp8_backend: str = "none"  # "none", "native", "te", or "auto"
 
     # Engram: Conditional Memory via Scalable N-gram Lookup
     # Complements MoE by performing O(1) lookups in N-gram embedding tables

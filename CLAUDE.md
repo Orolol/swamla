@@ -99,12 +99,14 @@ Example: With defaults (2 DeltaNet + 1 MLA), a 12-layer model has the pattern:
 - DDP-compatible with automatic sharding
 
 ### Optimization
-**FP8 Training with Native PyTorch** ([optimization/fp8_native.py](optimization/fp8_native.py)):
-- **Custom FP8 implementation** using PyTorch's `float8_e4m3fn` and `_scaled_mm`
-- Dynamic per-tensor scaling with clamping for numerical stability
-- Compatible with `torch.compile` and DDP
-- Requires `GradScaler` for proper gradient scaling
-- Targets H100/H200 GPUs with CUDA >= 12.6
+**FP8 Training via Transformer Engine** ([optimization/fp8_te.py](optimization/fp8_te.py)):
+- Uses NVIDIA Transformer Engine (`transformer-engine[pytorch]`) for FP8 training
+- TE Linear layers replace `nn.Linear` at model construction via `get_te_linear()`
+- HYBRID format: E4M3 forward pass, E5M2 backward pass
+- `te.fp8_autocast()` context manager wraps forward passes
+- FP8-aware gradient checkpointing via `te_checkpoint()`
+- Requires H100/H200 GPU + `transformer-engine` package
+- GradScaler enabled for proper gradient scaling
 
 **Supported Optimizers**:
 - `adamw`: Standard AdamW (fused on CUDA)
@@ -129,13 +131,14 @@ swamla/
 ├── data/
 │   └── data_loader_packed.py          # Packed sequence data loader
 ├── optimization/
-│   ├── fp8_native.py                  # Native PyTorch FP8 implementation
+│   ├── fp8_te.py                      # Transformer Engine FP8 integration
 │   ├── mup.py                         # μP (Maximal Update Parametrization)
 │   ├── progressive.py                 # Progressive sequence length training
 │   └── swa.py                         # EMA model wrapper
 └── scripts/
     ├── train.sh                       # Consolidated training script
-    └── train_unified.sh               # Reference implementation with all features
+    ├── train_unified.sh               # Reference implementation with all features
+    └── setup_deepinfra.sh             # Setup script for DeepInfra instances
 ```
 
 ## Model Configuration
@@ -429,149 +432,116 @@ Applied at block level with `use_reentrant=False`:
 - Separate checkpointing for attention and MLP sub-blocks
 - Controlled by `use_gradient_checkpointing` config flag
 
-### FP8 Integration with Native PyTorch
-Custom FP8 implementation using PyTorch's native FP8 support:
-- **Automatic GPU detection**: Checks for H100/H200 via compute capability
-- **Model conversion**: Uses `convert_to_native_fp8()` to replace Linear layers with FP8Linear
-- **Dynamic scaling**: Per-tensor scaling with clamping for numerical stability
+### FP8 Integration via Transformer Engine
+FP8 training uses NVIDIA Transformer Engine ([optimization/fp8_te.py](optimization/fp8_te.py)):
+- **Build-time integration**: `get_te_linear()` creates TE Linear layers during model construction
+- **Runtime context**: `te.fp8_autocast()` wraps forward passes for FP8 compute
+- **HYBRID format**: E4M3 for forward (more precision), E5M2 for backward (more range)
+- **DelayedScaling recipe**: 16-step amax history with max algorithm
+- **FP8-aware checkpointing**: `te_checkpoint()` handles FP8 states during recomputation
 - **GradScaler required**: Must enable GradScaler for proper gradient scaling
-- **Compatibility**: Works with `torch.compile` and DDP
+- **DDP support**: Pass `fp8_group=dist.group.WORLD` for synchronized scaling
 
 Key implementation details:
-- FP8 conversion happens after model creation but before DDP wrapping
-- **Requires GradScaler** - Custom autograd needs external gradient scaling
-- Linear layers in attention and MLP are converted to FP8Linear
-- Normalization layers and embeddings remain in higher precision
-- Scale factors clamped to [1.0, 1e4] to prevent overflow/underflow
-- Expected memory reduction: ~25-30% compared to BF16
+- TE Linear layers are created at model construction (not post-hoc conversion)
+- `get_te_linear()` falls back to `nn.Linear` if TE unavailable or dims not divisible by 16
+- Used in MLA attention (`models/mla.py`) and MLP (`models/mlp.py`)
+- GatedDeltaNet blocks do NOT use TE (they use standard `nn.Linear`)
+- `te.fp8_autocast()` context wraps both training and validation forward passes
+- Requires `transformer-engine[pytorch]>=2.0.0` package (install separately, see `scripts/setup_deepinfra.sh`)
 
-## Native FP8 Training Guide
+## Transformer Engine FP8 Training Guide
 
 ### Overview
-The DeltaNet-MLA model uses a **custom native FP8 implementation** built on PyTorch's `float8_e4m3fn` type and `_scaled_mm` function. This provides fine-grained control over FP8 quantization while maintaining compatibility with standard PyTorch training workflows.
+FP8 training uses **NVIDIA Transformer Engine (TE)**, which provides optimized FP8 Linear layers
+and an `fp8_autocast` context manager. TE handles FP8 quantization, scaling, and format selection
+internally. This is integrated at model build time via `get_te_linear()` in [optimization/fp8_te.py](optimization/fp8_te.py).
 
-### Key Features
-- **Custom autograd**: FP8LinearFunction with manual forward/backward passes
-- **Dynamic per-tensor scaling**: Computed on-the-fly for inputs, weights, and gradients
-- **Numerical stability**: Scale factor clamping to prevent overflow/underflow
-- **GradScaler integration**: Required for proper gradient scaling across iterations
-- **Standard optimizers**: Works with AdamW, Lion, and quantized variants
+### Requirements
+- NVIDIA H100/H200 GPU (compute capability >= 9.0)
+- `transformer-engine[pytorch]>=2.0.0` (heavy C++ build, see `scripts/setup_deepinfra.sh`)
+- CUDA toolkit dev headers, cuDNN, NCCL for building from source
 
 ### Usage
 
 #### Basic FP8 Training
 ```bash
-# Single GPU
-python train.py --size small --batch_size 8 --block_size 2048 --use_fp8
+# FP8 is enabled by default (--use_fp8 defaults to True)
+./scripts/train.sh --preset engram-moe 8 2048
+
+# Explicitly enable
+python train.py --size engram-moe-1b --batch_size 8 --block_size 2048 --use_fp8
 
 # Multi-GPU with DDP
-torchrun --nproc_per_node=4 train.py --size medium --batch_size 4 --use_fp8
-
-# With torch.compile for additional speedup
-python train.py --size small --use_fp8 --compile
+torchrun --nproc_per_node=4 train.py --size moe-1b --batch_size 4 --use_fp8
 ```
 
 #### How It Works
-1. **GPU Detection**: Checks for native FP8 support (H100/H200, CUDA >= 12.6)
-2. **Model Conversion**: Replaces `nn.Linear` layers with `FP8Linear` via `convert_to_native_fp8()`
-3. **GradScaler Enabled**: `GradScaler('cuda', enabled=True)` for FP8 gradient scaling
-4. **Training Loop**: Standard PyTorch training with autocast and GradScaler
+1. **Model construction**: `get_te_linear()` creates `te.Linear` layers where dims are divisible by 16
+2. **FP8 recipe**: `DelayedScaling(fp8_format=HYBRID, amax_history_len=16, amax_compute_algo="max")`
+3. **Training loop**: `te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)` wraps forward passes
+4. **GradScaler**: Enabled for FP8 gradient scaling
+5. **DDP sync**: `fp8_group=dist.group.WORLD` for synchronized scaling across GPUs
 
 #### Code Flow
 ```python
 # In train.py
-model = create_swa_mla_model(..., use_fp8=False)  # Create in BF16
-model = model.to(device)
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, DelayedScaling
 
-if args.use_fp8:
-    from fp8_native import convert_to_native_fp8
-    model = convert_to_native_fp8(model)  # Replace Linear with FP8Linear
+# FP8 recipe
+fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
+
+# Model is created with use_te_fp8=True, which uses te.Linear inside MLA and MLP
+model = create_swa_mla_model(..., use_te_fp8=args.use_fp8)
 
 # GradScaler MUST be enabled for FP8
 scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)
 
-# Training loop with scaling
+# Training loop
+fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-    loss = model(...)
+    with fp8_ctx:
+        loss = model(...)
 scaler.scale(loss).backward()
-scaler.unscale_(optimizer)  # Critical for correct grad magnitudes
+scaler.unscale_(optimizer)
 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 scaler.step(optimizer)
 scaler.update()
 ```
 
-#### What Gets Converted to FP8
-- ✅ Linear layers in DeltaNet attention (Q, K, V, output projections)
-- ✅ Linear layers in MLA attention (Q, K, V, LoRA projections)
-- ✅ MLP feed-forward layers (gate_up_proj, down_proj)
-- ❌ **lm_head** - Excluded (vocab_size not divisible by 16)
-- ❌ **Embeddings** (wte, wpe) - Excluded
-- ❌ **Normalization layers** - Excluded
-
-**Note**: Layers with dimensions not divisible by 16 are automatically skipped.
-
-### Critical Implementation Details
-
-#### GradScaler is Required
-Unlike some FP8 implementations, this custom approach **requires GradScaler** because:
-- FP8 quantization affects gradient magnitudes
-- Dynamic scaling varies between forward/backward passes
-- No built-in overflow detection or scale management
-- Gradient clipping needs correctly unscaled gradients
-
-**Bug fixed in this implementation**: The initial code incorrectly disabled GradScaler (`enabled=False`), causing loss to not converge. Always use `enabled=args.use_fp8`.
-
-#### Scale Factor Clamping
-The implementation clamps scale factors to prevent numerical issues:
-```python
-# Clamp abs_max to prevent extreme scales
-abs_max = tensor.abs().max().clamp(min=1e-4)
-scale = (448.0 / (abs_max + 1e-6)).clamp(min=1.0, max=1e4)
-```
-
-This prevents:
-- **Overflow**: When abs_max is tiny → scale becomes huge
-- **Underflow**: When abs_max is large → scale becomes tiny
+#### What Uses TE FP8 Linear
+- TE Linear in MLA attention (`models/mla.py`): Q, K, V, LoRA projections, output
+- TE Linear in MLP (`models/mlp.py`): gate_up_proj, down_proj
+- **NOT** GatedDeltaNet blocks (use standard `nn.Linear`)
+- **NOT** layers with dims not divisible by 16 (automatic fallback to `nn.Linear`)
+- **NOT** embeddings, normalization layers, lm_head
 
 ### Troubleshooting FP8 Training
 
-**Loss not decreasing (stuck at ~11.0):**
-- **CRITICAL**: Verify GradScaler is enabled: `scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)`
-- Check gradient norms are non-zero (training script logs this every 100 steps with `--use_fp8`)
-- Ensure `scaler.unscale_()` is called before gradient clipping
+**TE import error (`libcudnn_graph.so.9`):**
+- Set `LD_LIBRARY_PATH` to include cuDNN lib path from pip packages
+- See `scripts/setup_deepinfra.sh` for automatic detection
 
-**Out of memory with FP8:**
-- FP8 uses ~25-30% less memory than BF16, but may still OOM
-- Try reducing `--batch_size` or `--block_size`
-- Enable `--gradient_checkpointing` for additional savings
+**TE build failure (`nccl.h` / `cudnn.h` not found):**
+- Install system packages: `apt-get install -y libcudnn-dev libnccl-dev ninja-build`
+- Ensure CUDA toolkit is installed: `apt-get install -y cuda-toolkit-12-8`
+
+**Loss not decreasing:**
+- Verify GradScaler is enabled: `scaler = torch.amp.GradScaler('cuda', enabled=args.use_fp8)`
+- Ensure `scaler.unscale_()` is called before gradient clipping
 
 **NaN loss with FP8:**
 - Reduce `--learning_rate` (e.g., from 1e-4 to 5e-5)
 - Increase `--warmup_iters` (e.g., from 400 to 1000)
-- Verify `--grad_clip 1.0` is set (critical for stability)
-- Check GradScaler scale factor isn't growing unbounded
-
-**Slower than expected:**
-- Ensure `--compile` is enabled for maximum speedup
-- Check GPU utilization with `nvidia-smi`
-- FP8 benefits are most visible with larger models (base/large/xl)
-- Small models may have overhead that reduces gains
-
-**torch.compile errors with FP8:**
-- The training script uses `mode='reduce-overhead'` for FP8 (instead of `max-autotune`)
-- This avoids layout errors with dynamic scaling operations
-- Still provides significant speedup (~10-20%)
-
-### Performance Expectations
-- **Memory**: ~25-30% reduction vs BF16
-- **Speed**: Depends on model size and GPU
-- **Convergence**: Should match BF16 within 5-10% final loss
+- Verify `--grad_clip 1.0` is set
 
 ### Implementation Reference
-See [optimization/fp8_native.py](optimization/fp8_native.py) for the full implementation:
-- `FP8LinearFunction`: Custom autograd function
-- `FP8Linear`: nn.Module wrapper
-- `convert_to_native_fp8()`: Recursive model conversion
+See [optimization/fp8_te.py](optimization/fp8_te.py):
+- `get_te_linear()`: Creates `te.Linear` or `nn.Linear` based on availability and dim compatibility
+- `get_fp8_recipe()`: Creates DelayedScaling recipe
+- `te_checkpoint()`: FP8-aware gradient checkpointing wrapper
+- `check_fp8_support()`: Environment diagnostic
 
 ## Debugging and Troubleshooting
 

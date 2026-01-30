@@ -7,13 +7,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from positional_encoding import RoPE
 
-# Import TE FP8 helper
-try:
-    from optimization.fp8_te import get_te_linear, HAS_TE
-except ImportError:
-    HAS_TE = False
-    def get_te_linear(in_features, out_features, bias=True, use_te_fp8=False):
-        return nn.Linear(in_features, out_features, bias=bias)
 
 # Import Flash Attention
 try:
@@ -90,28 +83,23 @@ class MLA(nn.Module):
         # Optional values from config
         self.dropout = getattr(config, 'dropout', 0.0)
 
-        # Check if TE FP8 should be used
-        use_te_fp8 = getattr(config, 'use_te_fp8', False)
         bias = config.bias if hasattr(config, 'bias') else False
 
-        # Linear projections - use TE Linear where dimensions are compatible
+        # Linear projections
         if self.q_lora_rank == 0:
-            # Direct projection for queries
-            self.wq = get_te_linear(self.dim, self.n_heads * self.qk_head_dim, bias=bias, use_te_fp8=use_te_fp8)
+            self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=bias)
         else:
-            # Low-rank projection for queries
-            self.wq_a = get_te_linear(self.dim, self.q_lora_rank, bias=bias, use_te_fp8=use_te_fp8)
+            self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=bias)
             self.q_norm = nn.LayerNorm(self.q_lora_rank)
-            self.wq_b = get_te_linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=bias, use_te_fp8=use_te_fp8)
+            self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=bias)
 
         # Low-rank projection for keys and values
-        # Note: These dimensions may not be divisible by 16, get_te_linear handles fallback
-        self.wkv_a = get_te_linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias, use_te_fp8=use_te_fp8)
+        self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias)
         self.kv_norm = nn.LayerNorm(self.kv_lora_rank)
-        self.wkv_b = get_te_linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=bias, use_te_fp8=use_te_fp8)
+        self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=bias)
 
         # Output projection
-        self.wo = get_te_linear(self.n_heads * self.v_head_dim, self.dim, bias=bias, use_te_fp8=use_te_fp8)
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=bias)
         
         # Dropout layers
         self.attn_dropout = nn.Dropout(self.dropout)
@@ -482,11 +470,6 @@ class MLA(nn.Module):
         # Reshape and project to output dimension
         x = x.reshape(bsz, seqlen, -1)
         x = self.wo(x)
-        
-        # Handle FP8 conversion: ensure output matches the expected dtype for residual connections
-        # Convert back to BFloat16 if the output is in FP8 format
-        if x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            x = x.to(torch.bfloat16)
         
         x = self.resid_dropout(x)
         
