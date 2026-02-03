@@ -451,7 +451,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --save_interval 5000 \
     --fp8_backend auto \
     --compile \
-    --compile_mode max-autotune \
+    --compile_mode default\
     $MUP_ARGS \
     $PROGRESSIVE_ARGS \
     $EMA_ARGS \
