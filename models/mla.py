@@ -133,6 +133,7 @@ class MLA(nn.Module):
 
         # Flash Attention support
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
+        print(f"MLA: FLASH_ATTN_AVAILABLE = {FLASH_ATTN_AVAILABLE}")
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention")
 
