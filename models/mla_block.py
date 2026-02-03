@@ -46,7 +46,7 @@ class MLABlock(nn.Module):
             self.ffn_norm = RMSNorm(config.n_embd)
 
         # MLA attention - FP8 version not included in standalone build
-        self.attn = MLA(config)
+        self.attn = MLA(config, layer_id=layer_id)
 
         # FFN: MoE (standard or latent) or standard MLP based on config
         if getattr(config, 'use_moe', False):
@@ -75,10 +75,10 @@ class MLABlock(nn.Module):
         """Engram conditional memory lookup (applied BEFORE attention)"""
         return self.engram(x, input_ids)
 
-    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, cu_seqlens=None, max_seqlen=None):
+    def _attn_block(self, x, start_pos=0, freqs_cis=None, mask=None, position_ids=None, cu_seqlens=None, max_seqlen=None, input_ids=None):
         """Attention portion of the block with appropriate normalization"""
         x_norm = self.attn_norm(x)
-        return self.attn(x_norm, start_pos, freqs_cis, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        return self.attn(x_norm, start_pos, freqs_cis, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, input_ids=input_ids)
 
     def _ffn_block(self, x):
         """Feed-forward portion of the block with appropriate normalization"""
@@ -123,6 +123,7 @@ class MLABlock(nn.Module):
                     position_ids,
                     cu_seqlens,
                     max_seqlen,
+                    input_ids,
                     use_te_fp8=True
                 )
             else:
@@ -135,6 +136,7 @@ class MLABlock(nn.Module):
                     position_ids,
                     cu_seqlens,
                     max_seqlen,
+                    input_ids,
                     use_reentrant=False
                 )
             # First residual connection
@@ -154,7 +156,7 @@ class MLABlock(nn.Module):
         else:
             # Standard forward pass without checkpoint
             # First residual connection
-            x = x + self._attn_block(x, start_pos, freqs_cis, mask, position_ids, cu_seqlens, max_seqlen)
+            x = x + self._attn_block(x, start_pos, freqs_cis, mask, position_ids, cu_seqlens, max_seqlen, input_ids)
             # Second residual connection
             x = x + self._ffn_block(x)
 

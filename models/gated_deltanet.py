@@ -121,6 +121,25 @@ class GatedDeltaNet(nn.Module):
         # Scale factor
         self.scale = self.head_dim ** -0.5
 
+        # Value Embeddings (VE) - applied at alternating layers
+        self.layer_id = getattr(config, 'layer_id', None)
+        use_value_embeds = getattr(config, 'use_value_embeds', False)
+        # Apply VE at alternating layers (every other layer)
+        self.has_value_embeds = (
+            use_value_embeds
+            and self.layer_id is not None
+            and self.layer_id % 2 == 0
+        )
+        if self.has_value_embeds:
+            vocab_size = getattr(config, 'vocab_size', 50304)
+            # VE output: (B, T, n_head * head_dim) to match v shape before reshape
+            self.value_embeds = nn.Embedding(vocab_size, self.n_head * self.head_dim)
+            ve_gate_dim = getattr(config, 've_gate_dim', 32)
+            self.ve_gate = nn.Linear(ve_gate_dim, 1, bias=False)
+            self.ve_gate_dim = ve_gate_dim
+            # Zero-init for identity at start
+            nn.init.zeros_(self.ve_gate.weight)
+
         # Initialize
         self._init_weights()
 
@@ -160,6 +179,7 @@ class GatedDeltaNet(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass using flash-linear-attention kernel.
@@ -167,6 +187,7 @@ class GatedDeltaNet(nn.Module):
         Args:
             x: Input tensor (B, T, D)
             state: Optional previous state for inference
+            input_ids: Token IDs for Value Embeddings (B, T)
 
         Returns:
             output: (B, T, D)
@@ -194,6 +215,13 @@ class GatedDeltaNet(nn.Module):
                 q = self.q_proj(x)
                 k = self.k_proj(x)
             v = self.v_proj(x)
+
+        # Apply Value Embeddings if enabled for this layer
+        # VE is applied before reshape: v is (B, T, n_head * head_dim)
+        if self.has_value_embeds and input_ids is not None:
+            ve = self.value_embeds(input_ids)  # (B, T, n_head * head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_dim]))  # (B, T, 1)
+            v = v + gate * ve
 
         # Apply short convolutions for local context
         if self.use_short_conv:
@@ -355,10 +383,11 @@ class GatedDeltaNetBlock(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         seq_lengths: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass. Extra args (freqs_cis, mask) are ignored (linear attention doesn't need them)."""
         # Self-attention with residual
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), input_ids=input_ids)
 
         # MLP with residual
         x = x + self.mlp(self.norm2(x))

@@ -37,6 +37,11 @@ class DeltaNetLayerConfig:
     # DeltaNet latent compression
     deltanet_latent_dim: int = 0  # 0 = disabled, >0 = latent dimension
     deltanet_share_qk: bool = False  # Share Q and K projection
+    # Value Embeddings
+    use_value_embeds: bool = False
+    ve_gate_dim: int = 32
+    vocab_size: int = 50304
+    layer_id: Optional[int] = None
 
 
 
@@ -141,6 +146,10 @@ class SWAMLAConfig:
     use_ema: bool = False
     ema_decay: float = 0.9999  # EMA decay factor
 
+    # Value Embeddings (VE) - token-based value bias at alternating layers
+    use_value_embeds: bool = False
+    ve_gate_dim: int = 32  # Number of input dims for gate projection
+
     def __post_init__(self) -> None:
         if self.expert_dim is None:
             self.expert_dim = self.n_embd
@@ -235,6 +244,10 @@ class SWAMLAModel(nn.Module):
                     use_gradient_checkpointing=config.use_gradient_checkpointing,
                     deltanet_latent_dim=config.deltanet_latent_dim,
                     deltanet_share_qk=config.deltanet_share_qk,
+                    use_value_embeds=config.use_value_embeds,
+                    ve_gate_dim=config.ve_gate_dim,
+                    vocab_size=config.vocab_size,
+                    layer_id=layer_idx,
                 )
                 block = GatedDeltaNetBlock(layer_config)
             else:
@@ -393,17 +406,17 @@ class SWAMLAModel(nn.Module):
 
         for block in self.transformer.h:
             if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock):
-                # GatedDeltaNet: pass position_ids if using WeDLM adapter
+                # GatedDeltaNet: pass position_ids if using WeDLM adapter, and input_ids for VE
                 if position_ids is not None and hasattr(block, 'forward_with_positions'):
                     x = block.forward_with_positions(x, position_ids)
                 else:
-                    x = block(x)
+                    x = block(x, input_ids=idx)
             elif isinstance(block, MLABlock):
                 # Engram: run BEFORE attention, outside compiled block to avoid recompilation
                 if getattr(block, 'has_engram', False) and idx is not None:
                     x = x + block.engram(x, idx)
-                # MLA: pass position_ids for WeDLM and varlen metadata
-                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                # MLA: pass position_ids for WeDLM, varlen metadata, and input_ids for Value Embeddings
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)
@@ -602,6 +615,9 @@ def _create_mla_block_config(config: SWAMLAConfig):
         engram_ngram_orders: List[int] = field(default_factory=lambda: config.engram_ngram_orders.copy())
         engram_conv_kernel: int = config.engram_conv_kernel
         engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = config.engram_table_sizes
+        # Value Embeddings
+        use_value_embeds: bool = config.use_value_embeds
+        ve_gate_dim: int = config.ve_gate_dim
 
     return _Config()
 

@@ -53,10 +53,10 @@ except ImportError:
 class MLA(nn.Module):
     """
     Multi-Head Latent Attention (MLA) Layer.
-    
+
     MLA uses a low-rank projection for compressing the key-value representations,
     reducing memory usage and computational complexity while maintaining model quality.
-    
+
     Attributes:
         dim (int): Dimensionality of the input features.
         n_heads (int): Number of attention heads.
@@ -70,7 +70,7 @@ class MLA(nn.Module):
         softmax_scale (float): Scaling factor for softmax in attention computation.
         attention_backend (str): Backend used for attention computation.
     """
-    def __init__(self, config):
+    def __init__(self, config, layer_id: Optional[int] = None):
         super().__init__()
         self.dim = config.n_embd if hasattr(config, 'n_embd') else config.dim
         self.n_heads = config.n_head if hasattr(config, 'n_head') else config.n_heads
@@ -180,6 +180,27 @@ class MLA(nn.Module):
         self.v_cache = None
         self.kv_cache = None
         self.pe_cache = None
+
+        # Value Embeddings (VE) - applied at alternating layers
+        # VE adds token-based bias to V: v = v + gate * ve
+        self.layer_id = layer_id
+        use_value_embeds = getattr(config, 'use_value_embeds', False)
+        # Apply VE at alternating MLA layers (every other layer)
+        self.has_value_embeds = (
+            use_value_embeds
+            and layer_id is not None
+            and layer_id % 2 == 0
+        )
+        if self.has_value_embeds:
+            vocab_size = getattr(config, 'vocab_size', 50304)
+            kv_dim = self.n_heads * self.v_head_dim
+            self.value_embeds = nn.Embedding(vocab_size, kv_dim)
+            # Gate projection: x[:, :, :gate_dim] -> scalar for gating
+            ve_gate_dim = getattr(config, 've_gate_dim', 32)
+            self.ve_gate = nn.Linear(ve_gate_dim, 1, bias=False)
+            self.ve_gate_dim = ve_gate_dim
+            # Zero-init for identity at start (like Engram)
+            nn.init.zeros_(self.ve_gate.weight)
         
     def set_inference_mode(self, mode=True):
         """
@@ -223,10 +244,44 @@ class MLA(nn.Module):
                 delattr(self, "kv_cache")
             if hasattr(self, "pe_cache"):
                 delattr(self, "pe_cache")
-        
+
+    def _apply_value_embeds(
+        self,
+        v: torch.Tensor,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply Value Embeddings (VE) to the value tensor.
+
+        VE adds token-based bias to V with a learned gate:
+            ve = value_embeds(token_ids)  # (B, T, kv_dim)
+            gate = 2 * sigmoid(ve_gate(x[:, :, :gate_dim]))  # range (0, 2)
+            v = v + gate * ve
+
+        Args:
+            v: Value tensor (B, T, H, D_v)
+            x: Input hidden states (B, T, D) for gate computation
+            input_ids: Token IDs (B, T) for embedding lookup
+
+        Returns:
+            v with VE applied: (B, T, H, D_v)
+        """
+        bsz, seqlen = input_ids.shape
+
+        # Get value embeddings from token IDs
+        ve = self.value_embeds(input_ids)  # (B, T, n_heads * v_head_dim)
+        ve = ve.view(bsz, seqlen, self.n_heads, self.v_head_dim)  # (B, T, H, D_v)
+
+        # Compute gate from first gate_dim dimensions of x
+        # gate output is (B, T, 1), expand to (B, T, 1, 1) for broadcast
+        gate = 2 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_dim]))  # (B, T, 1)
+        gate = gate.unsqueeze(-1)  # (B, T, 1, 1)
+
+        # Apply gated VE to V
+        return v + gate * ve
 
 
-    
 
 
     def forward(
@@ -238,6 +293,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -335,7 +391,11 @@ class MLA(nn.Module):
             kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
-            
+
+            # Apply Value Embeddings if enabled for this layer
+            if self.has_value_embeds and input_ids is not None:
+                v = self._apply_value_embeds(v, x, input_ids)
+
             if is_inference and hasattr(self, 'k_cache') and hasattr(self, 'v_cache'):
                 # Only update caches in inference mode
                 self.k_cache[:bsz, start_pos:end_pos] = k
@@ -425,6 +485,10 @@ class MLA(nn.Module):
             # For the optimized approach, we need to project values through low-rank space
             # First, extract values from the low-rank representation
             v = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, -self.v_head_dim:])
+
+            # Apply Value Embeddings if enabled for this layer
+            if self.has_value_embeds and input_ids is not None:
+                v = self._apply_value_embeds(v, x, input_ids)
 
             # Reshape queries - keep q_nope and q_pe in their original dimensions
             q_full = torch.cat([q_nope, q_pe], dim=-1)  # Combine q components [B, S, H, D]
