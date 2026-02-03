@@ -935,7 +935,7 @@ def train(args):
     # Compile model if requested
     if args.compile:
         compile_mode = args.compile_mode
-        if args.gradient_accumulation_steps > 1 and compile_mode == 'default':
+        if args.gradient_accumulation_steps > 1 and compile_mode == 'max-autotune':
             compile_mode = 'reduce-overhead'
         model = torch.compile(model, mode=compile_mode)
         # Update args for banner display
@@ -1684,7 +1684,7 @@ def main():
 
     # Performance
     parser.add_argument('--compile', action='store_true', default=True)
-    parser.add_argument('--compile_mode', type=str, default='max-autotune',
+    parser.add_argument('--compile_mode', type=str, default='default',
                         choices=['reduce-overhead', 'max-autotune', 'default'],
                         help='torch.compile mode')
 
