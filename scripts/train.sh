@@ -441,6 +441,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --mla_layers_per_cycle 1 \
     --mla_q_lora_rank $MLA_Q_LORA_RANK \
     --mla_kv_lora_rank 256 \
+    --cudnn_compatible_heads \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
@@ -450,7 +451,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --save_interval 5000 \
     --fp8_backend auto \
     --compile \
-    --compile_mode default\
+    --compile_mode\
     $MUP_ARGS \
     $PROGRESSIVE_ARGS \
     $EMA_ARGS \
