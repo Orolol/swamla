@@ -8,12 +8,24 @@ from typing import Optional, Tuple
 from positional_encoding import RoPE
 
 
-# Import Flash Attention
+# Import Flash Attention (FA3 preferred, fallback to FA2)
+FLASH_ATTN_AVAILABLE = False
+FLASH_ATTN_VERSION = None
+flash_attn_func = None
+
 try:
-    from flash_attn import flash_attn_func
+    # Flash Attention 3 (Hopper optimized)
+    from flash_attn_interface import flash_attn_func
     FLASH_ATTN_AVAILABLE = True
+    FLASH_ATTN_VERSION = 3
 except ImportError:
-    FLASH_ATTN_AVAILABLE = False
+    try:
+        # Flash Attention 2 (fallback)
+        from flash_attn import flash_attn_func
+        FLASH_ATTN_AVAILABLE = True
+        FLASH_ATTN_VERSION = 2
+    except ImportError:
+        pass
 
 # Import FlexAttention (PyTorch 2.5+)
 try:
@@ -48,6 +60,17 @@ try:
 except ImportError:
     TRITON_MLA_AVAILABLE = False
     mla_attention_triton = None
+
+
+# FA3 wrapper with torch.compiler.disable to prevent Inductor tracing
+# FA3 custom ops don't have meta kernels, causing compilation failures
+def _fa3_forward(q, k, v, softmax_scale=None, causal=False):
+    """Flash Attention 3 forward pass, excluded from torch.compile."""
+    return flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal)
+
+# Apply torch.compiler.disable if available (PyTorch 2.1+)
+if hasattr(torch, 'compiler') and hasattr(torch.compiler, 'disable'):
+    _fa3_forward = torch.compiler.disable(_fa3_forward)
 
 
 class MLA(nn.Module):
@@ -133,9 +156,12 @@ class MLA(nn.Module):
 
         # Flash Attention support
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
-        print(f"MLA: FLASH_ATTN_AVAILABLE = {FLASH_ATTN_AVAILABLE}")
+        fa_version_str = f"v{FLASH_ATTN_VERSION}" if FLASH_ATTN_VERSION else "not found"
+        print(f"MLA: FLASH_ATTN_AVAILABLE = {FLASH_ATTN_AVAILABLE} ({fa_version_str})")
         if self.use_flash_attention:
-            print(f"MLA: Using Flash Attention")
+            print(f"MLA: Using Flash Attention {fa_version_str}")
+            if FLASH_ATTN_VERSION == 3 and self.dropout > 0:
+                print(f"MLA: WARNING: FA3 does not support dropout, dropout={self.dropout} will be ignored")
 
         # Custom Triton MLA kernel (H100 compatible alternative to FA2)
         # Use this when FA2 causes CUDA graph issues with torch.compile
@@ -599,12 +625,22 @@ class MLA(nn.Module):
 
         # Run Flash Attention
         # flash_attn_func expects (B, T, H, D) with contiguous memory layout
-        attn_output = flash_attn_func(
-            q, k, v_padded,
-            dropout_p=self.dropout if self.training else 0.0,
-            softmax_scale=self.softmax_scale,
-            causal=causal,
-        )
+        # FA3 doesn't support dropout_p, FA2 does
+        # FA3 also requires torch.compiler.disable() as it lacks meta kernels for Inductor
+        if FLASH_ATTN_VERSION == 3:
+            attn_output = _fa3_forward(
+                q, k, v_padded,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
+            )
+        else:
+            # FA2 API
+            attn_output = flash_attn_func(
+                q, k, v_padded,
+                dropout_p=self.dropout if self.training else 0.0,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
+            )
 
         # Remove padding from output if we padded V
         if d_v != d_qk:
