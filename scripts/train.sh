@@ -209,7 +209,7 @@ case "$PRESET" in
     full)
         MODEL_SIZE="${MODEL_SIZE:-engram-moe-1b}"
         USE_MUP="true"
-        USE_PROGRESSIVE="true"
+        USE_PROGRESSIVE="false"
         USE_EMA="true"
         USE_ENGRAM="true"
         USE_LATENT_MOE="true"
@@ -261,7 +261,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-2048}"
 MUP_BASE_WIDTH="${MUP_BASE_WIDTH:-256}"
 
 # Progressive Training
-PROGRESSIVE_SCHEDULE="${PROGRESSIVE_SCHEDULE:-512:50M,1024:2B,2048:inf}"
+PROGRESSIVE_SCHEDULE="${PROGRESSIVE_SCHEDULE:-2048:inf}"
 
 # EMA
 EMA_DECAY="${EMA_DECAY:-0.9999}"
