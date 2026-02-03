@@ -934,6 +934,10 @@ def train(args):
 
     # Compile model if requested
     if args.compile:
+        # Reduce recompilations with FP8/torchao by inlining nn.Module checks
+        import torch._dynamo
+        torch._dynamo.config.inline_inbuilt_nn_modules = True
+
         compile_mode = args.compile_mode
         if args.gradient_accumulation_steps > 1 and compile_mode == 'max-autotune':
             compile_mode = 'reduce-overhead'
