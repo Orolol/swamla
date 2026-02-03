@@ -935,7 +935,6 @@ def train(args):
     # Compile model if requested
     if args.compile:
         # Reduce recompilations with FP8/torchao by inlining nn.Module checks
-        import torch._dynamo
         torch._dynamo.config.inline_inbuilt_nn_modules = True
 
         compile_mode = args.compile_mode
