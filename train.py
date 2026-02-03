@@ -1684,7 +1684,7 @@ def main():
 
     # Performance
     parser.add_argument('--compile', action='store_true', default=True)
-    parser.add_argument('--compile_mode', type=str, default='default',
+    parser.add_argument('--compile_mode', type=str, default='max-autotune',
                         choices=['reduce-overhead', 'max-autotune', 'default'],
                         help='torch.compile mode')
 
