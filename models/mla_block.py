@@ -11,7 +11,7 @@ except ImportError:
     te_checkpoint = None
 
 from normalization import RMSNorm, DynamicTanh
-from mla import MLA
+from mla import MLA, FLASH_ATTN_VERSION
 # from mla_fp8 import MLA_FP8
 from mlp import MLP
 # from tensor_utils import isolate_tensor, prevent_backward_reuse
@@ -161,3 +161,12 @@ class MLABlock(nn.Module):
             x = x + self._ffn_block(x)
 
         return x
+
+
+# Disable torch.compile for MLABlock when using FA3
+# FA3 custom ops don't have meta kernels required by Inductor
+# DeltaNet blocks will still be compiled normally
+if FLASH_ATTN_VERSION == 3:
+    if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'disable'):
+        MLABlock.forward = torch._dynamo.disable(MLABlock.forward)
+        print("MLABlock: torch.compile disabled (FA3 detected)")

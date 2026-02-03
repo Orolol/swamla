@@ -589,6 +589,9 @@ class MLA(nn.Module):
         """
         Run Flash Attention with proper dtype and dimension handling.
 
+        Note: When using FA3, this method is wrapped with torch._dynamo.disable
+        to prevent compilation issues with FA3's custom ops.
+
         Args:
             q: (B, T, H, D_qk) queries
             k: (B, T, H, D_qk) keys
