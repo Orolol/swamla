@@ -38,7 +38,7 @@ class DeltaNetLayerConfig:
     deltanet_latent_dim: int = 0  # 0 = disabled, >0 = latent dimension
     deltanet_share_qk: bool = False  # Share Q and K projection
     # Value Embeddings
-    use_value_embeds: bool = False
+    use_value_embeds: bool = True
     ve_gate_dim: int = 32
     vocab_size: int = 50304
     layer_id: Optional[int] = None
@@ -147,7 +147,7 @@ class SWAMLAConfig:
     ema_decay: float = 0.9999  # EMA decay factor
 
     # Value Embeddings (VE) - token-based value bias at alternating layers
-    use_value_embeds: bool = False
+    use_value_embeds: bool = True
     ve_gate_dim: int = 32  # Number of input dims for gate projection
 
     def __post_init__(self) -> None:
