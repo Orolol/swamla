@@ -159,10 +159,7 @@ class MLA(nn.Module):
         # Requires head_dim <= 128 (cuDNN constraint) and GPU CC >= 9.0
         self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
         if self.use_cudnn_sdpa:
-            if self.qk_head_dim > 128:
-                # MLA has qk_head_dim=192 (128 nope + 64 rope) which exceeds cuDNN's 128 limit
-                self.use_cudnn_sdpa = False
-            elif torch.cuda.is_available():
+            if torch.cuda.is_available():
                 cc = torch.cuda.get_device_capability()
                 if cc[0] >= 9:
                     print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
