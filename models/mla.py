@@ -164,7 +164,7 @@ class MLA(nn.Module):
                 self.use_cudnn_sdpa = False
             elif torch.cuda.is_available():
                 cc = torch.cuda.get_device_capability()
-                if cc[0] > 9:
+                if cc[0] >= 9:
                     print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
                 else:
                     self.use_cudnn_sdpa = False
