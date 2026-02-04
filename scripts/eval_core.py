@@ -501,13 +501,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def infer_config_from_weights(state_dict):
     """Infer model config from weight shapes."""
+    inferred = {}
+
     # Infer vocab_size and n_embd from embedding or lm_head
     if 'transformer.wte.weight' in state_dict:
-        vocab_size, n_embd = state_dict['transformer.wte.weight'].shape
+        inferred['vocab_size'], inferred['n_embd'] = state_dict['transformer.wte.weight'].shape
     elif 'lm_head.weight' in state_dict:
-        vocab_size, n_embd = state_dict['lm_head.weight'].shape
-    else:
-        return {}
+        inferred['vocab_size'], inferred['n_embd'] = state_dict['lm_head.weight'].shape
 
     # Infer n_layer by counting transformer blocks
     n_layer = 0
@@ -515,12 +515,40 @@ def infer_config_from_weights(state_dict):
         if key.startswith('transformer.h.'):
             layer_idx = int(key.split('.')[2])
             n_layer = max(n_layer, layer_idx + 1)
+    inferred['n_layer'] = n_layer
 
-    return {
-        'n_embd': n_embd,
-        'vocab_size': vocab_size,
-        'n_layer': n_layer,
-    }
+    # Infer n_head from DeltaNet g_proj (first DeltaNet block)
+    for i in range(n_layer):
+        key = f'transformer.h.{i}.attn.g_proj.weight'
+        if key in state_dict:
+            inferred['n_head'] = state_dict[key].shape[0]
+            break
+
+    # Infer MLA parameters from first MLA block
+    for i in range(n_layer):
+        wkv_a_key = f'transformer.h.{i}.attn.wkv_a.weight'
+        wkv_b_key = f'transformer.h.{i}.attn.wkv_b.weight'
+        wo_key = f'transformer.h.{i}.attn.wo.weight'
+        kv_norm_key = f'transformer.h.{i}.attn.kv_norm.weight'
+
+        if wkv_a_key in state_dict and wkv_b_key in state_dict:
+            # This is an MLA block
+            wkv_a_shape = state_dict[wkv_a_key].shape  # [kv_lora_rank + rope_dim, n_embd]
+            wkv_b_shape = state_dict[wkv_b_key].shape  # [n_head * (nope + v), kv_lora_rank + rope_dim]
+            wo_shape = state_dict[wo_key].shape  # [n_embd, n_head * v_head_dim]
+            kv_norm_shape = state_dict[kv_norm_key].shape  # [kv_lora_rank + rope_dim - some offset]
+
+            # wo gives us n_head * v_head_dim
+            n_head_times_v = wo_shape[1]
+
+            # Try to infer rope_head_dim from wkv_a
+            # wkv_a.shape[0] = kv_lora_rank + rope_head_dim
+            # kv_norm.shape[0] = kv_lora_rank + rope_head_dim (with possible offset)
+
+            # For now, just store raw dimensions - let the model figure it out
+            break
+
+    return inferred
 
 
 def load_swamla_checkpoint(checkpoint_path: str, device):
@@ -544,43 +572,38 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
             clean_state_dict[k] = v
     state_dict = clean_state_dict
 
-    # Infer config from weights
-    inferred = infer_config_from_weights(state_dict)
-    print0(f"Inferred from weights: n_embd={inferred.get('n_embd')}, n_layer={inferred.get('n_layer')}, vocab_size={inferred.get('vocab_size')}")
-
     # Get config from checkpoint
     if 'config' in checkpoint:
         config = checkpoint['config']
 
         # Handle both dict and SWAMLAConfig objects
         if isinstance(config, SWAMLAConfig):
-            config_dict = asdict(config)
+            # Already a proper config object - use directly
+            print0(f"Config from checkpoint (SWAMLAConfig): n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}, vocab_size={config.vocab_size}")
         elif isinstance(config, dict):
-            config_dict = config.copy()
+            # Debug: show what's in the config dict
+            print0(f"Config from checkpoint (dict): n_embd={config.get('n_embd')}, n_layer={config.get('n_layer')}, n_head={config.get('n_head')}, vocab_size={config.get('vocab_size')}")
+
+            # Filter out unknown keys that aren't in SWAMLAConfig
+            valid_fields = {f.name for f in fields(SWAMLAConfig)}
+            filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+
+            # Convert string lists to actual lists (from CLI args like "2,6")
+            list_fields = ['engram_layers', 'engram_ngram_orders']
+            for field_name in list_fields:
+                if field_name in filtered_config:
+                    val = filtered_config[field_name]
+                    if isinstance(val, str):
+                        filtered_config[field_name] = [int(x) for x in val.split(',')]
+
+            config = SWAMLAConfig(**filtered_config)
         else:
             raise ValueError(f"Unknown config type: {type(config)}")
-
-        # Filter out unknown keys that aren't in SWAMLAConfig
-        valid_fields = {f.name for f in fields(SWAMLAConfig)}
-        filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
-
-        # Convert string lists to actual lists (from CLI args like "2,6")
-        list_fields = ['engram_layers', 'engram_ngram_orders']
-        for field_name in list_fields:
-            if field_name in filtered_config:
-                val = filtered_config[field_name]
-                if isinstance(val, str):
-                    filtered_config[field_name] = [int(x) for x in val.split(',')]
-
-        # Override with inferred values (weights are ground truth)
-        filtered_config.update(inferred)
-
-        config = SWAMLAConfig(**filtered_config)
     else:
         raise ValueError("Checkpoint does not contain config")
 
     # Debug: print final config values
-    print0(f"Final config: n_embd={config.n_embd}, n_layer={config.n_layer}, vocab_size={config.vocab_size}, block_size={config.block_size}")
+    print0(f"Final config: n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}, vocab_size={config.vocab_size}, block_size={config.block_size}")
 
     # Create model directly from config
     model = SWAMLAModel(config)
