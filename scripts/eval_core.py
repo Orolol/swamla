@@ -501,6 +501,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def load_swamla_checkpoint(checkpoint_path: str, device):
     """Load a SWAMLA model from checkpoint."""
+    from dataclasses import fields
     print0(f"Loading checkpoint: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -509,7 +510,10 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
     if 'config' in checkpoint:
         config = checkpoint['config']
         if isinstance(config, dict):
-            config = SWAMLAConfig(**config)
+            # Filter out unknown keys that aren't in SWAMLAConfig
+            valid_fields = {f.name for f in fields(SWAMLAConfig)}
+            filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+            config = SWAMLAConfig(**filtered_config)
     else:
         raise ValueError("Checkpoint does not contain config")
 
