@@ -513,6 +513,15 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
             # Filter out unknown keys that aren't in SWAMLAConfig
             valid_fields = {f.name for f in fields(SWAMLAConfig)}
             filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+
+            # Convert string lists to actual lists (from CLI args like "2,6")
+            list_fields = ['engram_layers', 'engram_ngram_orders']
+            for field_name in list_fields:
+                if field_name in filtered_config:
+                    val = filtered_config[field_name]
+                    if isinstance(val, str):
+                        filtered_config[field_name] = [int(x) for x in val.split(',')]
+
             config = SWAMLAConfig(**filtered_config)
     else:
         raise ValueError("Checkpoint does not contain config")
