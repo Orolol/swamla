@@ -1648,11 +1648,16 @@ def train(args):
             if args.use_wedlm and mask_token_id is not None:
                 config_dict['wedlm_mask_token_id'] = mask_token_id
 
+            # Save model config as dataclass dict (contains actual dimensions)
+            from dataclasses import asdict
+            model_config_dict = asdict(raw_model.config)
+
             checkpoint = {
                 'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer_state,
                 'step': step,
-                'config': config_dict,
+                'config': model_config_dict,  # Use actual model config, not CLI args
+                'args': config_dict,  # Keep CLI args for reference
                 'total_tokens': total_tokens_seen,
                 # Token-based thresholds for correct resume
                 'last_eval_tokens': last_eval_tokens,

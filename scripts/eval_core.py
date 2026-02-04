@@ -46,7 +46,7 @@ from jinja2 import Template
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / 'models'))
 
-from models.swa_mla_model import SWAMLAModel, SWAMLAConfig
+from models.swa_mla_model import SWAMLAModel, SWAMLAConfig, create_swa_mla_model
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # -----------------------------------------------------------------------------
@@ -573,40 +573,52 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
     state_dict = clean_state_dict
 
     # Get config from checkpoint
+    config = None
+    use_fallback = False
+
     if 'config' in checkpoint:
-        config = checkpoint['config']
+        ckpt_config = checkpoint['config']
 
         # Handle both dict and SWAMLAConfig objects
-        if isinstance(config, SWAMLAConfig):
-            # Already a proper config object - use directly
-            print0(f"Config from checkpoint (SWAMLAConfig): n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}, vocab_size={config.vocab_size}")
-        elif isinstance(config, dict):
-            # Debug: show what's in the config dict
-            print0(f"Config from checkpoint (dict): n_embd={config.get('n_embd')}, n_layer={config.get('n_layer')}, n_head={config.get('n_head')}, vocab_size={config.get('vocab_size')}")
+        if isinstance(ckpt_config, SWAMLAConfig):
+            config = ckpt_config
+            print0(f"Config from checkpoint (SWAMLAConfig): n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}")
+        elif isinstance(ckpt_config, dict):
+            # Check if config has actual model dimensions (not just CLI args)
+            has_dimensions = ckpt_config.get('n_embd') is not None and ckpt_config.get('n_layer') is not None
+            print0(f"Config from checkpoint (dict): n_embd={ckpt_config.get('n_embd')}, n_layer={ckpt_config.get('n_layer')}, n_head={ckpt_config.get('n_head')}")
 
-            # Filter out unknown keys that aren't in SWAMLAConfig
-            valid_fields = {f.name for f in fields(SWAMLAConfig)}
-            filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+            if has_dimensions:
+                # Filter out unknown keys that aren't in SWAMLAConfig
+                valid_fields = {f.name for f in fields(SWAMLAConfig)}
+                filtered_config = {k: v for k, v in ckpt_config.items() if k in valid_fields}
 
-            # Convert string lists to actual lists (from CLI args like "2,6")
-            list_fields = ['engram_layers', 'engram_ngram_orders']
-            for field_name in list_fields:
-                if field_name in filtered_config:
-                    val = filtered_config[field_name]
-                    if isinstance(val, str):
-                        filtered_config[field_name] = [int(x) for x in val.split(',')]
+                # Convert string lists to actual lists (from CLI args like "2,6")
+                list_fields = ['engram_layers', 'engram_ngram_orders']
+                for field_name in list_fields:
+                    if field_name in filtered_config:
+                        val = filtered_config[field_name]
+                        if isinstance(val, str):
+                            filtered_config[field_name] = [int(x) for x in val.split(',')]
 
-            config = SWAMLAConfig(**filtered_config)
+                config = SWAMLAConfig(**filtered_config)
+            else:
+                use_fallback = True
         else:
-            raise ValueError(f"Unknown config type: {type(config)}")
+            use_fallback = True
     else:
-        raise ValueError("Checkpoint does not contain config")
+        use_fallback = True
 
-    # Debug: print final config values
-    print0(f"Final config: n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}, vocab_size={config.vocab_size}, block_size={config.block_size}")
-
-    # Create model directly from config
-    model = SWAMLAModel(config)
+    # Fallback to preset if config is incomplete
+    if use_fallback:
+        print0("Config incomplete - using fallback preset 'engram-moe-1b'")
+        model = create_swa_mla_model(size='engram-moe-1b', vocab_size=50257, block_size=2048)
+        config = model.config
+    else:
+        # Debug: print final config values
+        print0(f"Final config: n_embd={config.n_embd}, n_layer={config.n_layer}, n_head={config.n_head}, vocab_size={config.vocab_size}, block_size={config.block_size}")
+        # Create model directly from config
+        model = SWAMLAModel(config)
 
     # Load weights (state_dict already cleaned above)
     model.load_state_dict(state_dict, strict=False)
