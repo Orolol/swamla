@@ -347,28 +347,32 @@ class FoPE(nn.Module):
 
     def _precompute_cache(self, seq_len: int):
         """Precompute cos/sin cache with Fourier series."""
-        t = torch.arange(seq_len, device=self.inv_freq.device).float()
+        # Use consistent device - prefer sin_coef device if available, else inv_freq
+        device = self.sin_coef.device if self.sin_coef is not None else self.inv_freq.device
+
+        t = torch.arange(seq_len, device=device).float()
 
         # For floor frequencies (low freq, long wavelength): use constant 1
         # This effectively zeros out the rotation for these dimensions
         if self.n_floor > 0:
-            floor_cos = torch.ones(seq_len, self.n_floor, device=self.inv_freq.device)
-            floor_sin = torch.zeros(seq_len, self.n_floor, device=self.inv_freq.device)
+            floor_cos = torch.ones(seq_len, self.n_floor, device=device)
+            floor_sin = torch.zeros(seq_len, self.n_floor, device=device)
         else:
             floor_cos = None
             floor_sin = None
 
         # For active frequencies: apply Fourier series
         if self.n_active > 0:
-            # Get active inverse frequencies (higher frequencies)
-            active_inv_freq = self.inv_freq[self.n_floor:]  # [n_active]
+            # Get active inverse frequencies (higher frequencies) and ensure on correct device
+            active_inv_freq = self.inv_freq[self.n_floor:].to(device)  # [n_active]
 
             # Compute base angles: [seq_len, n_active]
             base_angles = torch.outer(t, active_inv_freq)
 
             # Compute harmonic angles: [seq_len, n_active, n_harmonics]
             # Each harmonic k has angle = k * base_angle
-            harmonic_angles = base_angles.unsqueeze(-1) * self.harmonic_mult.view(1, 1, -1)
+            harmonic_mult = self.harmonic_mult.to(device)
+            harmonic_angles = base_angles.unsqueeze(-1) * harmonic_mult.view(1, 1, -1)
 
             # Compute sin and cos for all harmonics
             sin_harmonics = torch.sin(harmonic_angles)  # [seq_len, n_active, n_harmonics]
@@ -381,12 +385,12 @@ class FoPE(nn.Module):
 
             # Create coefficient tensor with 1 for first harmonic
             sin_weights = torch.cat([
-                torch.ones(self.n_active, 1, device=self.sin_coef.device),
-                self.sin_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=self.sin_coef.device)
+                torch.ones(self.n_active, 1, device=device),
+                self.sin_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=device)
             ], dim=1)
             cos_weights = torch.cat([
-                torch.ones(self.n_active, 1, device=self.cos_coef.device),
-                self.cos_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=self.cos_coef.device)
+                torch.ones(self.n_active, 1, device=device),
+                self.cos_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=device)
             ], dim=1)
 
             # Weighted sum: [seq_len, n_active]
@@ -451,9 +455,17 @@ class FoPE(nn.Module):
 
         B, H, T, D = x.shape
 
-        # Extend cache if needed
-        if T > self.max_seq_len:
-            self._extend_cache(T)
+        # Extend cache if needed, or recompute if device changed
+        if T > self.max_seq_len or (self.cos_cached is not None and self.cos_cached.device != x.device):
+            # Move parameters to input device if needed
+            if self.sin_coef is not None and self.sin_coef.device != x.device:
+                self.sin_coef.data = self.sin_coef.data.to(x.device)
+                self.cos_coef.data = self.cos_coef.data.to(x.device)
+            if self.inv_freq.device != x.device:
+                self.inv_freq = self.inv_freq.to(x.device)
+            if self.harmonic_mult is not None and self.harmonic_mult.device != x.device:
+                self.harmonic_mult = self.harmonic_mult.to(x.device)
+            self._precompute_cache(max(T, self.max_seq_len))
 
         # Ensure input is contiguous
         x = x.contiguous()
