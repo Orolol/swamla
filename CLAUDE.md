@@ -57,6 +57,30 @@ python test_setup.py
 python test_tf32_config.py
 ```
 
+### Evaluation (CORE Benchmark)
+```bash
+# Evaluate a checkpoint on CORE benchmark (22 ICL tasks from DCLM paper)
+python scripts/eval_core.py --checkpoint outputs/engram-moe/checkpoint_step_10000.pt
+
+# Faster evaluation with DDP (multiple GPUs)
+torchrun --nproc_per_node=4 scripts/eval_core.py --checkpoint outputs/engram-moe/checkpoint_step_10000.pt
+
+# Quick evaluation (subset of examples per task)
+python scripts/eval_core.py --checkpoint outputs/engram-moe/checkpoint_step_10000.pt --max_per_task 100
+
+# Compare against GPT-2 baseline
+python scripts/eval_core.py --hf_model openai-community/gpt2
+
+# Save results to JSON
+python scripts/eval_core.py --checkpoint outputs/engram-moe/checkpoint_step_10000.pt --output results/core_eval.json
+```
+
+**CORE Benchmark Details:**
+- 22 ICL tasks from DCLM paper (arXiv:2406.11794)
+- GPT-2 baseline: **0.256525**
+- Tasks include: MMLU, HellaSwag, ARC, PIQA, WinoGrande, LAMBADA, etc.
+- Score = mean of centered accuracies: `(acc - random) / (1 - random)`
+
 ## Architecture Overview
 
 ### Hybrid Block Structure
@@ -257,6 +281,7 @@ swamla/
 │   └── swa.py                         # EMA model wrapper
 └── scripts/
     ├── train.sh                       # Consolidated training script
+    ├── eval_core.py                   # CORE benchmark evaluation (22 ICL tasks)
     ├── train_unified.sh               # Reference implementation with all features
     └── setup_deepinfra.sh             # Setup script for DeepInfra instances
 ```

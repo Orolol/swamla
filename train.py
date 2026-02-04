@@ -137,6 +137,31 @@ def format_params(n):
     return str(n)
 
 
+def parse_token_count(s: str) -> int:
+    """Parse token count string like '500M', '1B', '2.5B' into integer.
+
+    Supports K (thousands), M (millions), B (billions) suffixes.
+    Examples: '500M' -> 500_000_000, '2.5B' -> 2_500_000_000, '100K' -> 100_000
+    """
+    s = s.strip().upper()
+    multipliers = {'K': 1_000, 'M': 1_000_000, 'B': 1_000_000_000}
+    for suffix, mult in multipliers.items():
+        if s.endswith(suffix):
+            return int(float(s[:-1]) * mult)
+    return int(s)
+
+
+def format_tokens(n: int) -> str:
+    """Format token count with appropriate suffix for display."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    elif n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
 def print_training_banner(args, model, world_size, device, resume_step=0, resume_tokens=0):
     """Print compact training summary banner."""
     total_params = sum(p.numel() for p in model.parameters())
@@ -1157,6 +1182,21 @@ def train(args):
     # Adjust starting step
     start_step = resume_step
 
+    # Token-based validation and save thresholds
+    eval_token_threshold = parse_token_count(args.eval_tokens)
+    save_token_threshold = parse_token_count(args.save_tokens)
+
+    # Initialize from checkpoint if available, otherwise compute from resume_tokens
+    if resume_checkpoint:
+        last_eval_tokens = resume_checkpoint.get('last_eval_tokens', (resume_tokens // eval_token_threshold) * eval_token_threshold)
+        last_save_tokens = resume_checkpoint.get('last_save_tokens', (resume_tokens // save_token_threshold) * save_token_threshold)
+    else:
+        last_eval_tokens = 0
+        last_save_tokens = 0
+
+    if master_process:
+        print(f"Token-based triggers: eval every {format_tokens(eval_token_threshold)}, save every {format_tokens(save_token_threshold)}")
+
     # Store initial LR ratios for each optimizer to maintain proportions during scheduling
     # This is important for Muon which uses a much higher LR than AdamW
     optimizers_list = optimizer if isinstance(optimizer, list) else [optimizer]
@@ -1404,16 +1444,16 @@ def train(args):
             tokens_per_sec = (args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size * args.log_interval) / dt
 
             # Format total tokens for display
-            if total_tokens_seen < 1_000_000:
-                tokens_str = f"{total_tokens_seen // 1000}K"
-            elif total_tokens_seen < 1_000_000_000:
-                tokens_str = f"{total_tokens_seen / 1_000_000:.2f}M"
-            else:
-                tokens_str = f"{total_tokens_seen / 1_000_000_000:.2f}B"
+            tokens_str = format_tokens(total_tokens_seen)
+
+            # Calculate progress toward next evaluation
+            next_eval_at = last_eval_tokens + eval_token_threshold
+            tokens_to_eval = max(0, next_eval_at - total_tokens_seen)
+            eval_progress = f" | Next eval: {format_tokens(tokens_to_eval)}"
 
             # Include current seq_len/batch_size for progressive training tracking
             prog_info = f" | BS={current_batch_size}x{current_seq_len}" if progressive is not None else ""
-            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}{prog_info}")
+            print(f"Step {step:6d} | Loss: {lossf:.4f} | LR: {lr:.2e} | Tokens/sec: {tokens_per_sec:,.0f} | Total: {tokens_str}{eval_progress}{prog_info}")
 
             if wandb_run is not None:
                 log_dict = {
@@ -1461,8 +1501,12 @@ def train(args):
                             tb_writer.add_scalar(k, avg_value, step)
 
         # Validation (using next batches from same data loader)
-        # Skip validation at the exact resume step to avoid immediate validation after loading
-        if step % args.eval_interval == 0 and step > start_step and master_process:
+        # Token-based trigger: validate when we cross a new token threshold
+        current_eval_threshold = (total_tokens_seen // eval_token_threshold) * eval_token_threshold
+        should_eval = current_eval_threshold > last_eval_tokens and master_process
+
+        if should_eval:
+            last_eval_tokens = current_eval_threshold
             # CRITICAL: Synchronize all DDP ranks before validation
             # Without this, non-master ranks may timeout waiting for communication
             if is_ddp:
@@ -1584,8 +1628,13 @@ def train(args):
             if is_ddp:
                 dist.barrier()
 
-        # Checkpointing
-        if step % args.save_interval == 0 and step > 0 and master_process:
+        # Checkpointing (token-based trigger)
+        current_save_threshold = (total_tokens_seen // save_token_threshold) * save_token_threshold
+        should_save = current_save_threshold > last_save_tokens and master_process
+
+        if should_save:
+            last_save_tokens = current_save_threshold
+
             # Handle list of optimizers (e.g., Muon setup)
             if isinstance(optimizer, list):
                 optimizer_state = [opt.state_dict() for opt in optimizer]
@@ -1605,6 +1654,9 @@ def train(args):
                 'step': step,
                 'config': config_dict,
                 'total_tokens': total_tokens_seen,
+                # Token-based thresholds for correct resume
+                'last_eval_tokens': last_eval_tokens,
+                'last_save_tokens': last_save_tokens,
             }
 
             # Save EMA state if enabled
@@ -1618,9 +1670,11 @@ def train(args):
                     '_last_phase_idx': progressive._last_phase_idx,
                 }
 
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{step}.pt')
+            # Use token count in checkpoint filename for clarity
+            tokens_str = format_tokens(total_tokens_seen).replace('.', '_')
+            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{tokens_str}_step{step}.pt')
             torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Saved checkpoint to {checkpoint_path} ({format_tokens(total_tokens_seen)} tokens)")
 
         # Profiler step
         if profiler is not None:
@@ -1831,8 +1885,10 @@ def main():
     # Logging and checkpointing
     parser.add_argument('--output_dir', type=str, default='outputs/deltanet_mla')
     parser.add_argument('--log_interval', type=int, default=10)
-    parser.add_argument('--eval_interval', type=int, default=1000)
-    parser.add_argument('--save_interval', type=int, default=5000)
+    parser.add_argument('--eval_tokens', type=str, default='500M',
+                        help='Run validation every N tokens (e.g., 500M, 1B, 2.5B)')
+    parser.add_argument('--save_tokens', type=str, default='2B',
+                        help='Save checkpoint every N tokens (e.g., 2B, 5B)')
     parser.add_argument('--wandb_project', type=str, default="swamla")
     parser.add_argument('--wandb_run_name', type=str, default=None)
 

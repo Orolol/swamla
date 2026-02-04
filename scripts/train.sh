@@ -117,6 +117,10 @@ ENVIRONMENT VARIABLES:
     RESID_LR=0.005             LR for resid_lambdas (multiplicative)
     X0_BETA1=0.96              Beta1 for x0 params
 
+  Token-based Triggers:
+    EVAL_TOKENS=500M           Validate every N tokens (e.g., 500M, 1B, 2.5B)
+    SAVE_TOKENS=2B             Save checkpoint every N tokens (e.g., 2B, 5B)
+
 EOF
     exit 0
 }
@@ -364,6 +368,10 @@ X0_LR="${X0_LR:-0.5}"
 RESID_LR="${RESID_LR:-0.005}"
 X0_BETA1="${X0_BETA1:-0.96}"
 
+# Token-based validation and save triggers
+EVAL_TOKENS="${EVAL_TOKENS:-500M}"
+SAVE_TOKENS="${SAVE_TOKENS:-2B}"
+
 # =============================================================================
 # Auto-detect GPUs
 # =============================================================================
@@ -577,8 +585,8 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --mla_v_head_dim 128 \
     --tokenizer_name openai-community/gpt2 \
     --log_interval 50 \
-    --eval_interval 5000 \
-    --save_interval 5000 \
+    --eval_tokens $EVAL_TOKENS \
+    --save_tokens $SAVE_TOKENS \
     --fp8_backend auto \
     --compile \
     --compile_mode default \
