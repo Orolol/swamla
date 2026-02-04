@@ -100,6 +100,7 @@ class PackedFinewebDataset(IterableDataset):
         num_workers: int = 1,
         start_offset: int = 0,
         pin_memory: bool = True,
+        use_bestfit_crop: bool = True,  # BestFit-Crop packing (nanochat)
     ):
         super().__init__()
 
@@ -113,6 +114,7 @@ class PackedFinewebDataset(IterableDataset):
         self.num_workers = max(1, num_workers)
         self.start_offset = start_offset
         self.pin_memory = pin_memory
+        self.use_bestfit_crop = use_bestfit_crop
 
         # DDP awareness: detect if we're in a distributed environment
         try:
@@ -215,9 +217,31 @@ class PackedFinewebDataset(IterableDataset):
             start = end
         return chunks
 
+    def _bestfit_select(self, docs: List[torch.Tensor], remaining: int) -> Optional[int]:
+        """Find index of largest doc that fits entirely in remaining space.
+
+        BestFit selection: pick the largest document that fits entirely,
+        maximizing sequence utilization while avoiding document splitting.
+
+        Args:
+            docs: List of document tensors
+            remaining: Remaining space in the sequence
+
+        Returns:
+            Index of best-fitting document, or None if no document fits
+        """
+        best_idx = None
+        best_len = 0
+        for i, doc in enumerate(docs):
+            doc_len = doc.numel()
+            if doc_len <= remaining and doc_len > best_len:
+                best_idx = i
+                best_len = doc_len
+        return best_idx
+
     def _fill_sequence(self, docs: deque) -> Tuple[torch.Tensor, List[int]]:
         """
-        Fill a sequence with documents from the buffer.
+        Fill a sequence with documents from the buffer (greedy approach).
 
         Returns:
             out: 1D tensor of length max_length with packed documents
@@ -240,6 +264,63 @@ class PackedFinewebDataset(IterableDataset):
                 break
         return out, doc_lengths
 
+    def _fill_sequence_bestfit_crop(self, docs: List[torch.Tensor]) -> Tuple[torch.Tensor, List[int], List[torch.Tensor]]:
+        """
+        Fill a sequence using BestFit-Crop algorithm (nanochat approach).
+
+        BestFit: Select largest document that fits entirely from buffer.
+        Crop: When nothing fits, crop a document to fill exactly (100% utilization).
+
+        This achieves near-zero padding waste by:
+        1. Starting with BOS token
+        2. Selecting documents that maximize utilization
+        3. Cropping the last document to fill exactly
+
+        Args:
+            docs: List of document tensors (modified in place)
+
+        Returns:
+            out: 1D tensor of length max_length with packed documents
+            doc_lengths: List of document lengths packed into this sequence
+            remaining_docs: Documents that weren't used (for next sequence)
+        """
+        out = torch.full((self.max_length,), self.pad_id, dtype=torch.long)
+        doc_lengths = []
+        pos = 0
+
+        # Start with BOS token (if available)
+        bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+        if bos_id is not None:
+            out[0] = bos_id
+            pos = 1
+            # BOS counts as part of the first document for cu_seqlens consistency
+
+        while docs and pos < self.max_length:
+            remaining = self.max_length - pos
+
+            # BestFit: find largest doc that fits entirely
+            best_idx = self._bestfit_select(docs, remaining)
+
+            if best_idx is not None:
+                # Remove and use the best-fitting doc
+                doc = docs.pop(best_idx)
+                out[pos : pos + doc.numel()] = doc
+                doc_lengths.append(doc.numel())
+                pos += doc.numel()
+            else:
+                # Crop: nothing fits entirely, crop the first doc to fill exactly
+                if docs:
+                    doc = docs.pop(0)
+                    crop_len = min(doc.numel(), remaining)
+                    out[pos : pos + crop_len] = doc[:crop_len]
+                    doc_lengths.append(crop_len)
+                    pos += crop_len
+                    # Discard the rest of the cropped doc (nanochat approach)
+                    # This ensures 100% sequence utilization
+                break
+
+        return out, doc_lengths, docs
+
     def _build_batch(self, docs_buffer: deque) -> Optional[Dict[str, torch.Tensor]]:
         if len(docs_buffer) == 0:
             return None
@@ -251,14 +332,26 @@ class PackedFinewebDataset(IterableDataset):
         all_doc_lengths: List[List[int]] = []
         max_seqlen = 0
 
+        # Convert deque to list for BestFit-Crop (needs random access)
+        if self.use_bestfit_crop:
+            docs_list = list(docs_buffer)
+            docs_buffer.clear()
+
         for i in range(self.batch_size):
-            seq, doc_lengths = self._fill_sequence(docs_buffer)
+            if self.use_bestfit_crop:
+                seq, doc_lengths, docs_list = self._fill_sequence_bestfit_crop(docs_list)
+            else:
+                seq, doc_lengths = self._fill_sequence(docs_buffer)
             input_ids[i] = seq
             attention_mask[i] = (seq != self.pad_id).long()
             all_doc_lengths.append(doc_lengths)
             # Track max document length across entire batch
             if doc_lengths:
                 max_seqlen = max(max_seqlen, max(doc_lengths))
+
+        # Restore remaining docs to buffer for BestFit-Crop
+        if self.use_bestfit_crop:
+            docs_buffer.extend(docs_list)
 
         labels = input_ids.clone()
         labels[:, :-1] = input_ids[:, 1:]

@@ -113,6 +113,68 @@ Example: With defaults (2 DeltaNet + 1 MLA), a 12-layer model has the pattern:
 - `lion`: Lion optimizer (50% less memory than AdamW)
 - Alternative quantized optimizers: `AdamW8bit` (2x memory reduction), `AdamW4bit` (4x memory reduction)
 
+## YaRN (Yet another RoPE extensioN)
+
+YaRN enables context length extension at inference time, allowing models trained on shorter contexts (e.g., 2048 tokens) to process much longer sequences (8K-32K+) with minimal quality degradation.
+
+### How It Works
+
+YaRN uses **NTK-by-parts interpolation** to scale RoPE frequencies:
+- **High frequencies** (short wavelengths): Kept original (extrapolation) - preserves local positional information
+- **Low frequencies** (long wavelengths): Interpolated - allows extension beyond training length
+- **Middle frequencies**: Smooth transition via ramp function controlled by beta_slow and beta_fast
+
+Additionally, YaRN applies **attention temperature scaling** to maintain attention distribution quality at extended lengths.
+
+### Configuration
+
+YaRN is configured via `SWAMLAConfig`:
+```python
+SWAMLAConfig(
+    yarn_enabled=True,           # Enable YaRN
+    yarn_scale_factor=4.0,       # Extend context by 4x (2048 -> 8192)
+    yarn_original_max_seq_len=2048,  # Original training length
+    yarn_beta_fast=32.0,         # High frequency boundary
+    yarn_beta_slow=1.0,          # Low frequency boundary
+    yarn_attn_factor=None,       # Auto-computed: 0.1 * ln(scale_factor) + 1
+)
+```
+
+### CLI Usage
+
+```bash
+# Enable YaRN with 4x context extension
+python train.py --yarn_enabled --yarn_scale_factor 4.0 --yarn_original_max_seq_len 2048
+
+# Via train.sh
+YARN_ENABLED=true YARN_SCALE_FACTOR=4.0 ./scripts/train.sh --features yarn 8 8192
+
+# Or with environment variables
+YARN_SCALE_FACTOR=8.0 YARN_ORIGINAL_MAX_SEQ=2048 ./scripts/train.sh --features yarn 4 16384
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `yarn_enabled` | `False` | Enable YaRN context extension |
+| `yarn_scale_factor` | `1.0` | Context extension ratio (new_max_len / original_max_len) |
+| `yarn_original_max_seq_len` | `2048` | Original training context length |
+| `yarn_beta_fast` | `32.0` | Frequencies with wavelength ratio > beta_fast get full interpolation |
+| `yarn_beta_slow` | `1.0` | Frequencies with wavelength ratio < beta_slow keep original values |
+| `yarn_attn_factor` | `None` | Attention temperature scaling (auto-computed if None) |
+
+### Implementation Details
+
+- **Core functions**: `compute_yarn_inv_freq()` and `precompute_freqs_cis_yarn()` in `models/positional_encoding.py`
+- **MLA integration**: YaRN frequencies replace standard RoPE when enabled in `SWAMLAModel.__init__()`
+- **Attention scaling**: MLA applies `yarn_attn_factor` to softmax_scale in `models/mla.py`
+- **Backward compatible**: Default config (`yarn_enabled=False`) produces identical output to standard RoPE
+
+### Reference
+
+YaRN: Efficient Context Window Extension of Large Language Models (arXiv:2309.00071)
+
 ## File Structure
 
 ```
@@ -731,3 +793,10 @@ When adding new attention backends or features that need batch metadata:
 7. Add CLI argument in `train.py` argparser
 8. Add to model_kwargs dict in `train.py`
 9. Extract from batch and pass in training/validation loops
+
+## Active Technologies
+- Python 3.12+, PyTorch 2.10+ + torch, fla (for GatedDeltaNet) (001-fope-yarn)
+- N/A (in-memory computation) (001-fope-yarn)
+
+## Recent Changes
+- 001-fope-yarn: Added Python 3.12+, PyTorch 2.10+ + torch, fla (for GatedDeltaNet)

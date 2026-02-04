@@ -14,6 +14,7 @@ from mla_block import MLABlock
 from positional_encoding import (
     precompute_freqs_cis,
     precompute_freqs_cis_with_linear_scaling,
+    precompute_freqs_cis_yarn,
 )
 
 # Gated DeltaNet (linear attention O(n))
@@ -146,17 +147,56 @@ class SWAMLAConfig:
     use_ema: bool = False
     ema_decay: float = 0.9999  # EMA decay factor
 
+    # YaRN (Yet another RoPE extensioN) - Context length extension
+    # Enables inference on sequences longer than training length via NTK-by-parts interpolation
+    # Based on: https://arxiv.org/abs/2309.00071
+    yarn_enabled: bool = False  # Enable YaRN context extension
+    yarn_scale_factor: float = 1.0  # Context extension ratio (new_max_len / original_max_len)
+    yarn_original_max_seq_len: int = 2048  # Original training context length
+    yarn_beta_fast: float = 32.0  # High frequency boundary (extrapolation)
+    yarn_beta_slow: float = 1.0  # Low frequency boundary (interpolation)
+    yarn_attn_factor: Optional[float] = None  # Temperature scaling factor (auto-computed if None)
+
     # Value Embeddings (VE) - token-based value bias at alternating layers
     use_value_embeds: bool = True
     ve_gate_dim: int = 32  # Number of input dims for gate projection
+    # Per-layer residual scalars (nanochat x0/resid lambdas)
+    # x0_lambdas: additive residual from initial embeddings (zero-init)
+    # resid_lambdas: multiplicative scaling on running hidden state (one-init)
+    use_residual_scalars: bool = False
+    x0_lr: float = 0.5  # LR for x0_lambdas (additive, can be high)
+    resid_lr: float = 0.005  # LR for resid_lambdas (multiplicative, ~100x smaller)
+    x0_beta1: float = 0.96  # Higher beta1 for x0 params (nanochat finding)
 
     def __post_init__(self) -> None:
+        import math
+
         if self.expert_dim is None:
             self.expert_dim = self.n_embd
         if self.local_layers_per_cycle < 0 or self.mla_layers_per_cycle < 0:
             raise ValueError("Layer counts per cycle must be non-negative")
         if self.local_layers_per_cycle + self.mla_layers_per_cycle == 0:
             raise ValueError("At least one DeltaNet or MLA layer per cycle is required")
+
+        # YaRN configuration validation
+        if self.yarn_scale_factor < 1.0:
+            raise ValueError(f"yarn_scale_factor must be >= 1.0, got {self.yarn_scale_factor}")
+        if self.yarn_beta_fast <= self.yarn_beta_slow:
+            raise ValueError(
+                f"yarn_beta_fast ({self.yarn_beta_fast}) must be > yarn_beta_slow ({self.yarn_beta_slow})"
+            )
+        if self.yarn_original_max_seq_len <= 0:
+            raise ValueError(
+                f"yarn_original_max_seq_len must be > 0, got {self.yarn_original_max_seq_len}"
+            )
+
+        # Auto-compute YaRN attention factor if not provided
+        # YaRN paper formula: sqrt(1/t) = 0.1 * ln(s) + 1
+        if self.yarn_attn_factor is None and self.yarn_enabled:
+            if self.yarn_scale_factor > 1.0:
+                self.yarn_attn_factor = 0.1 * math.log(self.yarn_scale_factor) + 1.0
+            else:
+                self.yarn_attn_factor = 1.0
 
     @property
     def swa_layers_per_cycle(self) -> int:
@@ -190,7 +230,18 @@ class SWAMLAModel(nn.Module):
 
         # Precompute RoPE frequencies for MLA layers
         head_dim = config.qk_rope_head_dim
-        if config.rope_scaling is not None:
+        if config.yarn_enabled:
+            # YaRN: NTK-by-parts interpolation for extended context
+            freqs = precompute_freqs_cis_yarn(
+                head_dim,
+                config.block_size,
+                theta=config.rope_theta,
+                scale_factor=config.yarn_scale_factor,
+                beta_fast=config.yarn_beta_fast,
+                beta_slow=config.yarn_beta_slow,
+                original_max_seq_len=config.yarn_original_max_seq_len,
+            )
+        elif config.rope_scaling is not None:
             scaling_type = config.rope_scaling.get("type")
             scaling_factor = config.rope_scaling.get("factor")
             if scaling_type == "linear":
@@ -264,6 +315,17 @@ class SWAMLAModel(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
+
+        # Per-layer residual scalars (nanochat x0/resid lambdas)
+        # These enable per-layer control over residual connections
+        if config.use_residual_scalars:
+            # x0_lambdas: additive weight for initial embeddings (zero-init = no effect initially)
+            self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+            # resid_lambdas: multiplicative weight for running state (one-init = identity initially)
+            self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        else:
+            self.x0_lambdas = None
+            self.resid_lambdas = None
 
         self.apply(self._init_weights)
         self.param_count = sum(p.numel() for p in self.parameters())
@@ -378,6 +440,9 @@ class SWAMLAModel(nn.Module):
         tok_emb = self.transformer.wte(idx)
         x = self.transformer.drop(tok_emb)
 
+        # Save initial embeddings for residual scalars (x0 connection)
+        x0 = x if self.x0_lambdas is not None else None
+
         # Build attention mask
         if attention_mask_2d is not None:
             # Use provided 2D mask (for WeDLM dual-stream)
@@ -404,7 +469,12 @@ class SWAMLAModel(nn.Module):
         # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
         freqs_cis = self.freqs_cis[:max_pos].to(device, non_blocking=True).detach()
 
-        for block in self.transformer.h:
+        for layer_idx, block in enumerate(self.transformer.h):
+            # Apply per-layer residual scaling BEFORE block (if enabled)
+            # Formula: x = resid_lambda * x + x0_lambda * x0
+            if self.resid_lambdas is not None and self.x0_lambdas is not None:
+                x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
+
             if GatedDeltaNetBlock is not None and isinstance(block, GatedDeltaNetBlock):
                 # GatedDeltaNet: pass position_ids if using WeDLM adapter, and input_ids for VE
                 if position_ids is not None and hasattr(block, 'forward_with_positions'):
@@ -618,6 +688,13 @@ def _create_mla_block_config(config: SWAMLAConfig):
         # Value Embeddings
         use_value_embeds: bool = config.use_value_embeds
         ve_gate_dim: int = config.ve_gate_dim
+        # YaRN parameters
+        yarn_enabled: bool = config.yarn_enabled
+        yarn_scale_factor: float = config.yarn_scale_factor
+        yarn_original_max_seq_len: int = config.yarn_original_max_seq_len
+        yarn_beta_fast: float = config.yarn_beta_fast
+        yarn_beta_slow: float = config.yarn_beta_slow
+        yarn_attn_factor: Optional[float] = config.yarn_attn_factor
 
     return _Config()
 

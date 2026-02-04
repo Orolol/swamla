@@ -287,12 +287,29 @@ def get_lr(it, warmup_iters, max_iters, learning_rate, min_lr):
     return get_wsd_sched(it, warmup_iters, max_iters, learning_rate, min_lr)
 
 
-def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', engram_lr_multiplier=5.0):
+def get_wd_schedule(it, max_iters, initial_wd):
+    """Linear decay from initial_wd to 0 over training (nanochat finding).
+
+    Weight decay should decrease as training progresses because:
+    1. Early in training, WD helps regularize and prevents overfitting
+    2. Late in training, WD can hurt performance by preventing fine-tuning
+    """
+    if max_iters <= 0:
+        return initial_wd
+    return initial_wd * max(0.0, 1.0 - it / max_iters)
+
+
+def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', engram_lr_multiplier=5.0,
+                        x0_lr=0.5, resid_lr=0.005, x0_beta1=0.96):
     """Configure optimizer with proper parameter grouping.
 
     Engram parameters are handled specially:
     - Engram embedding tables: 5x LR (engram_lr_multiplier), no weight decay
     - Engram other params (w_k, w_v, conv): normal LR, weight decay
+
+    Residual scalars (nanochat x0/resid lambdas):
+    - x0_lambdas: high LR (0.5), higher beta1 (0.96), no weight decay
+    - resid_lambdas: low LR (0.005), standard betas, no weight decay
     """
 
     if optimizer_type == 'muon':
@@ -308,12 +325,19 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             muon_params = []
             adamw_params = []
             engram_embed_params = []  # Engram embeddings: high LR, no decay
+            x0_lambda_params = []  # x0_lambdas: high LR, higher beta1, no decay
+            resid_lambda_params = []  # resid_lambdas: low LR, no decay
 
             for name, param in model.named_parameters():
                 if not param.requires_grad:
                     continue
+                # Residual scalars (nanochat x0/resid lambdas)
+                if 'x0_lambdas' in name:
+                    x0_lambda_params.append(param)
+                elif 'resid_lambdas' in name:
+                    resid_lambda_params.append(param)
                 # Engram embedding tables: special treatment (5x LR, no decay)
-                if 'engram' in name and 'embeddings' in name and 'tables' in name:
+                elif 'engram' in name and 'embeddings' in name and 'tables' in name:
                     engram_embed_params.append(param)
                 elif any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
                     adamw_params.append(param)
@@ -340,20 +364,39 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
                     [{'params': engram_embed_params, 'weight_decay': 0.0}],
                     lr=engram_embed_lr, betas=betas, fused=True
                 ))
+            # x0_lambdas: high LR (0.5), higher beta1 (0.96), no weight decay
+            if x0_lambda_params:
+                optimizers.append(torch.optim.AdamW(
+                    [{'params': x0_lambda_params, 'weight_decay': 0.0}],
+                    lr=x0_lr, betas=(x0_beta1, betas[1]), fused=True
+                ))
+            # resid_lambdas: low LR (~100x smaller), standard betas, no weight decay
+            if resid_lambda_params:
+                optimizers.append(torch.optim.AdamW(
+                    [{'params': resid_lambda_params, 'weight_decay': 0.0}],
+                    lr=resid_lr, betas=betas, fused=True
+                ))
 
             return optimizers
 
-    # Standard AdamW configuration with Engram support
+    # Standard AdamW configuration with Engram and residual scalar support
     decay_params = []
     no_decay_params = []
     engram_embed_params = []  # Engram embeddings: high LR, no decay
     engram_other_params = []  # Engram w_k, w_v, conv: normal LR, with decay
+    x0_lambda_params = []  # x0_lambdas: high LR, higher beta1, no decay
+    resid_lambda_params = []  # resid_lambdas: low LR, no decay
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Residual scalars (nanochat x0/resid lambdas) - handle first
+        if 'x0_lambdas' in name:
+            x0_lambda_params.append(param)
+        elif 'resid_lambdas' in name:
+            resid_lambda_params.append(param)
         # Engram embedding tables: 5x LR, no weight decay (paper spec)
-        if 'engram' in name and 'embeddings' in name and 'tables' in name:
+        elif 'engram' in name and 'embeddings' in name and 'tables' in name:
             engram_embed_params.append(param)
         # Engram other params (w_k, w_v, conv weights): normal LR with decay
         elif 'engram' in name:
@@ -368,8 +411,8 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             decay_params.append(param)
 
     param_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
-        {'params': no_decay_params, 'weight_decay': 0.0, 'lr': learning_rate},
+        {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate, 'name': 'decay'},
+        {'params': no_decay_params, 'weight_decay': 0.0, 'lr': learning_rate, 'name': 'no_decay'},
     ]
 
     # Add Engram param groups
@@ -378,12 +421,31 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             'params': engram_embed_params,
             'weight_decay': 0.0,  # No weight decay for embeddings
             'lr': learning_rate * engram_lr_multiplier,  # 5x LR
+            'name': 'engram_embed',
         })
     if engram_other_params:
         param_groups.append({
             'params': engram_other_params,
             'weight_decay': weight_decay,
             'lr': learning_rate,
+            'name': 'engram_other',
+        })
+
+    # Add residual scalar param groups (nanochat x0/resid lambdas)
+    if x0_lambda_params:
+        param_groups.append({
+            'params': x0_lambda_params,
+            'weight_decay': 0.0,  # No weight decay
+            'lr': x0_lr,  # High LR (default 0.5)
+            'betas': (x0_beta1, betas[1]),  # Higher beta1 (default 0.96)
+            'name': 'x0_lambdas',
+        })
+    if resid_lambda_params:
+        param_groups.append({
+            'params': resid_lambda_params,
+            'weight_decay': 0.0,  # No weight decay
+            'lr': resid_lr,  # Low LR (default 0.005)
+            'name': 'resid_lambdas',
         })
 
     if device_type == 'cuda':
@@ -817,6 +879,18 @@ def train(args):
         engram_conv_kernel=args.engram_conv_kernel,
         # cuDNN-compatible heads
         cudnn_compatible_heads=args.cudnn_compatible_heads,
+        # Per-layer residual scalars (nanochat)
+        use_residual_scalars=args.use_residual_scalars,
+        x0_lr=args.x0_lr,
+        resid_lr=args.resid_lr,
+        x0_beta1=args.x0_beta1,
+        # YaRN: Context length extension
+        yarn_enabled=args.yarn_enabled,
+        yarn_scale_factor=args.yarn_scale_factor,
+        yarn_original_max_seq_len=args.yarn_original_max_seq_len,
+        yarn_beta_fast=args.yarn_beta_fast,
+        yarn_beta_slow=args.yarn_beta_slow,
+        yarn_attn_factor=args.yarn_attn_factor,
         # MoE parameters
         **moe_kwargs,
     )
@@ -970,6 +1044,7 @@ def train(args):
         tokenizer=tokenizer,
         shuffle=True,
         num_workers=args.num_workers,
+        use_bestfit_crop=args.use_bestfit_crop,
     )
 
     # Configure optimizer (μP-aware if enabled)
@@ -992,6 +1067,9 @@ def train(args):
             device_type='cuda' if torch.cuda.is_available() else 'cpu',
             optimizer_type=args.optimizer_type,
             engram_lr_multiplier=args.engram_lr_multiplier if args.use_engram else 1.0,
+            x0_lr=args.x0_lr,
+            resid_lr=args.resid_lr,
+            x0_beta1=args.x0_beta1,
         )
 
     # Load optimizer state if resuming
@@ -1117,6 +1195,7 @@ def train(args):
                     shuffle=True,
                     num_workers=args.num_workers,
                     start_offset=total_tokens_seen // new_seq_len,  # Approximate position
+                    use_bestfit_crop=args.use_bestfit_crop,
                 )
                 data_iter = iter(data_loader)
                 current_seq_len = new_seq_len
@@ -1260,6 +1339,34 @@ def train(args):
             else:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        # Update weight decay schedule (nanochat: linear decay from initial to 0)
+        if args.wd_schedule:
+            current_wd = get_wd_schedule(step, args.max_iters, args.weight_decay)
+            for opt in optimizers_list:
+                for pg in opt.param_groups:
+                    # Only update groups that originally had weight decay
+                    if pg.get('name') in ['decay', 'engram_other'] or 'weight_decay' not in pg:
+                        continue
+                    if pg.get('name') not in ['no_decay', 'engram_embed', 'x0_lambdas', 'resid_lambdas']:
+                        pg['weight_decay'] = current_wd
+
+        # Cautious weight decay (nanochat: only decay where update * weight >= 0)
+        # This prevents weight decay from fighting the gradient update
+        if args.cautious_wd and args.weight_decay > 0:
+            current_wd = get_wd_schedule(step, args.max_iters, args.weight_decay) if args.wd_schedule else args.weight_decay
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param.grad is None or not param.requires_grad:
+                        continue
+                    # Skip parameters that shouldn't have weight decay
+                    if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe', 'lambdas', 'engram']):
+                        continue
+                    # Cautious WD: only decay where grad and weight have same sign
+                    # (i.e., where the update would push weight toward zero)
+                    mask = (param.grad * param.data) >= 0
+                    # Apply selective weight decay manually
+                    param.data.mul_(1 - lr * current_wd * mask.float())
 
         # Optimizer step
         if isinstance(optimizer, list):
@@ -1633,6 +1740,30 @@ def main():
     parser.add_argument('--use_ema', action='store_true', help='Enable EMA weight averaging')
     parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay factor')
 
+    # YaRN (Yet another RoPE extensioN) - Context length extension
+    parser.add_argument('--yarn_enabled', action='store_true', default=False,
+                        help='Enable YaRN context extension via NTK-by-parts interpolation')
+    parser.add_argument('--yarn_scale_factor', type=float, default=1.0,
+                        help='YaRN context extension ratio (new_max_len / original_max_len)')
+    parser.add_argument('--yarn_original_max_seq_len', type=int, default=2048,
+                        help='Original training context length for YaRN scaling')
+    parser.add_argument('--yarn_beta_fast', type=float, default=32.0,
+                        help='YaRN high frequency boundary (extrapolation)')
+    parser.add_argument('--yarn_beta_slow', type=float, default=1.0,
+                        help='YaRN low frequency boundary (interpolation)')
+    parser.add_argument('--yarn_attn_factor', type=float, default=None,
+                        help='YaRN attention temperature scaling (auto-computed if None)')
+
+    # Per-layer residual scalars (nanochat x0/resid lambdas)
+    parser.add_argument('--use_residual_scalars', action='store_true', default=True,
+                        help='Enable per-layer residual scalars (x0_lambdas + resid_lambdas)')
+    parser.add_argument('--x0_lr', type=float, default=0.5,
+                        help='Learning rate for x0_lambdas (additive residual from embeddings)')
+    parser.add_argument('--resid_lr', type=float, default=0.005,
+                        help='Learning rate for resid_lambdas (multiplicative scaling)')
+    parser.add_argument('--x0_beta1', type=float, default=0.96,
+                        help='Beta1 for x0_lambdas optimizer (higher than default)')
+
     # LatentMoE parameters (always enabled for moe-* sizes)
     parser.add_argument('--use_moe', action='store_true', default=True, help='Enable MoE for MLA blocks')
     parser.add_argument('--use_latent_moe', action='store_true', default=True,
@@ -1668,9 +1799,17 @@ def main():
     # Optimizer (Muon + AdamW or pure AdamW)
     parser.add_argument('--optimizer_type', type=str, default='muon', choices=['adamw', 'muon'])
 
+    # Muon optimizer upgrades (nanochat findings)
+    parser.add_argument('--cautious_wd', action='store_true', default=False,
+                        help='Cautious weight decay: only decay where update pushes weight toward zero')
+    parser.add_argument('--wd_schedule', action='store_true', default=False,
+                        help='Linear weight decay schedule: decay WD from initial to 0 over training')
+
     # Data parameters
     parser.add_argument('--tokenizer_name', type=str, default='openai-community/gpt2')
     parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--use_bestfit_crop', action='store_true', default=True,
+                        help='Use BestFit-Crop packing for ~100%% sequence utilization (nanochat)')
 
     # Logging and checkpointing
     parser.add_argument('--output_dir', type=str, default='outputs/deltanet_mla')

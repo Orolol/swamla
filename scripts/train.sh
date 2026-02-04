@@ -51,7 +51,7 @@ PRESETS:
   moe           DeltaNet+MLA with LatentMoE
   engram        DeltaNet+MLA with Engram (no MoE)
   engram-moe    DeltaNet+MLA with Engram + LatentMoE (recommended)
-  full          All features enabled (μP, Progressive, EMA, Engram, MoE)
+  full          All features + nanochat optimizations (recommended for best perf)
   minimal       Minimal config for testing/debugging
 
 FEATURES (use with --features):
@@ -61,6 +61,12 @@ FEATURES (use with --features):
   engram        Enable Engram conditional memory
   moe           Enable LatentMoE
   deltanet-latent  Enable DeltaNet latent compression
+  yarn          Enable YaRN context extension (set YARN_SCALE_FACTOR env var)
+  nanochat      Enable all nanochat optimizations (resid-scalars + cautious-wd + wd-schedule)
+  resid-scalars Enable per-layer residual scalars (x0/resid lambdas)
+  cautious-wd   Enable cautious weight decay (only decay same-sign updates)
+  wd-schedule   Enable linear WD schedule (decay to 0 over training)
+  bestfit-crop  Enable BestFit-Crop packing (~100% seq utilization)
 
 EXAMPLES:
   # Basic training with presets
@@ -91,6 +97,18 @@ ENVIRONMENT VARIABLES:
     MUP_BASE_WIDTH=256         μP base width
     PROGRESSIVE_SCHEDULE="512:500M,1024:2B,2048:inf"
     EMA_DECAY=0.9999           EMA decay factor
+
+  YaRN (Context Extension):
+    YARN_ENABLED=false         Enable YaRN context extension
+    YARN_SCALE_FACTOR=1.0      Context extension ratio
+    YARN_ORIGINAL_MAX_SEQ=2048 Original training context length
+    YARN_BETA_FAST=32.0        High frequency boundary
+    YARN_BETA_SLOW=1.0         Low frequency boundary
+
+  Nanochat (per-layer residual scalars):
+    X0_LR=0.5                  LR for x0_lambdas (additive residual)
+    RESID_LR=0.005             LR for resid_lambdas (multiplicative)
+    X0_BETA1=0.96              Beta1 for x0 params
 
 EOF
     exit 0
@@ -181,6 +199,15 @@ USE_LATENT_MOE="${USE_LATENT_MOE:-false}"
 DELTANET_LATENT_DIM="${DELTANET_LATENT_DIM:-0}"
 DELTANET_SHARE_QK="${DELTANET_SHARE_QK:-false}"
 
+# Nanochat features
+USE_RESIDUAL_SCALARS="${USE_RESIDUAL_SCALARS:-false}"
+USE_CAUTIOUS_WD="${USE_CAUTIOUS_WD:-false}"
+USE_WD_SCHEDULE="${USE_WD_SCHEDULE:-false}"
+USE_BESTFIT_CROP="${USE_BESTFIT_CROP:-true}"  # Enabled by default
+
+# YaRN context extension
+USE_YARN="${USE_YARN:-false}"
+
 case "$PRESET" in
     base)
         MODEL_SIZE="${MODEL_SIZE:-moe-1b}"
@@ -213,6 +240,11 @@ case "$PRESET" in
         USE_EMA="true"
         USE_ENGRAM="true"
         USE_LATENT_MOE="true"
+        # Nanochat features
+        USE_RESIDUAL_SCALARS="true"
+        USE_CAUTIOUS_WD="true"
+        USE_WD_SCHEDULE="true"
+        USE_BESTFIT_CROP="true"
         OUTPUT_DIR="${OUTPUT_DIR:-outputs/full}"
         ;;
     minimal)
@@ -244,6 +276,19 @@ if [ -n "$FEATURES" ]; then
             engram) USE_ENGRAM="true" ;;
             moe) USE_LATENT_MOE="true" ;;
             deltanet-latent) DELTANET_LATENT_DIM="${DELTANET_LATENT_DIM:-256}" ;;
+            # YaRN context extension
+            yarn) USE_YARN="true" ;;
+            # Nanochat features
+            resid-scalars) USE_RESIDUAL_SCALARS="true" ;;
+            cautious-wd) USE_CAUTIOUS_WD="true" ;;
+            wd-schedule) USE_WD_SCHEDULE="true" ;;
+            bestfit-crop) USE_BESTFIT_CROP="true" ;;
+            nanochat)
+                USE_RESIDUAL_SCALARS="true"
+                USE_CAUTIOUS_WD="true"
+                USE_WD_SCHEDULE="true"
+                USE_BESTFIT_CROP="true"
+                ;;
             *) echo "Unknown feature: $feature"; exit 1 ;;
         esac
     done
@@ -286,6 +331,18 @@ MLA_Q_LORA_RANK="${MLA_Q_LORA_RANK:-0}"
 PROFILE_STEPS="${PROFILE_STEPS:-5}"
 PROFILE_WARMUP="${PROFILE_WARMUP:-2}"
 
+# YaRN: Context Extension
+YARN_ENABLED="${YARN_ENABLED:-$USE_YARN}"
+YARN_SCALE_FACTOR="${YARN_SCALE_FACTOR:-1.0}"
+YARN_ORIGINAL_MAX_SEQ="${YARN_ORIGINAL_MAX_SEQ:-2048}"
+YARN_BETA_FAST="${YARN_BETA_FAST:-32.0}"
+YARN_BETA_SLOW="${YARN_BETA_SLOW:-1.0}"
+
+# Nanochat: Per-layer residual scalars
+X0_LR="${X0_LR:-0.5}"
+RESID_LR="${RESID_LR:-0.005}"
+X0_BETA1="${X0_BETA1:-0.96}"
+
 # =============================================================================
 # Auto-detect GPUs
 # =============================================================================
@@ -321,6 +378,14 @@ echo "Features:"
 [ "$USE_ENGRAM" = "true" ] && echo "  ✓ Engram (layers=$ENGRAM_LAYERS, d_mem=$ENGRAM_D_MEM)" || echo "  ✗ Engram"
 [ "$USE_LATENT_MOE" = "true" ] && echo "  ✓ LatentMoE (ratio=$LATENT_RATIO, experts=$N_EXPERTS)" || echo "  ✗ LatentMoE"
 [ "$DELTANET_LATENT_DIM" != "0" ] && echo "  ✓ DeltaNet Latent (dim=$DELTANET_LATENT_DIM)"
+[ "$YARN_ENABLED" = "true" ] && echo "  ✓ YaRN (scale=$YARN_SCALE_FACTOR, orig_len=$YARN_ORIGINAL_MAX_SEQ)" || echo "  ✗ YaRN"
+
+echo ""
+echo "Nanochat Optimizations:"
+[ "$USE_RESIDUAL_SCALARS" = "true" ] && echo "  ✓ Residual Scalars (x0_lr=$X0_LR, resid_lr=$RESID_LR)" || echo "  ✗ Residual Scalars"
+[ "$USE_CAUTIOUS_WD" = "true" ] && echo "  ✓ Cautious Weight Decay" || echo "  ✗ Cautious Weight Decay"
+[ "$USE_WD_SCHEDULE" = "true" ] && echo "  ✓ WD Schedule (linear decay to 0)" || echo "  ✗ WD Schedule"
+[ "$USE_BESTFIT_CROP" = "true" ] && echo "  ✓ BestFit-Crop Packing" || echo "  ✗ BestFit-Crop Packing"
 echo ""
 
 if [ -n "$HF_REPO_ID" ]; then
@@ -421,6 +486,40 @@ if [ "$DELTANET_SHARE_QK" = "true" ]; then
     DELTANET_ARGS="$DELTANET_ARGS --deltanet_share_qk"
 fi
 
+# Nanochat: Residual Scalars
+RESID_SCALAR_ARGS=""
+if [ "$USE_RESIDUAL_SCALARS" = "true" ]; then
+    RESID_SCALAR_ARGS="--use_residual_scalars \
+        --x0_lr $X0_LR \
+        --resid_lr $RESID_LR \
+        --x0_beta1 $X0_BETA1"
+fi
+
+# Nanochat: Muon Optimizer Upgrades
+MUON_UPGRADE_ARGS=""
+if [ "$USE_CAUTIOUS_WD" = "true" ]; then
+    MUON_UPGRADE_ARGS="$MUON_UPGRADE_ARGS --cautious_wd"
+fi
+if [ "$USE_WD_SCHEDULE" = "true" ]; then
+    MUON_UPGRADE_ARGS="$MUON_UPGRADE_ARGS --wd_schedule"
+fi
+
+# Nanochat: BestFit-Crop Packing
+BESTFIT_ARGS=""
+if [ "$USE_BESTFIT_CROP" = "true" ]; then
+    BESTFIT_ARGS="--use_bestfit_crop"
+fi
+
+# YaRN: Context Extension
+YARN_ARGS=""
+if [ "$YARN_ENABLED" = "true" ]; then
+    YARN_ARGS="--yarn_enabled \
+        --yarn_scale_factor $YARN_SCALE_FACTOR \
+        --yarn_original_max_seq_len $YARN_ORIGINAL_MAX_SEQ \
+        --yarn_beta_fast $YARN_BETA_FAST \
+        --yarn_beta_slow $YARN_BETA_SLOW"
+fi
+
 # =============================================================================
 # Common Training Arguments
 # =============================================================================
@@ -451,13 +550,17 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --save_interval 5000 \
     --fp8_backend auto \
     --compile \
-    --compile_mode max-autotune \
+    --compile_mode default \
     $MUP_ARGS \
     $PROGRESSIVE_ARGS \
     $EMA_ARGS \
     $ENGRAM_ARGS \
     $MOE_ARGS \
     $DELTANET_ARGS \
+    $RESID_SCALAR_ARGS \
+    $MUON_UPGRADE_ARGS \
+    $BESTFIT_ARGS \
+    $YARN_ARGS \
     $HF_REPO_ARG \
     $RESUME_ARG \
     $TB_ARG \

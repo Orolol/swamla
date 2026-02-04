@@ -116,14 +116,23 @@ class MLA(nn.Module):
         
         # Attention scaling factor
         self.softmax_scale = self.qk_head_dim ** -0.5
-        
-        # For extended sequences
-        rope_factor = getattr(config, 'rope_factor', 1.0)
-        if rope_factor > 1.0 and hasattr(config, 'original_seq_len') and hasattr(config, 'max_seq_len'):
-            if config.max_seq_len > config.original_seq_len:
-                mscale = getattr(config, 'mscale', 1.0)
-                mscale = 0.1 * mscale * math.log(rope_factor) + 1.0
-                self.softmax_scale = self.softmax_scale * mscale * mscale
+
+        # YaRN attention temperature scaling
+        # When YaRN is enabled, multiply softmax_scale by attn_factor
+        # YaRN paper: sqrt(1/t) = 0.1 * ln(s) + 1, so softmax_scale *= attn_factor
+        yarn_enabled = getattr(config, 'yarn_enabled', False)
+        yarn_attn_factor = getattr(config, 'yarn_attn_factor', None)
+        if yarn_enabled and yarn_attn_factor is not None and yarn_attn_factor != 1.0:
+            self.softmax_scale = self.softmax_scale * yarn_attn_factor
+
+        # For extended sequences (legacy mscale logic, only if YaRN not enabled)
+        if not yarn_enabled:
+            rope_factor = getattr(config, 'rope_factor', 1.0)
+            if rope_factor > 1.0 and hasattr(config, 'original_seq_len') and hasattr(config, 'max_seq_len'):
+                if config.max_seq_len > config.original_seq_len:
+                    mscale = getattr(config, 'mscale', 1.0)
+                    mscale = 0.1 * mscale * math.log(rope_factor) + 1.0
+                    self.softmax_scale = self.softmax_scale * mscale * mscale
 
         
         # Set up caching for inference
@@ -157,7 +166,7 @@ class MLA(nn.Module):
 
         # cuDNN SDPA backend: native Hopper/Blackwell kernels instead of sm80 CUTLASS
         # Requires head_dim <= 128 (cuDNN constraint) and GPU CC >= 9.0
-        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
+        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', False) and SDPA_KERNEL_AVAILABLE
         if self.use_cudnn_sdpa:
             if torch.cuda.is_available():
                 cc = torch.cuda.get_device_capability()
