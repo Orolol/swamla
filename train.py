@@ -1369,7 +1369,9 @@ def train(args):
                         continue
                     # Cautious WD: only decay where grad and weight have same sign
                     # (i.e., where the update would push weight toward zero)
-                    mask = (param.grad * param.data) >= 0
+                    # Ensure grad is on same device as param.data
+                    grad = param.grad.to(param.data.device)
+                    mask = (grad * param.data) >= 0
                     # Apply selective weight decay manually
                     param.data.mul_(1 - lr * current_wd * mask.float())
 
