@@ -280,6 +280,11 @@ class FoPE(nn.Module):
     Based on: "Fourier Position Embedding: Enhancing Attention's Periodic
     Extension for Length Generalization" (arXiv:2412.17739)
 
+    NOTE: Unlike RoPE, FoPE has learnable parameters (sin_coef, cos_coef).
+    We do NOT cache the Fourier embeddings because:
+    1. Gradients must flow through the coefficients on every forward pass
+    2. Caching breaks gradient checkpointing (different tensor counts)
+
     Args:
         dim: Dimension of the position embeddings (typically qk_rope_head_dim)
         max_seq_len: Maximum sequence length for precomputation
@@ -335,17 +340,12 @@ class FoPE(nn.Module):
             self.register_parameter('cos_coef', None)
             self.register_buffer('harmonic_mult', None, persistent=False)
 
-        # Cache will be computed lazily on first forward pass
-        # This ensures it's on the correct device after model.to(device)
-        self.register_buffer('cos_cached', None, persistent=False)
-        self.register_buffer('sin_cached', None, persistent=False)
-        self._cache_seq_len = 0
-
-    def _compute_cache(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute cos/sin cache with Fourier series on the specified device."""
+    def _compute_embeddings(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Fourier position embeddings (always recomputed for gradient flow)."""
         t = torch.arange(seq_len, device=device).float()
 
         # For floor frequencies (low freq, long wavelength): use constant 1
+        # This effectively disables rotation for these dimensions
         if self.n_floor > 0:
             floor_cos = torch.ones(seq_len, self.n_floor, device=device)
             floor_sin = torch.zeros(seq_len, self.n_floor, device=device)
@@ -353,7 +353,7 @@ class FoPE(nn.Module):
             floor_cos = None
             floor_sin = None
 
-        # For active frequencies: apply Fourier series
+        # For active frequencies: apply Fourier series with learnable coefficients
         if self.n_active > 0:
             # Get active inverse frequencies
             active_inv_freq = self.inv_freq[self.n_floor:]  # [n_active]
@@ -368,7 +368,8 @@ class FoPE(nn.Module):
             sin_harmonics = torch.sin(harmonic_angles)
             cos_harmonics = torch.cos(harmonic_angles)
 
-            # Create coefficient tensor with 1 for first harmonic
+            # Create coefficient tensor with 1 for first harmonic (base frequency)
+            # Higher harmonics use learned coefficients
             sin_weights = torch.cat([
                 torch.ones(self.n_active, 1, device=device),
                 self.sin_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=device)
@@ -378,13 +379,14 @@ class FoPE(nn.Module):
                 self.cos_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=device)
             ], dim=1)
 
-            # Weighted sum: [seq_len, n_active]
+            # Weighted sum of harmonics: [seq_len, n_active]
             active_sin = torch.einsum('snh,nh->sn', sin_harmonics, sin_weights)
             active_cos = torch.einsum('snh,nh->sn', cos_harmonics, cos_weights)
 
-            # Normalize to prevent explosion
+            # Normalize to prevent explosion (use detached norm for stability)
             with torch.no_grad():
-                norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * (self.sin_coef.pow(2).mean().item() if self.n_harmonics > 1 else 0))
+                coef_var = self.sin_coef[:, 1:].pow(2).mean().item() if self.n_harmonics > 1 else 0
+                norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * coef_var)
             active_sin = active_sin / max(norm_factor, 1.0)
             active_cos = active_cos / max(norm_factor, 1.0)
         else:
@@ -393,23 +395,23 @@ class FoPE(nn.Module):
 
         # Concatenate floor and active parts
         if floor_cos is not None and active_cos is not None:
-            cos_cached = torch.cat([floor_cos, active_cos], dim=-1)
-            sin_cached = torch.cat([floor_sin, active_sin], dim=-1)
+            cos_emb = torch.cat([floor_cos, active_cos], dim=-1)
+            sin_emb = torch.cat([floor_sin, active_sin], dim=-1)
         elif floor_cos is not None:
-            cos_cached = floor_cos
-            sin_cached = floor_sin
+            cos_emb = floor_cos
+            sin_emb = floor_sin
         else:
-            cos_cached = active_cos
-            sin_cached = active_sin
+            cos_emb = active_cos
+            sin_emb = active_sin
 
         # Duplicate for full dim (RoPE uses paired dimensions)
-        cos_cached = torch.cat([cos_cached, cos_cached], dim=-1)
-        sin_cached = torch.cat([sin_cached, sin_cached], dim=-1)
+        cos_emb = torch.cat([cos_emb, cos_emb], dim=-1)
+        sin_emb = torch.cat([sin_emb, sin_emb], dim=-1)
 
         # Reshape for broadcasting: [1, 1, seq_len, dim]
         return (
-            cos_cached.view(1, 1, seq_len, self.dim),
-            sin_cached.view(1, 1, seq_len, self.dim)
+            cos_emb.view(1, 1, seq_len, self.dim),
+            sin_emb.view(1, 1, seq_len, self.dim)
         )
 
     def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
@@ -427,22 +429,9 @@ class FoPE(nn.Module):
             seq_len = x.shape[-2]
 
         B, H, T, D = x.shape
-        device = x.device
 
-        # Compute cache if needed (first call, longer sequence, or device change)
-        need_recompute = (
-            self.cos_cached is None or
-            T > self._cache_seq_len or
-            self.cos_cached.device != device
-        )
-
-        if need_recompute:
-            target_len = max(T, self.max_seq_len)
-            cos_cached, sin_cached = self._compute_cache(target_len, device)
-            # Store as regular tensors, not buffers (to avoid device issues)
-            self.cos_cached = cos_cached
-            self.sin_cached = sin_cached
-            self._cache_seq_len = target_len
+        # Always recompute embeddings - required for gradient flow and checkpointing compatibility
+        cos_emb, sin_emb = self._compute_embeddings(T, x.device)
 
         # Ensure input is contiguous
         x = x.contiguous()
@@ -451,13 +440,13 @@ class FoPE(nn.Module):
         x_reshaped = x.view(B, H, T, D // 2, 2)
         x1, x2 = x_reshaped[..., 0].contiguous(), x_reshaped[..., 1].contiguous()
 
-        # Get cached cos/sin for current sequence
-        cos = self.cos_cached[:, :, :T, :(D//2)]
-        sin = self.sin_cached[:, :, :T, :(D//2)]
+        # Get cos/sin for current sequence
+        cos = cos_emb[:, :, :T, :(D//2)]
+        sin = sin_emb[:, :, :T, :(D//2)]
 
         # Broadcast to batch and heads
-        cos = cos.expand(B, H, T, -1).contiguous()
-        sin = sin.expand(B, H, T, -1).contiguous()
+        cos = cos.expand(B, H, T, -1)
+        sin = sin.expand(B, H, T, -1)
 
         # Apply rotation
         rotated = torch.stack([
