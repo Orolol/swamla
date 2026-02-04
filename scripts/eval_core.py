@@ -551,7 +551,7 @@ def infer_config_from_weights(state_dict):
     return inferred
 
 
-def load_swamla_checkpoint(checkpoint_path: str, device):
+def load_swamla_checkpoint(checkpoint_path: str, device, size='engram-moe-1b', n_experts=None, latent_ratio=None):
     """Load a SWAMLA model from checkpoint."""
     from dataclasses import fields, asdict
     print0(f"Loading checkpoint: {checkpoint_path}")
@@ -611,8 +611,20 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
 
     # Fallback to preset if config is incomplete
     if use_fallback:
-        print0("Config incomplete - using fallback preset 'engram-moe-1b'")
-        model = create_swa_mla_model(size='engram-moe-1b', vocab_size=50257, block_size=2048)
+        print0(f"Config incomplete - using fallback preset '{size}'")
+        # Build config overrides from arguments
+        config_override = {}
+        if n_experts is not None:
+            config_override['n_experts'] = n_experts
+        if latent_ratio is not None:
+            config_override['latent_ratio'] = latent_ratio
+
+        model = create_swa_mla_model(
+            size=size,
+            vocab_size=50257,
+            block_size=2048,
+            config_override=config_override if config_override else None
+        )
         config = model.config
     else:
         # Debug: print final config values
@@ -653,6 +665,9 @@ def main():
     parser = argparse.ArgumentParser(description="CORE Benchmark Evaluation")
     parser.add_argument('--checkpoint', type=str, help='Path to SWAMLA checkpoint')
     parser.add_argument('--hf_model', type=str, help='HuggingFace model name (e.g., openai-community/gpt2)')
+    parser.add_argument('--size', type=str, default='engram-moe-1b', help='Model size preset for fallback (default: engram-moe-1b)')
+    parser.add_argument('--n_experts', type=int, default=None, help='Override number of experts')
+    parser.add_argument('--latent_ratio', type=int, default=None, help='Override latent ratio for MoE')
     parser.add_argument('--tokenizer', type=str, default='openai-community/gpt2', help='Tokenizer to use')
     parser.add_argument('--max_per_task', type=int, default=-1, help='Max examples per task (-1 = all)')
     parser.add_argument('--output', type=str, help='Output JSON file for results')
@@ -680,7 +695,12 @@ def main():
 
     # Load model
     if args.checkpoint:
-        model = load_swamla_checkpoint(args.checkpoint, device)
+        model = load_swamla_checkpoint(
+            args.checkpoint, device,
+            size=args.size,
+            n_experts=args.n_experts,
+            latent_ratio=args.latent_ratio
+        )
     else:
         model = load_hf_model(args.hf_model, device)
 
