@@ -175,6 +175,64 @@ YARN_SCALE_FACTOR=8.0 YARN_ORIGINAL_MAX_SEQ=2048 ./scripts/train.sh --features y
 
 YaRN: Efficient Context Window Extension of Large Language Models (arXiv:2309.00071)
 
+## FoPE (Fourier Position Embedding)
+
+FoPE models each dimension as a Fourier Series (multiple frequency components) instead of a single frequency like RoPE. This improves length generalization by:
+1. Using learnable coefficients to combine multiple harmonic frequencies
+2. Zeroing out undertrained frequency components (below floor frequency threshold)
+
+### Configuration
+
+FoPE is configured via `SWAMLAConfig`:
+```python
+SWAMLAConfig(
+    fope_enabled=True,           # Enable FoPE (replaces RoPE in MLA)
+    fope_n_harmonics=4,          # Number of harmonic components per dimension
+    fope_floor_ratio=0.1,        # Fraction of low frequencies to zero out
+    fope_coef_init_std=0.3,      # Std for Fourier coefficient initialization
+)
+```
+
+### CLI Usage
+
+```bash
+# Enable FoPE
+python train.py --fope_enabled --fope_n_harmonics 4
+
+# Via train.sh
+./scripts/train.sh --features fope 8 2048
+
+# Or with environment variables
+FOPE_ENABLED=true FOPE_N_HARMONICS=8 ./scripts/train.sh --features fope 4 4096
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `fope_enabled` | `False` | Enable FoPE (replaces standard RoPE) |
+| `fope_n_harmonics` | `4` | Number of harmonic components per dimension |
+| `fope_floor_ratio` | `0.1` | Fraction of low frequencies to zero out |
+| `fope_coef_init_std` | `0.3` | Standard deviation for coefficient initialization |
+
+### Implementation Details
+
+- **Core class**: `FoPE` in `models/positional_encoding.py`
+- **MLA integration**: When `fope_enabled=True`, MLA creates a `FoPE` instance instead of `RoPE`
+- **Learnable parameters**: `sin_coef` and `cos_coef` are trained during optimization
+- **Same interface**: FoPE has the same forward signature as RoPE, making integration seamless
+- **Backward compatible**: Default config (`fope_enabled=False`) uses standard RoPE
+
+### Combining with YaRN
+
+FoPE and YaRN serve different purposes:
+- **YaRN**: Context extension via NTK-by-parts interpolation (for inference on longer sequences)
+- **FoPE**: Fourier series position embeddings (for better length generalization during training)
+
+### Reference
+
+Fourier Position Embedding: Enhancing Attention's Periodic Extension for Length Generalization (arXiv:2412.17739)
+
 ## File Structure
 
 ```
@@ -189,7 +247,7 @@ swamla/
 │   ├── mlp.py                         # Feed-forward networks (SwiGLU)
 │   ├── engram.py                      # Engram (N-gram conditional memory)
 │   ├── normalization.py               # RMSNorm, DynamicTanh
-│   └── positional_encoding.py         # RoPE implementation
+│   └── positional_encoding.py         # RoPE, YaRN, and FoPE implementations
 ├── data/
 │   └── data_loader_packed.py          # Packed sequence data loader
 ├── optimization/

@@ -891,6 +891,11 @@ def train(args):
         yarn_beta_fast=args.yarn_beta_fast,
         yarn_beta_slow=args.yarn_beta_slow,
         yarn_attn_factor=args.yarn_attn_factor,
+        # FoPE: Fourier Position Embedding
+        fope_enabled=args.fope_enabled,
+        fope_n_harmonics=args.fope_n_harmonics,
+        fope_floor_ratio=args.fope_floor_ratio,
+        fope_coef_init_std=args.fope_coef_init_std,
         # MoE parameters
         **moe_kwargs,
     )
@@ -1753,6 +1758,16 @@ def main():
                         help='YaRN low frequency boundary (interpolation)')
     parser.add_argument('--yarn_attn_factor', type=float, default=None,
                         help='YaRN attention temperature scaling (auto-computed if None)')
+
+    # FoPE (Fourier Position Embedding) - Improved length generalization
+    parser.add_argument('--fope_enabled', action='store_true', default=False,
+                        help='Enable FoPE (replaces RoPE with Fourier series position embeddings)')
+    parser.add_argument('--fope_n_harmonics', type=int, default=4,
+                        help='Number of harmonic components per dimension for FoPE')
+    parser.add_argument('--fope_floor_ratio', type=float, default=0.1,
+                        help='Fraction of low frequencies to zero out (floor threshold)')
+    parser.add_argument('--fope_coef_init_std', type=float, default=0.3,
+                        help='Standard deviation for Fourier coefficient initialization')
 
     # Per-layer residual scalars (nanochat x0/resid lambdas)
     parser.add_argument('--use_residual_scalars', action='store_true', default=True,

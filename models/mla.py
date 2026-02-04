@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from positional_encoding import RoPE
+from positional_encoding import RoPE, FoPE
 
 
 # Import Flash Attention 2
@@ -175,8 +175,25 @@ class MLA(nn.Module):
                 else:
                     self.use_cudnn_sdpa = False
         
-        # Initialize RoPE before anything else
-        self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
+        # Initialize position embeddings (RoPE or FoPE)
+        # FoPE (Fourier Position Embedding) replaces RoPE for better length generalization
+        fope_enabled = getattr(config, 'fope_enabled', False)
+        if fope_enabled:
+            fope_n_harmonics = getattr(config, 'fope_n_harmonics', 4)
+            fope_floor_ratio = getattr(config, 'fope_floor_ratio', 0.1)
+            fope_coef_init_std = getattr(config, 'fope_coef_init_std', 0.3)
+            self.rope = FoPE(
+                dim=self.qk_rope_head_dim,
+                max_seq_len=self.max_seq_len,
+                base=getattr(config, 'rope_theta', 10000.0),
+                n_harmonics=fope_n_harmonics,
+                floor_ratio=fope_floor_ratio,
+                coef_init_std=fope_coef_init_std,
+            )
+            self.use_fope = True
+        else:
+            self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
+            self.use_fope = False
         
         # Only create caches for inference, not for training
         # This prevents memory leaks during training

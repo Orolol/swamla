@@ -267,6 +267,218 @@ def precompute_freqs_cis_yarn(
     return freqs_cis
 
 
+class FoPE(nn.Module):
+    """
+    Fourier Position Embedding (FoPE) implementation.
+
+    FoPE extends RoPE by modeling each dimension as a Fourier Series (multiple
+    frequency components) rather than a single frequency. This improves length
+    generalization by:
+    1. Using learnable coefficients to combine multiple frequencies
+    2. Zeroing out undertrained frequency components (below floor frequency)
+
+    Based on: "Fourier Position Embedding: Enhancing Attention's Periodic
+    Extension for Length Generalization" (arXiv:2412.17739)
+
+    Args:
+        dim: Dimension of the position embeddings (typically qk_rope_head_dim)
+        max_seq_len: Maximum sequence length for precomputation
+        base: Base frequency for RoPE computation (default: 10000)
+        n_harmonics: Number of harmonic components per dimension (default: 4)
+        floor_ratio: Fraction of frequencies to zero out (default: 0.1)
+        coef_init_std: Standard deviation for coefficient initialization (default: 0.3)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_seq_len: int = 2048,
+        base: float = 10000.0,
+        n_harmonics: int = 4,
+        floor_ratio: float = 0.1,
+        coef_init_std: float = 0.3,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        self.n_harmonics = n_harmonics
+        self.floor_ratio = floor_ratio
+        self.half_dim = dim // 2
+
+        # Compute base inverse frequencies (same as RoPE)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # Floor frequency: ω_l = 2π/N (frequencies below this are zeroed)
+        # This corresponds to the longest trainable wavelength
+        floor_freq = 2 * math.pi / max_seq_len
+        self.register_buffer('floor_freq', torch.tensor(floor_freq), persistent=False)
+
+        # Determine which frequencies are above the floor threshold
+        # Frequencies are ω_m = inv_freq (angular frequency)
+        n_floor = int(self.half_dim * floor_ratio)
+        n_active = self.half_dim - n_floor  # Frequencies that get Fourier treatment
+
+        self.n_floor = n_floor
+        self.n_active = n_active
+
+        # Learnable Fourier coefficients for harmonics
+        # Shape: [n_active, n_harmonics] for each of sin and cos
+        # These weights combine the dominant frequency with harmonics
+        if n_active > 0:
+            # Initialize with small values + identity for dominant frequency
+            self.sin_coef = nn.Parameter(
+                torch.randn(n_active, n_harmonics) * coef_init_std
+            )
+            self.cos_coef = nn.Parameter(
+                torch.randn(n_active, n_harmonics) * coef_init_std
+            )
+
+            # Harmonic multipliers: [1, 2, 3, 4, ...] for n_harmonics
+            harmonic_mult = torch.arange(1, n_harmonics + 1).float()
+            self.register_buffer('harmonic_mult', harmonic_mult, persistent=False)
+        else:
+            self.sin_coef = None
+            self.cos_coef = None
+
+        # Precompute and cache
+        self._precompute_cache(max_seq_len)
+
+    def _precompute_cache(self, seq_len: int):
+        """Precompute cos/sin cache with Fourier series."""
+        t = torch.arange(seq_len, device=self.inv_freq.device).float()
+
+        # For floor frequencies (low freq, long wavelength): use constant 1
+        # This effectively zeros out the rotation for these dimensions
+        if self.n_floor > 0:
+            floor_cos = torch.ones(seq_len, self.n_floor, device=self.inv_freq.device)
+            floor_sin = torch.zeros(seq_len, self.n_floor, device=self.inv_freq.device)
+        else:
+            floor_cos = None
+            floor_sin = None
+
+        # For active frequencies: apply Fourier series
+        if self.n_active > 0:
+            # Get active inverse frequencies (higher frequencies)
+            active_inv_freq = self.inv_freq[self.n_floor:]  # [n_active]
+
+            # Compute base angles: [seq_len, n_active]
+            base_angles = torch.outer(t, active_inv_freq)
+
+            # Compute harmonic angles: [seq_len, n_active, n_harmonics]
+            # Each harmonic k has angle = k * base_angle
+            harmonic_angles = base_angles.unsqueeze(-1) * self.harmonic_mult.view(1, 1, -1)
+
+            # Compute sin and cos for all harmonics
+            sin_harmonics = torch.sin(harmonic_angles)  # [seq_len, n_active, n_harmonics]
+            cos_harmonics = torch.cos(harmonic_angles)  # [seq_len, n_active, n_harmonics]
+
+            # Combine with learnable coefficients
+            # Base frequency (harmonic 1) gets weight 1, others get learned weights
+            # sin_out = sin(θ) + Σ_k a_k * sin(k*θ)
+            # cos_out = cos(θ) + Σ_k a_k * cos(k*θ)
+
+            # Create coefficient tensor with 1 for first harmonic
+            sin_weights = torch.cat([
+                torch.ones(self.n_active, 1, device=self.sin_coef.device),
+                self.sin_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=self.sin_coef.device)
+            ], dim=1)
+            cos_weights = torch.cat([
+                torch.ones(self.n_active, 1, device=self.cos_coef.device),
+                self.cos_coef[:, 1:] if self.n_harmonics > 1 else torch.empty(self.n_active, 0, device=self.cos_coef.device)
+            ], dim=1)
+
+            # Weighted sum: [seq_len, n_active]
+            active_sin = torch.einsum('snh,nh->sn', sin_harmonics, sin_weights)
+            active_cos = torch.einsum('snh,nh->sn', cos_harmonics, cos_weights)
+
+            # Normalize to prevent explosion
+            norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * (self.sin_coef.detach().pow(2).mean().item() if self.n_harmonics > 1 else 0))
+            active_sin = active_sin / max(norm_factor, 1.0)
+            active_cos = active_cos / max(norm_factor, 1.0)
+        else:
+            active_sin = None
+            active_cos = None
+
+        # Concatenate floor and active parts
+        if floor_cos is not None and active_cos is not None:
+            cos_cached = torch.cat([floor_cos, active_cos], dim=-1)
+            sin_cached = torch.cat([floor_sin, active_sin], dim=-1)
+        elif floor_cos is not None:
+            cos_cached = floor_cos
+            sin_cached = floor_sin
+        else:
+            cos_cached = active_cos
+            sin_cached = active_sin
+
+        # Duplicate for full dim (RoPE uses paired dimensions)
+        cos_cached = torch.cat([cos_cached, cos_cached], dim=-1)
+        sin_cached = torch.cat([sin_cached, sin_cached], dim=-1)
+
+        # Reshape for broadcasting: [1, 1, seq_len, dim]
+        self.register_buffer(
+            'cos_cached',
+            cos_cached.view(1, 1, seq_len, self.dim),
+            persistent=False
+        )
+        self.register_buffer(
+            'sin_cached',
+            sin_cached.view(1, 1, seq_len, self.dim),
+            persistent=False
+        )
+
+    def _extend_cache(self, new_max_len: int):
+        """Extend the cache for longer sequences."""
+        if new_max_len <= self.max_seq_len:
+            return
+        self.max_seq_len = new_max_len
+        self._precompute_cache(new_max_len)
+
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
+        """
+        Apply FoPE to input tensor.
+
+        Args:
+            x: Input tensor [B, H, T, D]
+            seq_len: Optional sequence length (defaults to x.shape[-2])
+
+        Returns:
+            Rotated tensor with same shape as input
+        """
+        if seq_len is None:
+            seq_len = x.shape[-2]
+
+        B, H, T, D = x.shape
+
+        # Extend cache if needed
+        if T > self.max_seq_len:
+            self._extend_cache(T)
+
+        # Ensure input is contiguous
+        x = x.contiguous()
+
+        # Reshape for rotation
+        x_reshaped = x.view(B, H, T, D // 2, 2)
+        x1, x2 = x_reshaped[..., 0].contiguous(), x_reshaped[..., 1].contiguous()
+
+        # Get cached cos/sin for current sequence
+        cos = self.cos_cached[:, :, :T, :(D//2)]
+        sin = self.sin_cached[:, :, :T, :(D//2)]
+
+        # Broadcast to batch and heads
+        cos = cos.expand(B, H, T, -1).contiguous()
+        sin = sin.expand(B, H, T, -1).contiguous()
+
+        # Apply rotation
+        rotated = torch.stack([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin,
+        ], dim=-1)
+
+        return rotated.view(B, H, T, D).contiguous()
+
+
 def apply_rope_with_positions(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,

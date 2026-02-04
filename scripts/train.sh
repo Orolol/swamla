@@ -62,6 +62,7 @@ FEATURES (use with --features):
   moe           Enable LatentMoE
   deltanet-latent  Enable DeltaNet latent compression
   yarn          Enable YaRN context extension (set YARN_SCALE_FACTOR env var)
+  fope          Enable FoPE (Fourier Position Embedding) for better length generalization
   nanochat      Enable all nanochat optimizations (resid-scalars + cautious-wd + wd-schedule)
   resid-scalars Enable per-layer residual scalars (x0/resid lambdas)
   cautious-wd   Enable cautious weight decay (only decay same-sign updates)
@@ -104,6 +105,12 @@ ENVIRONMENT VARIABLES:
     YARN_ORIGINAL_MAX_SEQ=2048 Original training context length
     YARN_BETA_FAST=32.0        High frequency boundary
     YARN_BETA_SLOW=1.0         Low frequency boundary
+
+  FoPE (Fourier Position Embedding):
+    FOPE_ENABLED=false         Enable FoPE (replaces RoPE with Fourier series)
+    FOPE_N_HARMONICS=4         Number of harmonic components per dimension
+    FOPE_FLOOR_RATIO=0.1       Fraction of low frequencies to zero out
+    FOPE_COEF_INIT_STD=0.3     Std for Fourier coefficient initialization
 
   Nanochat (per-layer residual scalars):
     X0_LR=0.5                  LR for x0_lambdas (additive residual)
@@ -208,6 +215,9 @@ USE_BESTFIT_CROP="${USE_BESTFIT_CROP:-true}"  # Enabled by default
 # YaRN context extension
 USE_YARN="${USE_YARN:-false}"
 
+# FoPE (Fourier Position Embedding)
+USE_FOPE="${USE_FOPE:-false}"
+
 case "$PRESET" in
     base)
         MODEL_SIZE="${MODEL_SIZE:-moe-1b}"
@@ -240,6 +250,9 @@ case "$PRESET" in
         USE_EMA="true"
         USE_ENGRAM="true"
         USE_LATENT_MOE="true"
+        # Position embeddings
+        USE_YARN="true"
+        USE_FOPE="true"
         # Nanochat features
         USE_RESIDUAL_SCALARS="true"
         USE_CAUTIOUS_WD="true"
@@ -278,6 +291,8 @@ if [ -n "$FEATURES" ]; then
             deltanet-latent) DELTANET_LATENT_DIM="${DELTANET_LATENT_DIM:-256}" ;;
             # YaRN context extension
             yarn) USE_YARN="true" ;;
+            # FoPE (Fourier Position Embedding)
+            fope) USE_FOPE="true" ;;
             # Nanochat features
             resid-scalars) USE_RESIDUAL_SCALARS="true" ;;
             cautious-wd) USE_CAUTIOUS_WD="true" ;;
@@ -338,6 +353,12 @@ YARN_ORIGINAL_MAX_SEQ="${YARN_ORIGINAL_MAX_SEQ:-2048}"
 YARN_BETA_FAST="${YARN_BETA_FAST:-32.0}"
 YARN_BETA_SLOW="${YARN_BETA_SLOW:-1.0}"
 
+# FoPE: Fourier Position Embedding
+FOPE_ENABLED="${FOPE_ENABLED:-$USE_FOPE}"
+FOPE_N_HARMONICS="${FOPE_N_HARMONICS:-4}"
+FOPE_FLOOR_RATIO="${FOPE_FLOOR_RATIO:-0.1}"
+FOPE_COEF_INIT_STD="${FOPE_COEF_INIT_STD:-0.3}"
+
 # Nanochat: Per-layer residual scalars
 X0_LR="${X0_LR:-0.5}"
 RESID_LR="${RESID_LR:-0.005}"
@@ -379,6 +400,7 @@ echo "Features:"
 [ "$USE_LATENT_MOE" = "true" ] && echo "  ✓ LatentMoE (ratio=$LATENT_RATIO, experts=$N_EXPERTS)" || echo "  ✗ LatentMoE"
 [ "$DELTANET_LATENT_DIM" != "0" ] && echo "  ✓ DeltaNet Latent (dim=$DELTANET_LATENT_DIM)"
 [ "$YARN_ENABLED" = "true" ] && echo "  ✓ YaRN (scale=$YARN_SCALE_FACTOR, orig_len=$YARN_ORIGINAL_MAX_SEQ)" || echo "  ✗ YaRN"
+[ "$FOPE_ENABLED" = "true" ] && echo "  ✓ FoPE (harmonics=$FOPE_N_HARMONICS, floor=$FOPE_FLOOR_RATIO)" || echo "  ✗ FoPE"
 
 echo ""
 echo "Nanochat Optimizations:"
@@ -520,6 +542,15 @@ if [ "$YARN_ENABLED" = "true" ]; then
         --yarn_beta_slow $YARN_BETA_SLOW"
 fi
 
+# FoPE: Fourier Position Embedding
+FOPE_ARGS=""
+if [ "$FOPE_ENABLED" = "true" ]; then
+    FOPE_ARGS="--fope_enabled \
+        --fope_n_harmonics $FOPE_N_HARMONICS \
+        --fope_floor_ratio $FOPE_FLOOR_RATIO \
+        --fope_coef_init_std $FOPE_COEF_INIT_STD"
+fi
+
 # =============================================================================
 # Common Training Arguments
 # =============================================================================
@@ -561,6 +592,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     $MUON_UPGRADE_ARGS \
     $BESTFIT_ARGS \
     $YARN_ARGS \
+    $FOPE_ARGS \
     $HF_REPO_ARG \
     $RESUME_ARG \
     $TB_ARG \

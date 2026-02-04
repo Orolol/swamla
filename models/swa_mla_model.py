@@ -15,6 +15,7 @@ from positional_encoding import (
     precompute_freqs_cis,
     precompute_freqs_cis_with_linear_scaling,
     precompute_freqs_cis_yarn,
+    FoPE,
 )
 
 # Gated DeltaNet (linear attention O(n))
@@ -156,6 +157,14 @@ class SWAMLAConfig:
     yarn_beta_fast: float = 32.0  # High frequency boundary (extrapolation)
     yarn_beta_slow: float = 1.0  # Low frequency boundary (interpolation)
     yarn_attn_factor: Optional[float] = None  # Temperature scaling factor (auto-computed if None)
+
+    # FoPE (Fourier Position Embedding) - Improved length generalization
+    # Models each dimension as a Fourier series instead of single frequency
+    # Based on: https://arxiv.org/abs/2412.17739
+    fope_enabled: bool = False  # Enable FoPE (replaces standard RoPE in MLA)
+    fope_n_harmonics: int = 4  # Number of harmonic components per dimension
+    fope_floor_ratio: float = 0.1  # Fraction of low frequencies to zero out
+    fope_coef_init_std: float = 0.3  # Std for Fourier coefficient initialization
 
     # Value Embeddings (VE) - token-based value bias at alternating layers
     use_value_embeds: bool = True
@@ -695,6 +704,11 @@ def _create_mla_block_config(config: SWAMLAConfig):
         yarn_beta_fast: float = config.yarn_beta_fast
         yarn_beta_slow: float = config.yarn_beta_slow
         yarn_attn_factor: Optional[float] = config.yarn_attn_factor
+        # FoPE parameters
+        fope_enabled: bool = config.fope_enabled
+        fope_n_harmonics: int = config.fope_n_harmonics
+        fope_floor_ratio: float = config.fope_floor_ratio
+        fope_coef_init_std: float = config.fope_coef_init_std
 
     return _Config()
 
