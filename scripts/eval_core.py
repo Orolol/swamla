@@ -499,6 +499,30 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 # -----------------------------------------------------------------------------
 # Model loading
 
+def infer_config_from_weights(state_dict):
+    """Infer model config from weight shapes."""
+    # Infer vocab_size and n_embd from embedding or lm_head
+    if 'transformer.wte.weight' in state_dict:
+        vocab_size, n_embd = state_dict['transformer.wte.weight'].shape
+    elif 'lm_head.weight' in state_dict:
+        vocab_size, n_embd = state_dict['lm_head.weight'].shape
+    else:
+        return {}
+
+    # Infer n_layer by counting transformer blocks
+    n_layer = 0
+    for key in state_dict.keys():
+        if key.startswith('transformer.h.'):
+            layer_idx = int(key.split('.')[2])
+            n_layer = max(n_layer, layer_idx + 1)
+
+    return {
+        'n_embd': n_embd,
+        'vocab_size': vocab_size,
+        'n_layer': n_layer,
+    }
+
+
 def load_swamla_checkpoint(checkpoint_path: str, device):
     """Load a SWAMLA model from checkpoint."""
     from dataclasses import fields, asdict
@@ -506,53 +530,63 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
+    # Get state dict first to infer dimensions
+    state_dict = checkpoint.get('model', checkpoint.get('model_state_dict', checkpoint))
+
+    # Handle DDP/compile prefixes
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            clean_state_dict[k[7:]] = v
+        elif k.startswith('_orig_mod.'):
+            clean_state_dict[k[10:]] = v
+        else:
+            clean_state_dict[k] = v
+    state_dict = clean_state_dict
+
+    # Infer config from weights
+    inferred = infer_config_from_weights(state_dict)
+    print0(f"Inferred from weights: n_embd={inferred.get('n_embd')}, n_layer={inferred.get('n_layer')}, vocab_size={inferred.get('vocab_size')}")
+
     # Get config from checkpoint
     if 'config' in checkpoint:
         config = checkpoint['config']
 
         # Handle both dict and SWAMLAConfig objects
         if isinstance(config, SWAMLAConfig):
-            # Already a config object, use as-is
-            pass
+            config_dict = asdict(config)
         elif isinstance(config, dict):
-            # Filter out unknown keys that aren't in SWAMLAConfig
-            valid_fields = {f.name for f in fields(SWAMLAConfig)}
-            filtered_config = {k: v for k, v in config.items() if k in valid_fields}
-
-            # Convert string lists to actual lists (from CLI args like "2,6")
-            list_fields = ['engram_layers', 'engram_ngram_orders']
-            for field_name in list_fields:
-                if field_name in filtered_config:
-                    val = filtered_config[field_name]
-                    if isinstance(val, str):
-                        filtered_config[field_name] = [int(x) for x in val.split(',')]
-
-            config = SWAMLAConfig(**filtered_config)
+            config_dict = config.copy()
         else:
             raise ValueError(f"Unknown config type: {type(config)}")
+
+        # Filter out unknown keys that aren't in SWAMLAConfig
+        valid_fields = {f.name for f in fields(SWAMLAConfig)}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+
+        # Convert string lists to actual lists (from CLI args like "2,6")
+        list_fields = ['engram_layers', 'engram_ngram_orders']
+        for field_name in list_fields:
+            if field_name in filtered_config:
+                val = filtered_config[field_name]
+                if isinstance(val, str):
+                    filtered_config[field_name] = [int(x) for x in val.split(',')]
+
+        # Override with inferred values (weights are ground truth)
+        filtered_config.update(inferred)
+
+        config = SWAMLAConfig(**filtered_config)
     else:
         raise ValueError("Checkpoint does not contain config")
 
-    # Debug: print key config values
-    print0(f"Config: n_embd={config.n_embd}, n_layer={config.n_layer}, vocab_size={config.vocab_size}, block_size={config.block_size}")
+    # Debug: print final config values
+    print0(f"Final config: n_embd={config.n_embd}, n_layer={config.n_layer}, vocab_size={config.vocab_size}, block_size={config.block_size}")
 
     # Create model directly from config
     model = SWAMLAModel(config)
 
-    # Load weights
-    state_dict = checkpoint.get('model', checkpoint.get('model_state_dict', checkpoint))
-
-    # Handle DDP prefix
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.'):
-            new_state_dict[k[7:]] = v
-        elif k.startswith('_orig_mod.'):
-            new_state_dict[k[10:]] = v
-        else:
-            new_state_dict[k] = v
-
-    model.load_state_dict(new_state_dict, strict=False)
+    # Load weights (state_dict already cleaned above)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
 
