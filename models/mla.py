@@ -164,16 +164,10 @@ class MLA(nn.Module):
         if self.use_varlen_attn:
             print(f"MLA: Using varlen_attn (PyTorch 2.10+)")
 
-        # cuDNN SDPA backend: native Hopper/Blackwell kernels instead of sm80 CUTLASS
-        # Requires head_dim <= 128 (cuDNN constraint) and GPU CC >= 9.0
-        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', False) and SDPA_KERNEL_AVAILABLE
+        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
         if self.use_cudnn_sdpa:
-            if torch.cuda.is_available():
-                cc = torch.cuda.get_device_capability()
-                if cc[0] >= 9:
-                    print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
-                else:
-                    self.use_cudnn_sdpa = False
+            print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
+               
         
         # Initialize position embeddings (RoPE or FoPE)
         # FoPE (Fourier Position Embedding) replaces RoPE for better length generalization

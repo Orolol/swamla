@@ -426,6 +426,9 @@ class EngramGating(nn.Module):
                 (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale
             )  # [B, T, 1]
 
+            # Store gate scalar for metrics (before multiplication with v)
+            self.last_gate = gate.detach()  # [B, T, 1]
+
             return gate * v  # [B, T, d]
 
         else:
@@ -578,6 +581,7 @@ class Engram(nn.Module):
         # For monitoring/debugging
         self.last_gate_values = None
         self.last_memory = None
+        self.last_scalar_gate = None  # Scalar gate values (0-1) for accurate activation_rate
 
     @property
     def tokenizer_compression(self) -> TokenizerCompression:
@@ -622,9 +626,11 @@ class Engram(nn.Module):
         # 3. Apply context-aware gating
         gated = self.gating(hidden_states, memory)  # [B, T, d] or list
 
-        # Store gate values for monitoring (compute from gated/v ratio if needed)
+        # Store gate values for monitoring
         if not isinstance(gated, list):
             self.last_gate_values = gated.detach()
+            # Store scalar gate from gating module for accurate activation_rate metric
+            self.last_scalar_gate = self.gating.last_gate.detach() if hasattr(self.gating, 'last_gate') else None
 
         # 4. Apply causal convolution (per branch if multi-branch)
         if isinstance(gated, list):
@@ -657,7 +663,8 @@ class Engram(nn.Module):
             Dict with:
             - engram/gate_mean: Mean norm of gated values
             - engram/gate_std: Std dev of gate norms
-            - engram/activation_rate: Proportion of gates with normalized norm > 0.5
+            - engram/activation_rate: Proportion of scalar gates > 0.5
+            - engram/gate_scalar_mean: Mean of scalar gate values (0-1)
             - engram/memory_norm: Mean norm of retrieved memory embeddings
         """
         metrics = {}
@@ -669,8 +676,13 @@ class Engram(nn.Module):
             metrics['engram/gate_mean'] = gate_norms.mean().item()
             metrics['engram/gate_std'] = gate_norms.std().item()
 
-            # Activation rate: proportion of gates that are "active"
-            # Normalize by expected max norm (sqrt(d) for unit vectors)
+        # Activation rate: proportion of gates > 0.5 (on scalar gate, not norms)
+        if self.last_scalar_gate is not None:
+            metrics['engram/activation_rate'] = (self.last_scalar_gate > 0.5).float().mean().item()
+            metrics['engram/gate_scalar_mean'] = self.last_scalar_gate.mean().item()
+        elif self.last_gate_values is not None:
+            # Fallback: use normalized gate norms (legacy, less accurate)
+            gate_norms = self.last_gate_values.norm(dim=-1)
             max_norm = (self.hidden_dim ** 0.5)
             normalized_gates = gate_norms / max_norm
             metrics['engram/activation_rate'] = (normalized_gates > 0.5).float().mean().item()
