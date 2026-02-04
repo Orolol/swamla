@@ -46,7 +46,7 @@ from jinja2 import Template
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / 'models'))
 
-from models.swa_mla_model import create_swa_mla_model, SWAMLAConfig
+from models.swa_mla_model import SWAMLAModel, SWAMLAConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # -----------------------------------------------------------------------------
@@ -517,13 +517,8 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
     else:
         raise ValueError("Checkpoint does not contain config")
 
-    # Create model
-    model = create_swa_mla_model(
-        size=None,
-        vocab_size=config.vocab_size,
-        block_size=config.block_size,
-        config_override=config.__dict__
-    )
+    # Create model directly from config
+    model = SWAMLAModel(config)
 
     # Load weights
     state_dict = checkpoint.get('model', checkpoint.get('model_state_dict', checkpoint))
