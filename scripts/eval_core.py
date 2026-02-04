@@ -501,7 +501,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def load_swamla_checkpoint(checkpoint_path: str, device):
     """Load a SWAMLA model from checkpoint."""
-    from dataclasses import fields
+    from dataclasses import fields, asdict
     print0(f"Loading checkpoint: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -509,7 +509,12 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
     # Get config from checkpoint
     if 'config' in checkpoint:
         config = checkpoint['config']
-        if isinstance(config, dict):
+
+        # Handle both dict and SWAMLAConfig objects
+        if isinstance(config, SWAMLAConfig):
+            # Already a config object, use as-is
+            pass
+        elif isinstance(config, dict):
             # Filter out unknown keys that aren't in SWAMLAConfig
             valid_fields = {f.name for f in fields(SWAMLAConfig)}
             filtered_config = {k: v for k, v in config.items() if k in valid_fields}
@@ -523,8 +528,13 @@ def load_swamla_checkpoint(checkpoint_path: str, device):
                         filtered_config[field_name] = [int(x) for x in val.split(',')]
 
             config = SWAMLAConfig(**filtered_config)
+        else:
+            raise ValueError(f"Unknown config type: {type(config)}")
     else:
         raise ValueError("Checkpoint does not contain config")
+
+    # Debug: print key config values
+    print0(f"Config: n_embd={config.n_embd}, n_layer={config.n_layer}, vocab_size={config.vocab_size}, block_size={config.block_size}")
 
     # Create model directly from config
     model = SWAMLAModel(config)
