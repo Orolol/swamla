@@ -1,7 +1,7 @@
 """Positional encoding methods for transformer models."""
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -310,24 +310,16 @@ class FoPE(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
-        # Floor frequency: ω_l = 2π/N (frequencies below this are zeroed)
-        # This corresponds to the longest trainable wavelength
-        floor_freq = 2 * math.pi / max_seq_len
-        self.register_buffer('floor_freq', torch.tensor(floor_freq), persistent=False)
-
         # Determine which frequencies are above the floor threshold
-        # Frequencies are ω_m = inv_freq (angular frequency)
         n_floor = int(self.half_dim * floor_ratio)
-        n_active = self.half_dim - n_floor  # Frequencies that get Fourier treatment
+        n_active = self.half_dim - n_floor
 
         self.n_floor = n_floor
         self.n_active = n_active
 
         # Learnable Fourier coefficients for harmonics
         # Shape: [n_active, n_harmonics] for each of sin and cos
-        # These weights combine the dominant frequency with harmonics
         if n_active > 0:
-            # Initialize with small values + identity for dominant frequency
             self.sin_coef = nn.Parameter(
                 torch.randn(n_active, n_harmonics) * coef_init_std
             )
@@ -339,21 +331,21 @@ class FoPE(nn.Module):
             harmonic_mult = torch.arange(1, n_harmonics + 1).float()
             self.register_buffer('harmonic_mult', harmonic_mult, persistent=False)
         else:
-            self.sin_coef = None
-            self.cos_coef = None
+            self.register_parameter('sin_coef', None)
+            self.register_parameter('cos_coef', None)
+            self.register_buffer('harmonic_mult', None, persistent=False)
 
-        # Precompute and cache
-        self._precompute_cache(max_seq_len)
+        # Cache will be computed lazily on first forward pass
+        # This ensures it's on the correct device after model.to(device)
+        self.register_buffer('cos_cached', None, persistent=False)
+        self.register_buffer('sin_cached', None, persistent=False)
+        self._cache_seq_len = 0
 
-    def _precompute_cache(self, seq_len: int):
-        """Precompute cos/sin cache with Fourier series."""
-        # Use consistent device - prefer sin_coef device if available, else inv_freq
-        device = self.sin_coef.device if self.sin_coef is not None else self.inv_freq.device
-
+    def _compute_cache(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute cos/sin cache with Fourier series on the specified device."""
         t = torch.arange(seq_len, device=device).float()
 
         # For floor frequencies (low freq, long wavelength): use constant 1
-        # This effectively zeros out the rotation for these dimensions
         if self.n_floor > 0:
             floor_cos = torch.ones(seq_len, self.n_floor, device=device)
             floor_sin = torch.zeros(seq_len, self.n_floor, device=device)
@@ -363,25 +355,18 @@ class FoPE(nn.Module):
 
         # For active frequencies: apply Fourier series
         if self.n_active > 0:
-            # Get active inverse frequencies (higher frequencies) and ensure on correct device
-            active_inv_freq = self.inv_freq[self.n_floor:].to(device)  # [n_active]
+            # Get active inverse frequencies
+            active_inv_freq = self.inv_freq[self.n_floor:]  # [n_active]
 
             # Compute base angles: [seq_len, n_active]
             base_angles = torch.outer(t, active_inv_freq)
 
             # Compute harmonic angles: [seq_len, n_active, n_harmonics]
-            # Each harmonic k has angle = k * base_angle
-            harmonic_mult = self.harmonic_mult.to(device)
-            harmonic_angles = base_angles.unsqueeze(-1) * harmonic_mult.view(1, 1, -1)
+            harmonic_angles = base_angles.unsqueeze(-1) * self.harmonic_mult.view(1, 1, -1)
 
             # Compute sin and cos for all harmonics
-            sin_harmonics = torch.sin(harmonic_angles)  # [seq_len, n_active, n_harmonics]
-            cos_harmonics = torch.cos(harmonic_angles)  # [seq_len, n_active, n_harmonics]
-
-            # Combine with learnable coefficients
-            # Base frequency (harmonic 1) gets weight 1, others get learned weights
-            # sin_out = sin(θ) + Σ_k a_k * sin(k*θ)
-            # cos_out = cos(θ) + Σ_k a_k * cos(k*θ)
+            sin_harmonics = torch.sin(harmonic_angles)
+            cos_harmonics = torch.cos(harmonic_angles)
 
             # Create coefficient tensor with 1 for first harmonic
             sin_weights = torch.cat([
@@ -398,7 +383,8 @@ class FoPE(nn.Module):
             active_cos = torch.einsum('snh,nh->sn', cos_harmonics, cos_weights)
 
             # Normalize to prevent explosion
-            norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * (self.sin_coef.detach().pow(2).mean().item() if self.n_harmonics > 1 else 0))
+            with torch.no_grad():
+                norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * (self.sin_coef.pow(2).mean().item() if self.n_harmonics > 1 else 0))
             active_sin = active_sin / max(norm_factor, 1.0)
             active_cos = active_cos / max(norm_factor, 1.0)
         else:
@@ -421,23 +407,10 @@ class FoPE(nn.Module):
         sin_cached = torch.cat([sin_cached, sin_cached], dim=-1)
 
         # Reshape for broadcasting: [1, 1, seq_len, dim]
-        self.register_buffer(
-            'cos_cached',
+        return (
             cos_cached.view(1, 1, seq_len, self.dim),
-            persistent=False
+            sin_cached.view(1, 1, seq_len, self.dim)
         )
-        self.register_buffer(
-            'sin_cached',
-            sin_cached.view(1, 1, seq_len, self.dim),
-            persistent=False
-        )
-
-    def _extend_cache(self, new_max_len: int):
-        """Extend the cache for longer sequences."""
-        if new_max_len <= self.max_seq_len:
-            return
-        self.max_seq_len = new_max_len
-        self._precompute_cache(new_max_len)
 
     def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
         """
@@ -454,18 +427,22 @@ class FoPE(nn.Module):
             seq_len = x.shape[-2]
 
         B, H, T, D = x.shape
+        device = x.device
 
-        # Extend cache if needed, or recompute if device changed
-        if T > self.max_seq_len or (self.cos_cached is not None and self.cos_cached.device != x.device):
-            # Move parameters to input device if needed
-            if self.sin_coef is not None and self.sin_coef.device != x.device:
-                self.sin_coef.data = self.sin_coef.data.to(x.device)
-                self.cos_coef.data = self.cos_coef.data.to(x.device)
-            if self.inv_freq.device != x.device:
-                self.inv_freq = self.inv_freq.to(x.device)
-            if self.harmonic_mult is not None and self.harmonic_mult.device != x.device:
-                self.harmonic_mult = self.harmonic_mult.to(x.device)
-            self._precompute_cache(max(T, self.max_seq_len))
+        # Compute cache if needed (first call, longer sequence, or device change)
+        need_recompute = (
+            self.cos_cached is None or
+            T > self._cache_seq_len or
+            self.cos_cached.device != device
+        )
+
+        if need_recompute:
+            target_len = max(T, self.max_seq_len)
+            cos_cached, sin_cached = self._compute_cache(target_len, device)
+            # Store as regular tensors, not buffers (to avoid device issues)
+            self.cos_cached = cos_cached
+            self.sin_cached = sin_cached
+            self._cache_seq_len = target_len
 
         # Ensure input is contiguous
         x = x.contiguous()
