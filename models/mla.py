@@ -166,7 +166,7 @@ class MLA(nn.Module):
 
         self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
         if self.use_cudnn_sdpa:
-            print(f"MLA: Using cuDNN SDPA backend (GPU sm{cc[0]}{cc[1]}, head_dim={self.qk_head_dim})")
+            print(f"MLA: Using cuDNN SDPA backend (head_dim={self.qk_head_dim})")
                
         
         # Initialize position embeddings (RoPE or FoPE)
