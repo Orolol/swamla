@@ -885,7 +885,6 @@ def train(args):
         use_gradient_checkpointing=args.gradient_checkpointing,
         # Attention backend options
         use_flash_attention=args.use_flash_attention,
-        use_varlen_attn=args.use_varlen_attn,
         use_triton_mla=args.use_triton_mla,
         use_triton_kernels=args.use_triton_kernels,
         use_gated_deltanet=args.use_gated_deltanet,
@@ -1306,13 +1305,6 @@ def train(args):
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            # Extract varlen metadata if available
-            cu_seqlens = None
-            max_seqlen = None
-            if args.use_varlen_attn and 'cu_seqlens' in batch:
-                cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
-                max_seqlen = batch.get('max_seqlen', None)
-
             # Create FP8 autocast context if using TE backend
             # Native FP8 (torchao) doesn't need a context manager — Float8Linear handles it
             fp8_group = dist.group.WORLD if is_ddp and use_te_fp8 else None
@@ -1357,8 +1349,6 @@ def train(args):
                         logits, loss = model(
                             input_ids,
                             targets=labels,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
                         )
 
                     # Add MoE auxiliary loss if model has MoE layers
@@ -1529,13 +1519,6 @@ def train(args):
                     input_ids = batch['input_ids'].to(device, non_blocking=True)
                     labels = batch['labels'].to(device, non_blocking=True)
 
-                    # Extract varlen metadata if available
-                    val_cu_seqlens = None
-                    val_max_seqlen = None
-                    if args.use_varlen_attn and 'cu_seqlens' in batch:
-                        val_cu_seqlens = batch['cu_seqlens'].to(device, non_blocking=True)
-                        val_max_seqlen = batch.get('max_seqlen', None)
-
                     # FP8 context for validation (TE only; native FP8 doesn't need context)
                     val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if use_te_fp8 else nullcontext()
 
@@ -1572,8 +1555,6 @@ def train(args):
                                 logits, loss = model(
                                     input_ids,
                                     targets=labels,
-                                    cu_seqlens=val_cu_seqlens,
-                                    max_seqlen=val_max_seqlen,
                                 )
 
                     val_loss += loss.item()
@@ -1762,8 +1743,6 @@ def main():
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,
                         help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
-    parser.add_argument('--use_varlen_attn', action='store_true', default=True,
-                        help='Use varlen_attn (PyTorch 2.10+) for packed sequences without padding waste')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
     parser.add_argument('--use_triton_kernels', action='store_true', default=True,

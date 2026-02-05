@@ -86,10 +86,6 @@ class SWAMLAConfig:
     # cuDNN SDPA backend: uses native Hopper/Blackwell kernels instead of sm80 CUTLASS
     use_cudnn_sdpa: bool = True
 
-    # Variable-length attention (PyTorch 2.10+)
-    # Eliminates padding waste for packed sequences with document boundaries
-    use_varlen_attn: bool = False
-
     # Custom Triton MLA kernel (H100 compatible alternative to FA2)
     # Use this when FA2 causes CUDA graph issues with torch.compile on H100
     use_triton_mla: bool = False
@@ -410,8 +406,6 @@ class SWAMLAModel(nn.Module):
         return_all_logits: bool = False,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask_2d: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
     ):
         """Forward pass.
 
@@ -425,9 +419,6 @@ class SWAMLAModel(nn.Module):
             attention_mask_2d: Custom 2D attention mask [S, S] or [B, S, S].
                 If provided, overrides the default causal mask.
                 Used for WeDLM dual-stream masking.
-            cu_seqlens: Cumulative sequence lengths for varlen_attn [num_docs + 1].
-                Used for variable-length attention without padding waste.
-            max_seqlen: Maximum sequence length in the batch for varlen_attn.
 
         Returns:
             (logits, loss) tuple
@@ -493,8 +484,8 @@ class SWAMLAModel(nn.Module):
                 # Engram: run BEFORE attention, outside compiled block to avoid recompilation
                 if getattr(block, 'has_engram', False) and idx is not None:
                     x = x + block.engram(x, idx)
-                # MLA: pass position_ids for WeDLM, varlen metadata, and input_ids for Value Embeddings
-                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                # MLA: pass position_ids for WeDLM, and input_ids for Value Embeddings
+                x = block(x, 0, freqs_cis, attn_mask, position_ids=position_ids, input_ids=idx)
             else:
                 # Fallback for any other block type
                 x = block(x, 0, freqs_cis, attn_mask)

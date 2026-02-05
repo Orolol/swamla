@@ -293,7 +293,6 @@ class PackedFinewebDataset(IterableDataset):
         if bos_id is not None:
             out[0] = bos_id
             pos = 1
-            # BOS counts as part of the first document for cu_seqlens consistency
 
         while docs and pos < self.max_length:
             remaining = self.max_length - pos
@@ -328,10 +327,6 @@ class PackedFinewebDataset(IterableDataset):
         input_ids = torch.full((self.batch_size, self.max_length), self.pad_id, dtype=torch.long)
         attention_mask = torch.zeros((self.batch_size, self.max_length), dtype=torch.long)
 
-        # Track document lengths per sequence for varlen_attn
-        all_doc_lengths: List[List[int]] = []
-        max_seqlen = 0
-
         # Convert deque to list for BestFit-Crop (needs random access)
         if self.use_bestfit_crop:
             docs_list = list(docs_buffer)
@@ -339,15 +334,11 @@ class PackedFinewebDataset(IterableDataset):
 
         for i in range(self.batch_size):
             if self.use_bestfit_crop:
-                seq, doc_lengths, docs_list = self._fill_sequence_bestfit_crop(docs_list)
+                seq, _, docs_list = self._fill_sequence_bestfit_crop(docs_list)
             else:
-                seq, doc_lengths = self._fill_sequence(docs_buffer)
+                seq, _ = self._fill_sequence(docs_buffer)
             input_ids[i] = seq
             attention_mask[i] = (seq != self.pad_id).long()
-            all_doc_lengths.append(doc_lengths)
-            # Track max document length across entire batch
-            if doc_lengths:
-                max_seqlen = max(max_seqlen, max(doc_lengths))
 
         # Restore remaining docs to buffer for BestFit-Crop
         if self.use_bestfit_crop:
@@ -366,21 +357,11 @@ class PackedFinewebDataset(IterableDataset):
         if self.stats["total_tokens"] > 0:
             self.stats["avg_padding_ratio"] = self.stats["total_padding"] / self.stats["total_tokens"]
 
-        # Build cu_seqlens for varlen_attn: cumulative sum of document lengths
-        # For a batch with documents [d1, d2, d3] per sequence, cu_seqlens = [0, d1, d1+d2, d1+d2+d3]
-        # We flatten all documents across the batch for packed varlen attention
-        cu_seqlens = [0]
-        for doc_lengths in all_doc_lengths:
-            for doc_len in doc_lengths:
-                cu_seqlens.append(cu_seqlens[-1] + doc_len)
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
-
         # Pin memory for faster CPU->GPU transfer
         if self.pin_memory:
             input_ids = input_ids.pin_memory()
             attention_mask = attention_mask.pin_memory()
             labels = labels.pin_memory()
-            cu_seqlens = cu_seqlens.pin_memory()
 
         return {
             "input_ids": input_ids.contiguous(),  # [B, L]
@@ -388,9 +369,6 @@ class PackedFinewebDataset(IterableDataset):
             "decoder_input_ids": input_ids.clone().contiguous(),
             "decoder_attention_mask": attention_mask.clone().contiguous(),
             "labels": labels.contiguous(),
-            # Varlen attention metadata
-            "cu_seqlens": cu_seqlens.contiguous(),  # [num_docs + 1]
-            "max_seqlen": max_seqlen,  # scalar
         }
 
     def _producer(self):

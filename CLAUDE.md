@@ -857,13 +857,6 @@ Toggle features via environment variables:
 USE_MUP=false USE_PROGRESSIVE=false ./scripts/train_unified.sh 8 2048
 ```
 
-## Varlen Attention (PyTorch 2.10+)
-
-`--use_varlen_attn` enables variable-length attention without padding waste:
-- Data loader returns `cu_seqlens` (cumulative document lengths) and `max_seqlen`
-- Metadata flows: batch → train.py → SWAMLAModel → MLABlock → MLA
-- Only affects MLA blocks (DeltaNet blocks use their own linear attention)
-
 ## Adding New Attention Features
 
 When adding new attention backends or features that need batch metadata:

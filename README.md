@@ -167,13 +167,6 @@ export HF_TOKEN="your_token"
 - `--n_shared_experts`: Always-active shared experts (default: 1)
 - `--latent_preserve_expert_dim`: Keep full expert_dim in latent space
 
-### Varlen Attention Parameters
-
-- `--use_varlen_attn`: Enable variable-length attention (default: true)
-  - Eliminates padding waste in packed sequences
-  - Provides document isolation (no cross-document attention)
-  - Requires PyTorch 2.10+
-
 ### Engram Parameters
 
 - `--use_engram`: Enable N-gram conditional memory (default: false)
