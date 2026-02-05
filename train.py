@@ -1105,14 +1105,29 @@ def train(args):
     if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
         try:
             saved_state = resume_checkpoint['optimizer_state_dict']
-            if isinstance(optimizer, list) and isinstance(saved_state, list):
-                for opt, state in zip(optimizer, saved_state):
-                    opt.load_state_dict(state)
-            elif not isinstance(optimizer, list) and not isinstance(saved_state, list):
+            saved_is_list = isinstance(saved_state, list)
+            opt_is_list = isinstance(optimizer, list)
+
+            if opt_is_list and saved_is_list:
+                if len(optimizer) == len(saved_state):
+                    for opt, state in zip(optimizer, saved_state):
+                        opt.load_state_dict(state)
+                    if rank == 0:
+                        print(f"Restored optimizer state ({len(optimizer)} optimizers)")
+                else:
+                    if rank == 0:
+                        print(f"Warning: Optimizer count mismatch (checkpoint={len(saved_state)}, current={len(optimizer)}), starting fresh")
+            elif not opt_is_list and not saved_is_list:
                 optimizer.load_state_dict(saved_state)
-            # Silently skip mismatched structures
-        except Exception:
-            pass  # Silently continue with fresh optimizer state
+                if rank == 0:
+                    print("Restored optimizer state")
+            else:
+                if rank == 0:
+                    print(f"Warning: Optimizer type mismatch (checkpoint={'list' if saved_is_list else 'single'}, current={'list' if opt_is_list else 'single'}), starting fresh")
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Could not restore optimizer state: {e}")
+                print("Starting with fresh optimizer state")
 
     # Load EMA state if resuming
     if resume_checkpoint and 'ema' in resume_checkpoint and ema is not None:
