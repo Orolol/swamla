@@ -1014,15 +1014,20 @@ def train(args):
             model = adapt_deltanet_for_wedlm(model, max_seq_len=args.block_size * 2, d_model=None)
 
     # Initialize μP if enabled
+    # IMPORTANT: Only init weights for fresh training, NOT when resuming (would overwrite loaded weights!)
     mup_config = None
     if args.use_mup and MUP_AVAILABLE:
         mup_config = MuPConfig(
             base_width=args.mup_base_width,
             width=model.config.n_embd,
         )
-        mup_init(model, mup_config)
-        if rank == 0:
-            print(f"μP initialized: base_width={mup_config.base_width}, width_mult={mup_config.width_mult:.1f}x")
+        if not resume_checkpoint:
+            mup_init(model, mup_config)
+            if rank == 0:
+                print(f"μP initialized: base_width={mup_config.base_width}, width_mult={mup_config.width_mult:.1f}x")
+        else:
+            if rank == 0:
+                print(f"μP config loaded (skipping init, using checkpoint weights): width_mult={mup_config.width_mult:.1f}x")
 
     # Initialize Progressive Scheduler if enabled
     progressive = None
