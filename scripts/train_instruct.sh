@@ -102,7 +102,7 @@ else
     --mla_layers_per_cycle 1 \
     --swa_window 256 \
     --swa_sink_size 4 \
-    --mla_q_lora_rank 0 \
+    --mla_q_lora_rank 256 \
     --mla_kv_lora_rank 256 \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \

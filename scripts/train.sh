@@ -370,7 +370,7 @@ X0_BETA1="${X0_BETA1:-0.96}"
 
 # Token-based validation and save triggers
 EVAL_TOKENS="${EVAL_TOKENS:-500M}"
-SAVE_TOKENS="${SAVE_TOKENS:-2B}"
+SAVE_TOKENS="${SAVE_TOKENS:-500M}"
 
 # =============================================================================
 # Auto-detect GPUs
