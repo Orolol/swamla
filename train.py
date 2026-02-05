@@ -1892,7 +1892,7 @@ def main():
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--eval_tokens', type=str, default='500M',
                         help='Run validation every N tokens (e.g., 500M, 1B, 2.5B)')
-    parser.add_argument('--save_tokens', type=str, default='2B',
+    parser.add_argument('--save_tokens', type=str, default='500M',
                         help='Save checkpoint every N tokens (e.g., 2B, 5B)')
     parser.add_argument('--wandb_project', type=str, default="swamla")
     parser.add_argument('--wandb_run_name', type=str, default=None)

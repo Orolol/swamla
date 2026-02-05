@@ -468,11 +468,10 @@ class SWAMLAModel(nn.Module):
             if attn_mask.dim() == 3:
                 # [B, S, S] -> use first batch as template (assuming same for all)
                 attn_mask = attn_mask[0]
-        elif t > 1:
-            # Use cached causal mask (slice to current sequence length)
-            # Move to device on-demand to avoid VRAM duplication in DDP
-            attn_mask = self.causal_mask[:t, :t].to(device, non_blocking=True)
         else:
+            # For standard causal attention, don't pass explicit mask
+            # SDPA's native is_causal=True is more efficient and compatible with
+            # cuDNN SDPA backend + torch.compile (avoids "No available kernel" error)
             attn_mask = None
 
         # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
