@@ -1493,12 +1493,12 @@ def train(args):
         # Validation (using next batches from same data loader)
         # Token-based trigger: validate when we cross a new token threshold
         current_eval_threshold = (total_tokens_seen // eval_token_threshold) * eval_token_threshold
-        should_eval = current_eval_threshold > last_eval_tokens and master_process
+        should_eval = current_eval_threshold > last_eval_tokens  # All ranks must agree
 
         if should_eval:
             last_eval_tokens = current_eval_threshold
             # CRITICAL: Synchronize all DDP ranks before validation
-            # Without this, non-master ranks may timeout waiting for communication
+            # All ranks must hit this barrier, not just master
             if is_ddp:
                 dist.barrier()
 
@@ -1562,24 +1562,26 @@ def train(args):
             val_loss /= val_steps
             perplexity = math.exp(val_loss) if val_loss < 10 else float('inf')
 
-            mode_str = " (WeDLM)" if args.use_wedlm else ""
-            print(f"\nValidation{mode_str} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}\n")
+            # Only master process logs/prints validation results
+            if master_process:
+                mode_str = " (WeDLM)" if args.use_wedlm else ""
+                print(f"\nValidation{mode_str} | Loss: {val_loss:.4f} | Perplexity: {perplexity:.2f}\n")
 
-            if wandb_run is not None:
-                wandb.log({
-                    'val/loss': val_loss,
-                    'val/perplexity': perplexity,
-                    'step': step
-                })
+                if wandb_run is not None:
+                    wandb.log({
+                        'val/loss': val_loss,
+                        'val/perplexity': perplexity,
+                        'step': step
+                    })
 
-            if tb_writer is not None:
-                tb_writer.add_scalar('val/loss', val_loss, step)
-                tb_writer.add_scalar('val/perplexity', perplexity, step)
+                if tb_writer is not None:
+                    tb_writer.add_scalar('val/loss', val_loss, step)
+                    tb_writer.add_scalar('val/perplexity', perplexity, step)
 
-            # Track best validation loss
-            if val_loss < best_val_loss:
-                print(f"New best validation loss: {val_loss:.4f} (previous: {best_val_loss:.4f})")
-                best_val_loss = val_loss
+                # Track best validation loss
+                if val_loss < best_val_loss:
+                    print(f"New best validation loss: {val_loss:.4f} (previous: {best_val_loss:.4f})")
+                    best_val_loss = val_loss
 
             # Push to HF at every validation if repo_id is set
             # IMPORTANT: Only master process should upload to avoid NCCL timeout in multi-GPU training
