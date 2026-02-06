@@ -145,3 +145,92 @@ print(f"  EOS logit: {last_logits[eos_id].item():.4f}")
 print(f"  EOS prob: {probs[eos_id].item():.6f}")
 print(f"  Max logit: {last_logits.max().item():.4f} (token: '{tokenizer.decode([last_logits.argmax().item()])}')")
 print(f"  Logit mean: {last_logits.mean().item():.4f}, std: {last_logits.std().item():.4f}")
+
+# --- Step 4: Compare with inference.py loading ---
+print("\n" + "="*80)
+print("=== Step 4: Compare with inference.py's load_model_from_checkpoint ===")
+print("="*80)
+from inference import load_model_from_checkpoint
+
+# Save direct-load logits for comparison
+direct_logits = last_logits.clone()
+
+# Load via inference.py
+model2, tokenizer2 = load_model_from_checkpoint(
+    checkpoint_path=path,
+    device=device,
+    torch_dtype=torch.bfloat16,
+    use_ema=False,  # Same as --no_ema
+)
+model2.eval()
+
+# Compare state dicts
+print("\n--- State dict comparison ---")
+sd1 = {k: v for k, v in model.state_dict().items()}
+sd2 = {k: v for k, v in model2.state_dict().items()}
+print(f"  Model 1 (direct): {len(sd1)} keys")
+print(f"  Model 2 (inference.py): {len(sd2)} keys")
+
+# Check for key differences
+keys1 = set(sd1.keys())
+keys2 = set(sd2.keys())
+if keys1 != keys2:
+    print(f"  KEY MISMATCH!")
+    print(f"  Only in model1: {keys1 - keys2}")
+    print(f"  Only in model2: {keys2 - keys1}")
+else:
+    print(f"  Keys match perfectly")
+
+# Compare parameter values
+max_diff = 0
+max_diff_key = ""
+diff_count = 0
+for k in keys1 & keys2:
+    v1, v2 = sd1[k], sd2[k]
+    if v1.shape != v2.shape:
+        print(f"  SHAPE MISMATCH: {k}: {v1.shape} vs {v2.shape}")
+        diff_count += 1
+        continue
+    if v1.dtype != v2.dtype:
+        print(f"  DTYPE MISMATCH: {k}: {v1.dtype} vs {v2.dtype}")
+    if v1.is_floating_point() and v2.is_floating_point():
+        # Compare in float32
+        d = (v1.float() - v2.float()).abs().max().item()
+        if d > 1e-6:
+            diff_count += 1
+            if d > max_diff:
+                max_diff = d
+                max_diff_key = k
+            if d > 0.01:  # Only print large diffs
+                print(f"  DIFF: {k}: max_diff={d:.6f}")
+
+print(f"\n  Total params with diff > 1e-6: {diff_count}")
+print(f"  Largest diff: {max_diff:.6f} in {max_diff_key}")
+
+# Forward pass with inference.py model
+print("\n--- Forward pass comparison ---")
+with torch.inference_mode():
+    with torch.amp.autocast(device, dtype=torch.bfloat16):
+        logits2, _ = model2(input_ids, return_all_logits=True)
+    last_logits2 = logits2[0, -1, :].float()
+    probs2 = torch.softmax(last_logits2, dim=-1)
+
+    # Compare logits
+    logit_diff = (direct_logits - last_logits2).abs()
+    print(f"  Logit diff: mean={logit_diff.mean():.6f}, max={logit_diff.max():.6f}")
+
+    topk2 = torch.topk(probs2, 5)
+    print(f"\n  inference.py Top-5 predictions:")
+    for i in range(5):
+        token = tokenizer.decode([topk2.indices[i].item()])
+        print(f"    {i+1}. '{token}' (p={topk2.values[i].item():.4f})")
+
+    # Perplexity comparison
+    with torch.amp.autocast(device, dtype=torch.bfloat16):
+        logits2_ppl, _ = model2(test_ids, return_all_logits=True)
+    shift_logits2 = logits2_ppl[:, :-1, :].float()
+    loss2 = torch.nn.functional.cross_entropy(
+        shift_logits2.reshape(-1, shift_logits2.size(-1)),
+        shift_labels.reshape(-1)
+    )
+    print(f"\n  inference.py perplexity: loss={loss2.item():.4f}, ppl={torch.exp(loss2).item():.2f}")
