@@ -771,12 +771,39 @@ def load_model_from_checkpoint(
             state_dict = checkpoint
 
         # Overlay EMA parameters onto base state dict
+        # EMA keys may lack prefixes (_orig_mod., module.) that are in the state_dict
+        # from torch.compile or DDP wrapping. Build a mapping to handle this.
+        def _strip_prefixes(key: str) -> str:
+            """Strip _orig_mod. and module. prefixes from a key."""
+            for prefix in ("_orig_mod.", "module."):
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+            return key
+
+        # Build reverse mapping: stripped_key -> original state_dict key
+        stripped_to_sd_key = {}
+        for sd_key in state_dict:
+            stripped_to_sd_key[_strip_prefixes(sd_key)] = sd_key
+
         ema_count = 0
-        for name, tensor in ema_params.items():
-            if name in state_dict:
-                state_dict[name] = tensor
+        for ema_name, tensor in ema_params.items():
+            ema_stripped = _strip_prefixes(ema_name)
+            if ema_name in state_dict:
+                # Direct match (same prefix)
+                state_dict[ema_name] = tensor
+                ema_count += 1
+            elif ema_stripped in stripped_to_sd_key:
+                # Match after stripping prefixes
+                state_dict[stripped_to_sd_key[ema_stripped]] = tensor
                 ema_count += 1
         print(f"  Applied {ema_count} EMA parameters over base state dict")
+        if ema_count == 0 and len(ema_params) > 0:
+            # Show sample keys to help diagnose prefix mismatch
+            ema_sample = list(ema_params.keys())[:3]
+            sd_sample = list(state_dict.keys())[:3]
+            print(f"  WARNING: EMA has {len(ema_params)} params but 0 matched!")
+            print(f"  EMA key samples: {ema_sample}")
+            print(f"  State dict key samples: {sd_sample}")
     else:
         if "model" in checkpoint:
             state_dict = checkpoint["model"]
