@@ -369,8 +369,8 @@ RESID_LR="${RESID_LR:-0.005}"
 X0_BETA1="${X0_BETA1:-0.96}"
 
 # Token-based validation and save triggers
-EVAL_TOKENS="${EVAL_TOKENS:-500M}"
-SAVE_TOKENS="${SAVE_TOKENS:-500M}"
+EVAL_TOKENS="${EVAL_TOKENS:-50M}"
+SAVE_TOKENS="${SAVE_TOKENS:-50M}"
 
 # =============================================================================
 # Auto-detect GPUs

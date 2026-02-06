@@ -1,0 +1,31 @@
+# Conversational Prompts
+
+User: What's the best way to learn a new programming language?
+Assistant:
+
+User: Can you explain quantum computing in simple terms?
+Assistant:
+
+User: I'm feeling overwhelmed with work. Any advice?
+Assistant:
+
+User: What are some good books to read this year?
+Assistant:
+
+User: How do I make a perfect omelette?
+Assistant:
+
+User: What's the meaning of life?
+Assistant:
+
+User: Can you help me plan a trip to Japan?
+Assistant:
+
+User: What are the pros and cons of remote work?
+Assistant:
+
+User: How does machine learning actually work?
+Assistant:
+
+User: What should I know before adopting a dog?
+Assistant:

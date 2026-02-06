@@ -1632,18 +1632,21 @@ def train(args):
 
                 if hf_token:
                     print(f"Pushing model to Hugging Face...")
-                    push_to_huggingface(
-                        model=raw_model,
-                        tokenizer=tokenizer,
-                        config_args=vars(args),
-                        output_dir=args.output_dir,
-                        total_tokens=total_tokens_seen,
-                        val_loss=val_loss,
-                        repo_id=args.hf_repo_id,
-                        hf_token=hf_token,
-                        optimizer=optimizer,
-                        step=step
-                    )
+                    # Apply EMA weights for HF upload so saved weights match validation loss
+                    ema_upload_ctx = ema.apply(raw_model) if ema is not None else nullcontext()
+                    with ema_upload_ctx:
+                        push_to_huggingface(
+                            model=raw_model,
+                            tokenizer=tokenizer,
+                            config_args=vars(args),
+                            output_dir=args.output_dir,
+                            total_tokens=total_tokens_seen,
+                            val_loss=val_loss,
+                            repo_id=args.hf_repo_id,
+                            hf_token=hf_token,
+                            optimizer=optimizer,
+                            step=step
+                        )
                 else:
                     print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
 
@@ -1784,7 +1787,7 @@ def main():
                         help='Enable cuDNN SDPA (H100+ supports head_dim ≤ 256, no dimension adjustment needed)')
 
     # DeltaNet options (always enabled)
-    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
                         help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')

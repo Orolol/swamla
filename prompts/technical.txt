@@ -1,0 +1,34 @@
+# Technical and Coding Prompts
+
+def fibonacci(n):
+    """Calculate the nth Fibonacci number."""
+
+The main difference between TCP and UDP is that
+
+To implement a binary search tree in Python, you need to
+
+When optimizing neural network training, the most important factors to consider are
+
+The transformer architecture revolutionized NLP because
+
+A recursive function to calculate factorial works by
+
+In distributed systems, the CAP theorem states that
+
+The time complexity of quicksort in the average case is O(n log n) because
+
+To prevent SQL injection attacks, developers should
+
+The difference between supervised and unsupervised learning is that
+
+class NeuralNetwork:
+    def __init__(self, layers):
+        """Initialize a simple feedforward neural network."""
+
+Memory management in Rust differs from C++ because
+
+The backpropagation algorithm computes gradients by
+
+To scale a web application horizontally, you should
+
+When designing a RESTful API, best practices include

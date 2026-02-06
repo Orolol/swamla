@@ -50,8 +50,9 @@ class RoPE(nn.Module):
         sin = self.sin_cached[:, :, :T, :(D//2)]
 
         # Ensure broadcasting works correctly by explicitly matching dimensions
-        cos = cos.expand(B, H, T, -1).contiguous()
-        sin = sin.expand(B, H, T, -1).contiguous()
+        # Also convert to input dtype to avoid float32 upcast
+        cos = cos.expand(B, H, T, -1).to(x.dtype).contiguous()
+        sin = sin.expand(B, H, T, -1).to(x.dtype).contiguous()
 
         # Apply rotation
         rotated = torch.stack([
@@ -444,9 +445,9 @@ class FoPE(nn.Module):
         cos = cos_emb[:, :, :T, :(D//2)]
         sin = sin_emb[:, :, :T, :(D//2)]
 
-        # Broadcast to batch and heads
-        cos = cos.expand(B, H, T, -1)
-        sin = sin.expand(B, H, T, -1)
+        # Broadcast to batch and heads, convert to input dtype to avoid upcast
+        cos = cos.expand(B, H, T, -1).to(x.dtype)
+        sin = sin.expand(B, H, T, -1).to(x.dtype)
 
         # Apply rotation
         rotated = torch.stack([

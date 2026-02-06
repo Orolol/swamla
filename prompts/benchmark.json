@@ -1,0 +1,37 @@
+{
+  "creative": [
+    "Once upon a time, in a kingdom where dragons and humans lived in peace,",
+    "The last lighthouse keeper watched the storm approach, knowing that tonight would change everything.",
+    "She opened the ancient book and found a letter addressed to her, dated two hundred years in the future.",
+    "The robot looked at its hands and, for the first time, felt something it could only describe as sadness.",
+    "Deep beneath the ocean, where sunlight never reaches, a city of glass still glows."
+  ],
+  "technical": [
+    "def fibonacci(n):\n    \"\"\"Calculate the nth Fibonacci number.\"\"\"",
+    "The main difference between TCP and UDP is that",
+    "To implement a binary search tree in Python, you need to",
+    "The transformer architecture revolutionized NLP because",
+    "To prevent SQL injection attacks, developers should"
+  ],
+  "knowledge": [
+    "The French Revolution began in 1789 when",
+    "Albert Einstein's theory of general relativity describes",
+    "Photosynthesis is the process by which plants",
+    "Black holes are formed when",
+    "Evolution by natural selection works through the mechanism of"
+  ],
+  "reasoning": [
+    "If all roses are flowers and some flowers fade quickly, then",
+    "A train leaves Paris at 9am traveling at 200km/h. Another train leaves Lyon at 10am traveling at 250km/h toward Paris. If the distance is 500km,",
+    "There are three boxes: one contains only apples, one contains only oranges, and one contains both. All labels are wrong. If you can only pick one fruit from one box,",
+    "In a room of 23 people, the probability that two share a birthday is",
+    "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?"
+  ],
+  "french": [
+    "Il etait une fois, dans un petit village de Provence,",
+    "La revolution francaise a profondement change la societe parce que",
+    "La cuisine francaise est reconnue mondialement pour",
+    "Victor Hugo a ecrit Les Miserables pour denoncer",
+    "La philosophie de Descartes repose sur le principe que"
+  ]
+}

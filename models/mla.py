@@ -602,6 +602,11 @@ class MLA(nn.Module):
 
         return attn_output
 
+    # Disable torch.compile tracing for this method: dynamo's fake tensor check
+    # has a stale head_dim<=128 limit for cuDNN SDPA, but the actual cuDNN runtime
+    # supports head_dim<=256 on Hopper/Blackwell GPUs. Running eagerly bypasses
+    # the false rejection while still using the cuDNN kernel.
+    @torch.compiler.disable
     def _sdpa_attention(self, q, k, v, attn_mask=None, is_causal=False):
         """
         Run SDPA with cuDNN backend when available, handling V dimension padding.

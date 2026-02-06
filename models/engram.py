@@ -615,7 +615,12 @@ class Engram(nn.Module):
         """
         # 1. Compress token IDs to canonical form
         # Use the registered buffer (already on correct device) to avoid DeviceCopy
-        canonical_ids = self._compression_mapping[input_ids]
+        if self._compression_mapping is None:
+            # Fallback if mapping not set: use identity (original IDs)
+            # This prevents TypeError if set_tokenizer_compression wasn't called
+            canonical_ids = input_ids
+        else:
+            canonical_ids = self._compression_mapping[input_ids]
 
         # 2. Retrieve N-gram embeddings
         memory = self.embeddings.retrieve(canonical_ids)  # [B, T, d_mem]

@@ -18,6 +18,12 @@ Usage:
     # Evaluate a HuggingFace model (e.g., GPT-2 for comparison)
     python scripts/eval_core.py --hf_model openai-community/gpt2
 
+    # Load latest checkpoint from HuggingFace repo
+    python scripts/eval_core.py --hf_repo_id username/swamla-model
+
+    # Load specific checkpoint from HuggingFace repo
+    python scripts/eval_core.py --hf_repo_id username/swamla-model --hf_checkpoint checkpoint_tokens_500k_loss_2.3456
+
 References:
     - DCLM paper: https://arxiv.org/abs/2406.11794
     - nanochat: https://github.com/karpathy/nanochat
@@ -116,9 +122,9 @@ class SWAMLAWrapper:
         self.max_seq_len = max_seq_len or getattr(model.config, 'block_size', 2048)
 
     def __call__(self, input_ids):
-        """Forward pass returning logits."""
+        """Forward pass returning logits for all positions."""
         with torch.inference_mode():
-            logits, _ = self.model(input_ids)
+            logits, _ = self.model(input_ids, return_all_logits=True)
         return logits
 
     def get_device(self):
@@ -497,6 +503,180 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 
 # -----------------------------------------------------------------------------
+# HuggingFace repo loading
+
+def load_swamla_from_hf(
+    repo_id: str,
+    checkpoint_name: str = None,
+    device: torch.device = None,
+    hf_token: str = None,
+):
+    """Load SWAMLA model from HuggingFace repo.
+
+    Args:
+        repo_id: HF model repo ID (e.g., "username/swamla-model")
+        checkpoint_name: Optional specific checkpoint folder name.
+                        If None, loads the latest checkpoint automatically.
+        device: Device to load model on
+        hf_token: Optional HuggingFace token for private repos
+
+    Returns:
+        SWAMLAWrapper instance
+    """
+    from huggingface_hub import hf_hub_download, list_repo_files
+    from dataclasses import fields
+    import re
+    import ast
+
+    # If no checkpoint specified, find the latest one
+    if checkpoint_name is None:
+        print0(f"Finding latest checkpoint in {repo_id}...")
+
+        files = list_repo_files(repo_id, token=hf_token)
+
+        # Find all checkpoint directories
+        checkpoint_pattern = re.compile(r'checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
+        checkpoints = []
+
+        for file in files:
+            match = checkpoint_pattern.match(file)
+            if match:
+                tokens_str = match.group(1)
+                loss_str = match.group(2)
+
+                # Parse tokens
+                tokens_multiplier = {'k': 1000, 'K': 1000, 'm': 1_000_000, 'M': 1_000_000, 'b': 1_000_000_000, 'B': 1_000_000_000}
+                tokens_value = int(tokens_str[:-1])
+                tokens_suffix = tokens_str[-1]
+                total_tokens = tokens_value * tokens_multiplier.get(tokens_suffix, 1)
+
+                checkpoints.append({
+                    'name': file.rsplit('/', 1)[0],
+                    'total_tokens': total_tokens,
+                    'loss': float(loss_str),
+                })
+
+        if not checkpoints:
+            raise ValueError(f"No checkpoints found in {repo_id}")
+
+        # Sort by total tokens (most recent training)
+        checkpoints.sort(key=lambda x: x['total_tokens'], reverse=True)
+        checkpoint_name = checkpoints[0]['name']
+
+        print0(f"Found {len(checkpoints)} checkpoints")
+        print0(f"Loading latest: {checkpoint_name} (tokens: {checkpoints[0]['total_tokens']:,}, loss: {checkpoints[0]['loss']:.4f})")
+    else:
+        print0(f"Loading checkpoint {checkpoint_name} from {repo_id}...")
+
+    # Download config
+    config_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{checkpoint_name}/config.json",
+        token=hf_token
+    )
+    with open(config_path, 'r') as f:
+        config_dict = json.load(f)
+
+    # Download weights
+    weights_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{checkpoint_name}/pytorch_model.bin",
+        token=hf_token
+    )
+
+    checkpoint_data = torch.load(weights_path, map_location="cpu", weights_only=False)
+
+    # Extract state_dict
+    if 'model_state_dict' in checkpoint_data:
+        state_dict = checkpoint_data['model_state_dict']
+    else:
+        state_dict = checkpoint_data
+
+    # Remove DDP/compile wrapper prefixes
+    if any(key.startswith("module.") for key in state_dict.keys()):
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    # Extract vocab_size and block_size from state_dict
+    vocab_size = None
+    block_size = None
+    if "transformer.wte.weight" in state_dict:
+        vocab_size = state_dict["transformer.wte.weight"].shape[0]
+        print0(f"Extracted vocab_size={vocab_size} from checkpoint")
+    if "transformer.wpe.weight" in state_dict:
+        block_size = state_dict["transformer.wpe.weight"].shape[0]
+        print0(f"Extracted block_size={block_size} from checkpoint")
+
+    # Process training_config if present
+    if 'training_config' in config_dict:
+        training_config = config_dict['training_config'].copy()
+        model_size = training_config.get('size', None)
+
+        # Map parameter names
+        param_mapping = {
+            'mla_q_lora_rank': 'q_lora_rank',
+            'mla_kv_lora_rank': 'kv_lora_rank',
+            'mla_qk_nope_head_dim': 'qk_nope_head_dim',
+            'mla_qk_rope_head_dim': 'qk_rope_head_dim',
+            'mla_v_head_dim': 'v_head_dim',
+        }
+        for old_name, new_name in param_mapping.items():
+            if old_name in training_config:
+                training_config[new_name] = training_config[old_name]
+
+        if 'gradient_checkpointing' in training_config:
+            training_config['use_gradient_checkpointing'] = training_config.pop('gradient_checkpointing')
+
+        # Filter to valid SWAMLAConfig fields
+        valid_fields = {f.name for f in fields(SWAMLAConfig)}
+        training_config = {k: v for k, v in training_config.items() if k in valid_fields}
+
+        # Convert string lists
+        list_fields = ['engram_layers', 'engram_ngram_orders']
+        for field_name in list_fields:
+            if field_name in training_config and isinstance(training_config[field_name], str):
+                try:
+                    training_config[field_name] = ast.literal_eval(training_config[field_name])
+                except (ValueError, SyntaxError):
+                    pass
+
+        # Force use_fp8 to False for inference
+        training_config['use_fp8'] = False
+
+        # Override from checkpoint
+        if vocab_size is not None:
+            training_config['vocab_size'] = vocab_size
+        if block_size is not None:
+            training_config['block_size'] = block_size
+
+        # Create model
+        if model_size:
+            training_config.pop('size', None)
+            model = create_swa_mla_model(size=model_size, **training_config)
+        else:
+            config = SWAMLAConfig(**training_config)
+            model = SWAMLAModel(config)
+    else:
+        # Fallback to old format
+        if vocab_size is not None:
+            config_dict['vocab_size'] = vocab_size
+        if block_size is not None:
+            config_dict['block_size'] = block_size
+        valid_fields = {f.name for f in fields(SWAMLAConfig)}
+        config_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
+        config = SWAMLAConfig(**config_dict)
+        model = SWAMLAModel(config)
+
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    print0(f"Model loaded successfully ({model.param_count / 1e6:.2f}M parameters)")
+    return SWAMLAWrapper(model, max_seq_len=model.config.block_size)
+
+
+# -----------------------------------------------------------------------------
 # Model loading
 
 def infer_config_from_weights(state_dict):
@@ -663,8 +843,11 @@ def load_hf_model(model_name: str, device):
 
 def main():
     parser = argparse.ArgumentParser(description="CORE Benchmark Evaluation")
-    parser.add_argument('--checkpoint', type=str, help='Path to SWAMLA checkpoint')
-    parser.add_argument('--hf_model', type=str, help='HuggingFace model name (e.g., openai-community/gpt2)')
+    parser.add_argument('--checkpoint', type=str, help='Path to local SWAMLA checkpoint')
+    parser.add_argument('--hf_repo_id', type=str, help='HuggingFace repo ID for SWAMLA model (e.g., username/swamla-model)')
+    parser.add_argument('--hf_checkpoint', type=str, default=None,
+                        help='Specific checkpoint folder in HF repo (e.g., checkpoint_tokens_500k_loss_2.3456). If not specified, loads latest.')
+    parser.add_argument('--hf_model', type=str, help='HuggingFace model name for comparison (e.g., openai-community/gpt2)')
     parser.add_argument('--size', type=str, default='engram-moe-1b', help='Model size preset for fallback (default: engram-moe-1b)')
     parser.add_argument('--n_experts', type=int, default=None, help='Override number of experts')
     parser.add_argument('--latent_ratio', type=int, default=None, help='Override latent ratio for MoE')
@@ -674,8 +857,8 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     args = parser.parse_args()
 
-    if not args.checkpoint and not args.hf_model:
-        parser.error("Must specify either --checkpoint or --hf_model")
+    if not args.checkpoint and not args.hf_repo_id and not args.hf_model:
+        parser.error("Must specify one of: --checkpoint, --hf_repo_id, or --hf_model")
 
     # Setup distributed
     is_distributed, rank, local_rank, world_size = setup_distributed()
@@ -700,6 +883,14 @@ def main():
             size=args.size,
             n_experts=args.n_experts,
             latent_ratio=args.latent_ratio
+        )
+    elif args.hf_repo_id:
+        hf_token = os.getenv("HF_TOKEN")
+        model = load_swamla_from_hf(
+            repo_id=args.hf_repo_id,
+            checkpoint_name=args.hf_checkpoint,
+            device=device,
+            hf_token=hf_token,
         )
     else:
         model = load_hf_model(args.hf_model, device)

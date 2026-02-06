@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional, Dict, Tuple, List
 
 import torch
@@ -43,6 +43,8 @@ class DeltaNetLayerConfig:
     use_value_embeds: bool = True
     ve_gate_dim: int = 32
     vocab_size: int = 50304
+    # Triton kernel control
+    use_triton_kernels: bool = True
     layer_id: Optional[int] = None
 
 
@@ -143,6 +145,9 @@ class SWAMLAConfig:
     # EMA (Exponential Moving Average)
     use_ema: bool = False
     ema_decay: float = 0.9999  # EMA decay factor
+
+    # Save tokens for resume
+    save_tokens: bool = False
 
     # YaRN (Yet another RoPE extensioN) - Context length extension
     # Enables inference on sequences longer than training length via NTK-by-parts interpolation
@@ -304,6 +309,7 @@ class SWAMLAModel(nn.Module):
                     ve_gate_dim=config.ve_gate_dim,
                     vocab_size=config.vocab_size,
                     layer_id=layer_idx,
+                    use_triton_kernels=config.use_triton_kernels,
                 )
                 block = GatedDeltaNetBlock(layer_config)
             else:
@@ -678,10 +684,10 @@ def _create_mla_block_config(config: SWAMLAConfig):
         use_flash_attention: bool = config.use_flash_attention
         # Engram parameters
         use_engram: bool = config.use_engram
-        engram_layers: List[int] = field(default_factory=lambda: config.engram_layers.copy())
+        engram_layers: List[int] = field(default_factory=lambda: list(config.engram_layers))
         engram_d_mem: int = config.engram_d_mem
         engram_n_hash_heads: int = config.engram_n_hash_heads
-        engram_ngram_orders: List[int] = field(default_factory=lambda: config.engram_ngram_orders.copy())
+        engram_ngram_orders: List[int] = field(default_factory=lambda: list(config.engram_ngram_orders))
         engram_conv_kernel: int = config.engram_conv_kernel
         engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = config.engram_table_sizes
         # Value Embeddings
@@ -699,6 +705,10 @@ def _create_mla_block_config(config: SWAMLAConfig):
         fope_n_harmonics: int = config.fope_n_harmonics
         fope_floor_ratio: float = config.fope_floor_ratio
         fope_coef_init_std: float = config.fope_coef_init_std
+        # Triton kernel control
+        use_triton_kernels: bool = config.use_triton_kernels
+        # SDPA backend control
+        use_cudnn_sdpa: bool = config.use_cudnn_sdpa
 
     return _Config()
 
@@ -763,20 +773,7 @@ def create_swa_mla_model(
     cfg_kwargs = presets[size].copy()
     cfg_kwargs.update(dict(vocab_size=vocab_size, block_size=block_size, dropout=dropout))
     cfg_kwargs.update(kwargs)
-    # Pop compile_mode if it exists, as it's not part of SWAMLAConfig
-    cfg_kwargs.pop("compile_mode", None)
-    cfg_kwargs.pop("use_tensorboard", None)
-    cfg_kwargs.pop("use_fp8", None)
-    # WeDLM parameters are handled in train.py, not in model config
-    cfg_kwargs.pop("use_wedlm", None)
-    cfg_kwargs.pop("wedlm_block_size", None)
-    cfg_kwargs.pop("wedlm_min_mask_ratio", None)
-    cfg_kwargs.pop("wedlm_max_mask_ratio", None)
-    cfg_kwargs.pop("wedlm_ar_loss_weight", None)
-    cfg_kwargs.pop("wedlm_mask_token_id", None)
-    # resume_from is handled in train.py, not in model config
-    cfg_kwargs.pop("resume_from", None)
-    cfg_kwargs.pop("resume_from_hf", None)
+
     # Backward compatibility: map swa_layers_per_cycle to local_layers_per_cycle
     if "swa_layers_per_cycle" in cfg_kwargs:
         import warnings
@@ -789,8 +786,10 @@ def create_swa_mla_model(
             cfg_kwargs["local_layers_per_cycle"] = cfg_kwargs.pop("swa_layers_per_cycle")
         else:
             cfg_kwargs.pop("swa_layers_per_cycle")
-    # cuDNN-compatible heads: H100+ supports head_dim ≤ 256, so no adjustment needed
-    # (qk_nope_head_dim=128 + qk_rope_head_dim=64 = 192 ≤ 256)
-    # Flag kept for backward compatibility but no longer modifies head dimensions
+
+    # Filter to only valid SWAMLAConfig fields (robust against checkpoint extras)
+    valid_fields = {f.name for f in fields(SWAMLAConfig)}
+    cfg_kwargs = {k: v for k, v in cfg_kwargs.items() if k in valid_fields}
+
     config = SWAMLAConfig(**cfg_kwargs)
     return SWAMLAModel(config)
