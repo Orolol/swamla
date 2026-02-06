@@ -1,5 +1,8 @@
 """Minimal forward pass test — bypasses inference.py entirely."""
 import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "models"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "optimization"))
 import torch
 from models.swa_mla_model import SWAMLAModel, SWAMLAConfig
 from transformers import AutoTokenizer
