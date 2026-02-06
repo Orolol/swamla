@@ -86,6 +86,17 @@ class InferenceEngine:
         # Encode prompt
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
 
+        # Prepend <eos> token to signal document boundary.
+        # Models trained on packed sequences (multiple docs per sequence separated by
+        # <eos>) learn that position 0 is ambiguous — it could be mid-document or
+        # document start. Without this prefix, the model strongly predicts <eos> at
+        # early positions, causing garbage generation. Prepending <eos> puts the model
+        # into "start of new document" mode, matching the training distribution.
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None:
+            eos_prefix = torch.tensor([[eos_id]], dtype=torch.long, device=self.device)
+            input_ids = torch.cat([eos_prefix, input_ids], dim=1)
+
         if input_ids.size(1) > self.max_length:
             print(f"Warning: Prompt length ({input_ids.size(1)}) exceeds max_length ({self.max_length}). Truncating.")
             input_ids = input_ids[:, -self.max_length:]
@@ -490,6 +501,14 @@ def load_model_from_hf(
         training_config['use_te_fp8'] = False
         training_config['fp8_backend'] = 'none'
 
+        # Handle config parameters that have changed defaults between versions
+        # Auto-detect use_value_embeds from checkpoint state_dict
+        if 'use_value_embeds' not in training_config:
+            has_ve = any('value_embeds' in k for k in state_dict.keys())
+            training_config['use_value_embeds'] = has_ve
+            if has_ve:
+                print(f"Auto-detected use_value_embeds=True from checkpoint weights")
+
         # Override vocab_size and block_size from checkpoint if extracted
         if vocab_size is not None:
             training_config['vocab_size'] = vocab_size
@@ -517,6 +536,10 @@ def load_model_from_hf(
         import ast
         valid_fields = {f.name for f in fields(SWAMLAConfig)}
         config_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
+
+        # Handle config parameters that have changed defaults between versions
+        if 'use_value_embeds' not in config_dict:
+            config_dict['use_value_embeds'] = False
         # Convert string representations of lists back to actual lists
         list_fields = ['engram_layers', 'engram_ngram_orders']
         for field_name in list_fields:
@@ -528,7 +551,20 @@ def load_model_from_hf(
         config = SWAMLAConfig(**config_dict)
         model = SWAMLAModel(config)
 
-    model.load_state_dict(state_dict)
+    # Load the converted state dict with strict=False to handle version differences
+    load_result = model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys:
+        print(f"Note: {len(load_result.missing_keys)} missing keys (new features not in checkpoint)")
+        for key in load_result.missing_keys[:5]:
+            print(f"  - {key}")
+        if len(load_result.missing_keys) > 5:
+            print(f"  ... and {len(load_result.missing_keys) - 5} more")
+    if load_result.unexpected_keys:
+        print(f"Warning: {len(load_result.unexpected_keys)} unexpected keys in checkpoint")
+        for key in load_result.unexpected_keys[:10]:
+            print(f"  - {key}")
+        if len(load_result.unexpected_keys) > 10:
+            print(f"  ... and {len(load_result.unexpected_keys) - 10} more")
 
     # Preserve complex-valued buffers (e.g., freqs_cis) before dtype conversion
     # Converting complex64 to bfloat16 discards the imaginary part
@@ -656,9 +692,14 @@ def load_model_from_checkpoint(
                 config_dict[key] = [int(x.strip()) for x in config_dict[key].split(',') if x.strip()]
 
         # Handle config parameters that have changed defaults between versions
-        # If not explicitly set in checkpoint, use safe defaults to match training
+        # Auto-detect use_value_embeds from checkpoint state_dict
         if 'use_value_embeds' not in config_dict:
-            config_dict['use_value_embeds'] = False  # Feature didn't exist in older checkpoints
+            state_dict_ref = checkpoint.get("model") or checkpoint.get("model_state_dict")
+            if state_dict_ref and any('value_embeds' in k for k in state_dict_ref.keys()):
+                config_dict['use_value_embeds'] = True
+                print("Auto-detected use_value_embeds=True from checkpoint weights")
+            else:
+                config_dict['use_value_embeds'] = False
 
         # Disable Triton kernels and cuDNN for CPU inference (they only work on CUDA)
         if device == 'cpu' or device == torch.device('cpu'):
@@ -1135,6 +1176,106 @@ def chat_mode(
 
 
 @torch.inference_mode()
+def run_validation_diagnostic(
+    model: SWAMLAModel,
+    tokenizer,
+    device: str = "cuda",
+    n_batches: int = 25,
+    block_size: int = 2048,
+):
+    """Compute cross-entropy loss on real FineWeb-Edu data.
+
+    This gives a stable loss number directly comparable to the training loss
+    reported in the checkpoint name (e.g. 3.14).
+
+    Args:
+        model: Loaded SWA-MLA model (already on device, eval mode).
+        tokenizer: Tokenizer for the model.
+        device: Device string.
+        n_batches: Number of batches to evaluate (~n_batches * block_size tokens).
+        block_size: Sequence length per sample.
+    """
+    import math
+
+    print("\n" + "=" * 80)
+    print("VALIDATION LOSS DIAGNOSTIC (FineWeb-Edu)")
+    print("=" * 80)
+
+    # Import and create dataset
+    try:
+        sys.path.insert(0, str(Path(__file__).parent / 'data'))
+        from data_loader_packed import PackedFinewebDataset
+    except ImportError as e:
+        print(f"Cannot import PackedFinewebDataset: {e}")
+        print("Skipping validation diagnostic.")
+        return
+
+    print(f"Loading FineWeb-Edu validation split ({n_batches} batches, block_size={block_size})...")
+    dataset = PackedFinewebDataset(
+        split="train",  # FineWeb-Edu streaming, use offset to get "validation" data
+        max_length=block_size,
+        batch_size=1,
+        buffer_docs=512,
+        prefetch_batches=4,
+        shuffle=False,
+        tokenizer=tokenizer,
+        num_workers=1,
+        start_offset=500_000,  # Skip ahead to avoid overlap with training data
+    )
+
+    loader = iter(dataset)
+    total_loss = 0.0
+    total_tokens = 0
+    batch_count = 0
+
+    model.eval()
+    for _ in range(n_batches):
+        try:
+            batch = next(loader)
+        except StopIteration:
+            break
+
+        input_ids = batch['input_ids'].to(device)
+        labels = batch['labels'].to(device)
+
+        with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == 'cuda')):
+            # Use the model's built-in loss computation (same as training).
+            # Labels from PackedFinewebDataset are ALREADY shifted:
+            #   labels[:, i] = input_ids[:, i+1], with pad positions = -100
+            # So no additional shifting is needed.
+            _, loss = model(input_ids, targets=labels)
+
+        if loss is None:
+            continue
+
+        # Count valid tokens (non-padding labels)
+        n_valid = (labels != -100).sum().item()
+        if n_valid == 0:
+            continue
+
+        total_loss += loss.item() * n_valid
+        total_tokens += n_valid
+        batch_count += 1
+
+        if batch_count % 5 == 0:
+            running_loss = total_loss / total_tokens
+            print(f"  Batch {batch_count}/{n_batches}: running loss = {running_loss:.4f} "
+                  f"(ppl = {math.exp(running_loss):.2f}, {total_tokens:,} tokens)")
+
+    if total_tokens == 0:
+        print("No valid tokens found!")
+        return
+
+    avg_loss = total_loss / total_tokens
+    ppl = math.exp(avg_loss)
+    print(f"\n  Final: loss = {avg_loss:.4f}, perplexity = {ppl:.2f}")
+    print(f"  Evaluated on {total_tokens:,} tokens across {batch_count} batches")
+    print(f"\n  Compare with checkpoint reported loss to verify weight integrity.")
+    print(f"  If actual loss >> reported loss, weights are likely corrupted or stale.")
+    print("=" * 80 + "\n")
+
+
+@torch.inference_mode()
 def _eval_perplexity(engine: InferenceEngine, text: str):
     """Compute and print perplexity of the model on given text.
 
@@ -1277,6 +1418,67 @@ def run_diagnostics(model: SWAMLAModel, tokenizer, device: str = "cuda"):
         print("\n--- Residual Scalars ---")
         print("  Not present (use_residual_scalars=False or not trained)")
 
+    # 3c. FoPE learned parameters
+    fope_params = [(n, p) for n, p in model.named_parameters() if 'sin_coef' in n or 'cos_coef' in n]
+    if fope_params:
+        print("\n--- FoPE Learned Parameters ---")
+        for name, param in fope_params:
+            data = param.float()
+            nan_count = torch.isnan(data).sum().item()
+            inf_count = torch.isinf(data).sum().item()
+            flag = " *** ISSUE ***" if (nan_count > 0 or inf_count > 0) else ""
+            print(f"  {name}: mean={data.mean().item():.6f}, std={data.std().item():.6f}, "
+                  f"min={data.min().item():.6f}, max={data.max().item():.6f}, "
+                  f"NaN={nan_count}, Inf={inf_count}{flag}")
+        # Check if coefficients have been learned (std should be > init_std)
+        sin_params = [p for n, p in fope_params if 'sin_coef' in n]
+        if sin_params:
+            avg_std = sum(p.float().std().item() for p in sin_params) / len(sin_params)
+            print(f"  Average sin_coef std: {avg_std:.6f} (init ~0.3, should diverge if trained)")
+    else:
+        print("\n--- FoPE Learned Parameters ---")
+        print("  Not present (fope_enabled=False)")
+
+    # 3d. MoE router gate weights
+    router_params = [(n, p) for n, p in model.named_parameters() if 'router' in n and 'gate' in n]
+    if router_params:
+        print("\n--- MoE Router Gate Weights ---")
+        for name, param in router_params:
+            data = param.float()
+            nan_count = torch.isnan(data).sum().item()
+            inf_count = torch.isinf(data).sum().item()
+            flag = " *** ISSUE ***" if (nan_count > 0 or inf_count > 0) else ""
+            print(f"  {name}: mean={data.mean().item():.6f}, std={data.std().item():.6f}, "
+                  f"min={data.min().item():.6f}, max={data.max().item():.6f}, "
+                  f"shape={tuple(param.shape)}, NaN={nan_count}, Inf={inf_count}{flag}")
+    else:
+        print("\n--- MoE Router Gate Weights ---")
+        print("  Not present (no MoE layers)")
+
+    # 3e. Engram parameters
+    engram_params = [(n, p) for n, p in model.named_parameters() if 'engram' in n]
+    if engram_params:
+        print("\n--- Engram Parameters ---")
+        # Group by type for readability
+        embed_params = [(n, p) for n, p in engram_params if 'table' in n or 'embed' in n]
+        other_params = [(n, p) for n, p in engram_params if 'table' not in n and 'embed' not in n]
+
+        if embed_params:
+            print(f"  Embedding tables: {len(embed_params)} params")
+            total_nan = sum(torch.isnan(p.float()).sum().item() for _, p in embed_params)
+            total_inf = sum(torch.isinf(p.float()).sum().item() for _, p in embed_params)
+            avg_norm = sum(p.float().norm().item() for _, p in embed_params) / len(embed_params)
+            flag = " *** ISSUE ***" if (total_nan > 0 or total_inf > 0) else ""
+            print(f"    avg_norm={avg_norm:.4f}, total_NaN={total_nan}, total_Inf={total_inf}{flag}")
+
+        for name, param in other_params:
+            data = param.float()
+            print(f"  {name}: mean={data.mean().item():.6f}, std={data.std().item():.6f}, "
+                  f"shape={tuple(param.shape)}")
+    else:
+        print("\n--- Engram Parameters ---")
+        print("  Not present (use_engram=False)")
+
     # 4. Perplexity on test sentence
     print("\n--- Test Perplexity ---")
     test_text = "The quick brown fox jumps over the lazy dog. In a world where technology advances rapidly, humans must adapt to constant change."
@@ -1403,6 +1605,8 @@ def main():
                         help="Skip EMA weights even if available in local checkpoint (use raw model weights)")
     parser.add_argument("--diagnose", action="store_true",
                         help="Run diagnostics: print config, dtypes, weight stats, and precision comparison")
+    parser.add_argument("--eval_loss", action="store_true",
+                        help="Compute validation loss on FineWeb-Edu data and compare to checkpoint reported loss")
 
     args = parser.parse_args()
 
@@ -1458,6 +1662,11 @@ def main():
     # Run diagnostics if requested
     if args.diagnose:
         run_diagnostics(model, tokenizer, args.device)
+        return
+
+    # Run validation loss diagnostic if requested
+    if args.eval_loss:
+        run_validation_diagnostic(model, tokenizer, args.device)
         return
 
     # Evaluate perplexity if requested

@@ -135,6 +135,7 @@ class MLA(nn.Module):
         # Flash Attention 2 support
         self.use_flash_attention = getattr(config, 'use_flash_attention', False) and FLASH_ATTN_AVAILABLE
         print(f"MLA: FLASH_ATTN_AVAILABLE = {FLASH_ATTN_AVAILABLE}")
+        print(f"MLA: use_flash_attention = {self.use_flash_attention}")
         if self.use_flash_attention:
             print(f"MLA: Using Flash Attention 2")
 
@@ -151,7 +152,11 @@ class MLA(nn.Module):
         self._flex_attention_compiled = None  # Will be compiled on first use
 
         self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
-        if self.use_cudnn_sdpa:
+        if self.use_cudnn_sdpa and self.qk_head_dim > 128:
+            # cuDNN SDPA runtime limit is head_dim ≤ 128 on most GPUs
+            self.use_cudnn_sdpa = False
+            print(f"MLA: cuDNN SDPA disabled (head_dim={self.qk_head_dim} > 128), using default SDPA")
+        elif self.use_cudnn_sdpa:
             print(f"MLA: Using cuDNN SDPA backend (head_dim={self.qk_head_dim})")
                
         

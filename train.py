@@ -1787,7 +1787,7 @@ def main():
                         help='Enable cuDNN SDPA (H100+ supports head_dim ≤ 256, no dimension adjustment needed)')
 
     # DeltaNet options (always enabled)
-    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,
                         help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')

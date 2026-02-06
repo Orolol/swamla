@@ -321,6 +321,9 @@ class GatedDeltaNet(nn.Module):
         B, T, H, K = q.shape
         V = v.shape[-1]
 
+        # Apply scale to q (matching FLA kernel behavior)
+        q = q * self.scale
+
         # Initialize state
         if state is None:
             S = torch.zeros(B, H, K, V, device=q.device, dtype=q.dtype)
@@ -352,7 +355,7 @@ class GatedDeltaNet(nn.Module):
             delta = vk - correction
             S = g_t * S + beta_t * delta
 
-            # Output: S @ q
+            # Output: S @ q (scale already applied to q)
             o_t = torch.einsum('bhkv,bhk->bhv', S, q_t)  # (B, H, V)
             outputs.append(o_t)
 
