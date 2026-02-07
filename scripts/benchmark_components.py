@@ -764,7 +764,7 @@ def print_results(results: List[BenchmarkResult], batch_size: int, seq_len: int,
     print(f"  Batch: {batch_size} | Seq len: {seq_len} | dtype: bf16")
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
-        total_vram = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         print(f"  GPU: {gpu_name} ({total_vram:.1f} GB)")
     if config.use_moe:
         print(f"  MoE: {config.n_experts} experts, {config.n_activated} activated, "
@@ -833,7 +833,7 @@ def main():
     print(f"\nStarting benchmark: preset={args.preset}, batch_size={args.batch_size}, seq_len={args.seq_len}")
     print(f"Warmup={args.warmup}, Iterations={args.iterations}")
     print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM total: {torch.cuda.get_device_properties(0).total_mem / (1024 ** 3):.1f} GB")
+    print(f"VRAM total: {torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.1f} GB")
     print()
 
     results: List[BenchmarkResult] = []

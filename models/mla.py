@@ -155,10 +155,12 @@ class MLA(nn.Module):
         if self.use_cudnn_sdpa and self.qk_head_dim > 128:
             # cuDNN SDPA runtime limit is head_dim ≤ 128 on most GPUs
             self.use_cudnn_sdpa = False
-            print(f"MLA: cuDNN SDPA disabled (head_dim={self.qk_head_dim} > 128), using default SDPA")
+            
         elif self.use_cudnn_sdpa:
             print(f"MLA: Using cuDNN SDPA backend (head_dim={self.qk_head_dim})")
-               
+            
+        if not self.use_cudnn_sdpa and not self.use_flash_attention and not self.use_triton_mla:
+            print(f"MLA: Using PyTorch native SDPA backend (head_dim={self.qk_head_dim})")   
         
         # Initialize position embeddings (RoPE or FoPE)
         # FoPE (Fourier Position Embedding) replaces RoPE for better length generalization
@@ -448,28 +450,38 @@ class MLA(nn.Module):
                     # Ensure mask has the same dtype as query tensor for SDPA compatibility
                     attn_mask = attn_mask.to(q_sdpa.dtype)
 
-                attn_output = self._sdpa_attention(
-                    q_sdpa, k_sdpa, v_sdpa,
-                    attn_mask=attn_mask,
-                    is_causal=mask is None and seqlen > 1,
-                )
+                if self.use_cudnn_sdpa:
+                    # cuDNN path: requires @torch.compiler.disable for head_dim workaround
+                    attn_output = self._sdpa_attention(
+                        q_sdpa, k_sdpa, v_sdpa,
+                        attn_mask=attn_mask,
+                        is_causal=mask is None and seqlen > 1,
+                    )
+                else:
+                    # Standard SDPA: fully compilable, no graph break
+                    attn_output = F.scaled_dot_product_attention(
+                        q_sdpa, k_sdpa, v_sdpa,
+                        attn_mask=attn_mask,
+                        dropout_p=self.dropout if self.training else 0.0,
+                        is_causal=mask is None and seqlen > 1,
+                        scale=self.softmax_scale,
+                    )
 
                 # Transpose back to [B, S, H, D]
                 x = attn_output.transpose(1, 2).contiguous()
         else:
             # Optimized approach: use low-rank decomposition
-            # Extract weight for wkv_b
-            wkv_b = self.wkv_b.weight
-            wkv_b = wkv_b.view(self.n_heads, -1, self.kv_lora_rank)
-            
+            # Uses self.wkv_b() as a proper Linear call (not .weight access)
+            # to preserve FP8 quantization path when using Transformer Engine.
+
             # Prepare normalized kv and pe tensors
             kv_norm_tensor = self.kv_norm(kv)
-            
+
             if is_inference and hasattr(self, 'kv_cache') and hasattr(self, 'pe_cache'):
                 # Only update caches in inference mode
-                self.kv_cache[:bsz, start_pos:end_pos] = kv_norm_tensor  
+                self.kv_cache[:bsz, start_pos:end_pos] = kv_norm_tensor
                 self.pe_cache[:bsz, start_pos:end_pos] = k_pe
-                
+
                 # Use the cached values for attention
                 kv_to_use = self.kv_cache[:bsz, :end_pos]
                 pe_to_use = self.pe_cache[:bsz, :end_pos]
@@ -478,10 +490,13 @@ class MLA(nn.Module):
                 # This dramatically reduces memory usage
                 kv_to_use = kv_norm_tensor
                 pe_to_use = k_pe
-            
-            # For the optimized approach, we need to project values through low-rank space
-            # First, extract values from the low-rank representation
-            v = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, -self.v_head_dim:])
+
+            # Project K_nope and V from low-rank space via Linear call
+            # (goes through te.Linear FP8 path when available, and reads kv_to_use once)
+            kv_projected = self.wkv_b(kv_to_use)  # [B, T, n_heads * (D_nope + D_v)]
+            kv_projected = kv_projected.view(bsz, -1, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope_full = kv_projected[..., :self.qk_nope_head_dim]
+            v = kv_projected[..., self.qk_nope_head_dim:]
 
             # Apply Value Embeddings if enabled for this layer
             if self.has_value_embeds and input_ids is not None:
@@ -489,9 +504,6 @@ class MLA(nn.Module):
 
             # Reshape queries - keep q_nope and q_pe in their original dimensions
             q_full = torch.cat([q_nope, q_pe], dim=-1)  # Combine q components [B, S, H, D]
-
-            # For keys, we need to reconstruct from low-rank space
-            k_nope_full = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, :self.qk_nope_head_dim])
             # Properly expand pe_to_use from [B, T, D] to [B, T, H, D] where each head gets the same RoPE
             # This ensures consistent rotary positional encoding across all attention heads
             pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
@@ -532,15 +544,26 @@ class MLA(nn.Module):
                     # Ensure mask has the same dtype as query tensor for SDPA compatibility
                     attn_mask = attn_mask.to(q_sdpa.dtype)
 
-                attn_output = self._sdpa_attention(
-                    q_sdpa, k_sdpa, v_sdpa,
-                    attn_mask=attn_mask,
-                    is_causal=mask is None and seqlen > 1,
-                )
+                if self.use_cudnn_sdpa:
+                    # cuDNN path: requires @torch.compiler.disable for head_dim workaround
+                    attn_output = self._sdpa_attention(
+                        q_sdpa, k_sdpa, v_sdpa,
+                        attn_mask=attn_mask,
+                        is_causal=mask is None and seqlen > 1,
+                    )
+                else:
+                    # Standard SDPA: fully compilable, no graph break
+                    attn_output = F.scaled_dot_product_attention(
+                        q_sdpa, k_sdpa, v_sdpa,
+                        attn_mask=attn_mask,
+                        dropout_p=self.dropout if self.training else 0.0,
+                        is_causal=mask is None and seqlen > 1,
+                        scale=self.softmax_scale,
+                    )
 
                 # Transpose back to [B, S, H, D]
                 x = attn_output.transpose(1, 2).contiguous()
-        
+
         # Reshape and project to output dimension
         x = x.reshape(bsz, seqlen, -1)
         x = self.wo(x)

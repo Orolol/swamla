@@ -266,6 +266,14 @@ class EngramEmbeddings(nn.Module):
             torch.randint(1, 2**31, (max_n, config.num_heads), dtype=torch.long)
         )
 
+        # Pre-compute vectorization info: if all tables for a given n-gram order
+        # have the same size, we can batch all K heads into a single F.embedding call
+        self._uniform_table_size: Dict[int, int] = {}
+        for n in config.n_gram_orders:
+            sizes = {config.table_sizes[(n, k)] for k in range(config.num_heads)}
+            if len(sizes) == 1:
+                self._uniform_table_size[n] = sizes.pop()
+
     def extract_ngrams(
         self,
         canonical_ids: torch.Tensor,  # [batch, seq_len]
@@ -329,31 +337,56 @@ class EngramEmbeddings(nn.Module):
         """
         Retrieve and concatenate all N-gram embeddings.
 
+        Uses vectorized hash + packed F.embedding when all tables for a given
+        n-gram order have the same size (production config). Falls back to
+        per-head loop otherwise.
+
         Returns:
             embeddings: [batch, seq_len, d_mem]
         """
         all_embeddings = []
+        K = self.config.num_heads
+        B, T = canonical_ids.shape
+        device = canonical_ids.device
 
         for n in self.config.n_gram_orders:
-            # Extract N-grams
             ngrams = self.extract_ngrams(canonical_ids, n)  # [B, T, n]
 
-            for k in range(self.config.num_heads):
-                table_key = f"n{n}_h{k}"
-                table = self.tables[table_key]
-                table_size = self.config.table_sizes[(n, k)]
+            if n in self._uniform_table_size:
+                # Vectorized path: all K heads at once
+                table_size = self._uniform_table_size[n]
+                seeds = self.hash_seeds[:n, :K]  # [n, K]
 
-                # Hash to indices
-                indices = self.hash_ngram(ngrams, n, k, table_size)  # [B, T]
+                # Batched hash: [B, T, n, 1] * [n, K] → [B, T, n, K]
+                terms = ngrams.unsqueeze(-1).long() * seeds
 
-                # Lookup embeddings
-                emb = table(indices)  # [B, T, slot_dim]
-                all_embeddings.append(emb)
+                # XOR-fold along n-gram dimension → [B, T, K]
+                hash_val = terms[:, :, 0, :]
+                for i in range(1, n):
+                    hash_val = hash_val ^ terms[:, :, i, :]
 
-        # Concatenate all embeddings
-        output = torch.cat(all_embeddings, dim=-1)  # [B, T, d_mem]
+                indices = hash_val % table_size  # [B, T, K]
 
-        return output
+                # Pack all K table weights into one tensor for single F.embedding
+                packed = torch.cat(
+                    [self.tables[f"n{n}_h{k}"].weight for k in range(K)],
+                    dim=0,
+                )  # [K * table_size, slot_dim]
+
+                # Offset indices so each head indexes its own slice of packed
+                offsets = torch.arange(K, device=device, dtype=torch.long) * table_size
+                embs = F.embedding(indices + offsets, packed)  # [B, T, K, slot_dim]
+                all_embeddings.append(embs.reshape(B, T, -1))
+            else:
+                # Fallback: per-head loop (different table sizes)
+                for k in range(K):
+                    table_key = f"n{n}_h{k}"
+                    table = self.tables[table_key]
+                    table_size = self.config.table_sizes[(n, k)]
+                    indices = self.hash_ngram(ngrams, n, k, table_size)
+                    all_embeddings.append(table(indices))
+
+        return torch.cat(all_embeddings, dim=-1)  # [B, T, d_mem]
 
 
 # =============================================================================
@@ -426,8 +459,8 @@ class EngramGating(nn.Module):
                 (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale
             )  # [B, T, 1]
 
-            # Store gate scalar for metrics (before multiplication with v)
-            self.last_gate = gate.detach()  # [B, T, 1]
+            # Gate stored by Engram._store_monitoring via self.gating.last_gate
+            self.last_gate = gate
 
             return gate * v  # [B, T, d]
 
@@ -601,7 +634,6 @@ class Engram(nn.Module):
         device = next(self.parameters()).device
         self._compression_mapping = compression.mapping.to(device)
 
-    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,  # [B, T, d] or list for multi-branch
@@ -616,8 +648,6 @@ class Engram(nn.Module):
         # 1. Compress token IDs to canonical form
         # Use the registered buffer (already on correct device) to avoid DeviceCopy
         if self._compression_mapping is None:
-            # Fallback if mapping not set: use identity (original IDs)
-            # This prevents TypeError if set_tokenizer_compression wasn't called
             canonical_ids = input_ids
         else:
             canonical_ids = self._compression_mapping[input_ids]
@@ -625,25 +655,23 @@ class Engram(nn.Module):
         # 2. Retrieve N-gram embeddings
         memory = self.embeddings.retrieve(canonical_ids)  # [B, T, d_mem]
 
-        # Store for monitoring
-        self.last_memory = memory.detach()
-
         # 3. Apply context-aware gating
-        gated = self.gating(hidden_states, memory)  # [B, T, d] or list
+        gated = self.gating(hidden_states, memory)  # [B, T, d]
 
-        # Store gate values for monitoring
-        if not isinstance(gated, list):
-            self.last_gate_values = gated.detach()
-            # Store scalar gate from gating module for accurate activation_rate metric
-            self.last_scalar_gate = self.gating.last_gate.detach() if hasattr(self.gating, 'last_gate') else None
+        # 4. Apply causal convolution
+        output = self.conv(gated)
 
-        # 4. Apply causal convolution (per branch if multi-branch)
-        if isinstance(gated, list):
-            output = [self.conv(g) for g in gated]
-        else:
-            output = self.conv(gated)
+        # 5. Store monitoring data (outside compiled graph to avoid graph breaks)
+        self._store_monitoring(memory, gated)
 
         return output
+
+    @torch.compiler.disable
+    def _store_monitoring(self, memory: torch.Tensor, gated: torch.Tensor):
+        """Store monitoring data outside compiled region."""
+        self.last_memory = memory.detach()
+        self.last_gate_values = gated.detach()
+        self.last_scalar_gate = self.gating.last_gate.detach() if hasattr(self.gating, 'last_gate') else None
 
     def get_num_params(self) -> int:
         """Get total number of parameters."""

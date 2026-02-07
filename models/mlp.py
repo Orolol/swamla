@@ -110,10 +110,7 @@ class MLP(nn.Module):
             # Mode inference ou JIT: utiliser l'implémentation fusionnée
             return self._fuse_operations(x)
 
-        # Mode training: utiliser la version avec checkpointing si:
-        # - checkpointing est activé dans la config
-        # - la séquence est longue (> 1024 tokens)
-        if self.use_gradient_checkpointing and x.shape[1] > 1024:
-            return checkpoint.checkpoint(self._fuse_operations, x, use_reentrant=False)
-
+        # NOTE: MLP-level checkpointing is DISABLED because MLABlock and
+        # GatedDeltaNetBlock already checkpoint the entire FFN sublayer.
+        # Having both causes double-recomputation of the MLP during backward.
         return self._fuse_operations(x)

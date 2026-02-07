@@ -101,19 +101,22 @@ class GatedDeltaNet(nn.Module):
             self.v_proj = nn.Linear(config.n_embd, proj_dim, bias=False)
             self.o_proj = nn.Linear(proj_dim, config.n_embd, bias=False)
 
-        # Gate projection (single gate g for decay)
-        self.g_proj = nn.Linear(config.n_embd, self.n_head, bias=False)
-
-        # Beta projection (per-position beta for delta rule)
-        self.beta_proj = nn.Linear(config.n_embd, self.n_head, bias=False)
+        # Fused gate (g) + beta projection: single Linear instead of two
+        # Saves one full read of x from HBM per forward pass
+        self.g_beta_proj = nn.Linear(config.n_embd, 2 * self.n_head, bias=False)
 
         # Short convolution for local context
+        # Merged Q/K/V into single grouped depthwise conv: 6 transposes → 2, 3 launches → 1
         self.use_short_conv = getattr(config, 'deltanet_use_conv', True)
         if self.use_short_conv:
             conv_kernel = getattr(config, 'deltanet_conv_kernel', 4)
-            self.q_conv = ShortConvolution(proj_dim, conv_kernel)
-            self.k_conv = ShortConvolution(proj_dim, conv_kernel)
-            self.v_conv = ShortConvolution(proj_dim, conv_kernel)
+            self.qkv_conv = nn.Conv1d(
+                3 * proj_dim, 3 * proj_dim,
+                kernel_size=conv_kernel,
+                groups=3 * proj_dim,  # Depthwise
+                padding=conv_kernel - 1,
+            )
+            self._proj_dim = proj_dim  # Store for chunk split in forward
 
         # Dropout
         self.dropout = nn.Dropout(config.dropout)
@@ -171,9 +174,44 @@ class GatedDeltaNet(nn.Module):
             nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
             nn.init.xavier_uniform_(self.o_proj.weight, gain=0.1)
 
-        # Always initialize gate and beta projections
-        nn.init.xavier_uniform_(self.g_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.beta_proj.weight, gain=0.1)
+        # Always initialize fused gate+beta projection
+        nn.init.xavier_uniform_(self.g_beta_proj.weight, gain=0.1)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Migrate old checkpoint weights to fused projections."""
+        # Migrate old g_proj + beta_proj → fused g_beta_proj
+        g_key = prefix + 'g_proj.weight'
+        beta_key = prefix + 'beta_proj.weight'
+        fused_key = prefix + 'g_beta_proj.weight'
+        if g_key in state_dict and beta_key in state_dict and fused_key not in state_dict:
+            g_w = state_dict.pop(g_key)
+            beta_w = state_dict.pop(beta_key)
+            state_dict[fused_key] = torch.cat([g_w, beta_w], dim=0)
+
+        # Migrate old q_conv + k_conv + v_conv → merged qkv_conv
+        q_conv_w = prefix + 'q_conv.conv.weight'
+        k_conv_w = prefix + 'k_conv.conv.weight'
+        v_conv_w = prefix + 'v_conv.conv.weight'
+        qkv_conv_w = prefix + 'qkv_conv.weight'
+        if q_conv_w in state_dict and qkv_conv_w not in state_dict:
+            state_dict[qkv_conv_w] = torch.cat([
+                state_dict.pop(q_conv_w),
+                state_dict.pop(k_conv_w),
+                state_dict.pop(v_conv_w),
+            ], dim=0)
+            # Migrate biases too
+            q_conv_b = prefix + 'q_conv.conv.bias'
+            k_conv_b = prefix + 'k_conv.conv.bias'
+            v_conv_b = prefix + 'v_conv.conv.bias'
+            qkv_conv_b = prefix + 'qkv_conv.bias'
+            if q_conv_b in state_dict:
+                state_dict[qkv_conv_b] = torch.cat([
+                    state_dict.pop(q_conv_b),
+                    state_dict.pop(k_conv_b),
+                    state_dict.pop(v_conv_b),
+                ], dim=0)
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def forward(
         self,
@@ -223,17 +261,18 @@ class GatedDeltaNet(nn.Module):
             gate = 2 * torch.sigmoid(self.ve_gate(x[:, :, :self.ve_gate_dim]))  # (B, T, 1)
             v = v + gate * ve
 
-        # Apply short convolutions for local context
+        # Apply merged short convolution for local context (1 grouped conv instead of 3)
         if self.use_short_conv:
-            q = self.q_conv(q)
-            k = self.k_conv(k)
-            v = self.v_conv(v)
+            qkv = torch.cat([q, k, v], dim=-1)  # (B, T, 3*proj_dim)
+            qkv = qkv.transpose(1, 2)  # (B, 3*proj_dim, T)
+            qkv = self.qkv_conv(qkv)[:, :, :T]  # Causal: trim future padding
+            qkv = qkv.transpose(1, 2)  # (B, T, 3*proj_dim)
+            q, k, v = qkv.split(self._proj_dim, dim=-1)
 
-        # Compute gate (decay) and beta
-        g = self.g_proj(x)  # (B, T, n_head)
+        # Compute gate (decay) and beta from fused projection (single read of x)
+        g_beta = self.g_beta_proj(x)  # (B, T, 2 * n_head)
+        g, beta = g_beta.chunk(2, dim=-1)  # each (B, T, n_head)
         g = F.logsigmoid(g)  # Log-space for numerical stability
-
-        beta = self.beta_proj(x)  # (B, T, n_head)
         beta = torch.sigmoid(beta)  # Range [0, 1]
 
         # Reshape to (B, T, n_head, head_dim)

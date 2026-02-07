@@ -385,11 +385,15 @@ class FoPE(nn.Module):
             active_cos = torch.einsum('snh,nh->sn', cos_harmonics, cos_weights)
 
             # Normalize to prevent explosion (use detached norm for stability)
+            # NOTE: Use pure tensor ops (no .item()) to avoid GPU-CPU sync and torch.compile graph breaks
             with torch.no_grad():
-                coef_var = self.sin_coef[:, 1:].pow(2).mean().item() if self.n_harmonics > 1 else 0
-                norm_factor = math.sqrt(1 + (self.n_harmonics - 1) * coef_var)
-            active_sin = active_sin / max(norm_factor, 1.0)
-            active_cos = active_cos / max(norm_factor, 1.0)
+                if self.n_harmonics > 1:
+                    coef_var = self.sin_coef[:, 1:].pow(2).mean()
+                    norm_factor = torch.sqrt(1.0 + (self.n_harmonics - 1) * coef_var).clamp(min=1.0)
+                else:
+                    norm_factor = 1.0
+            active_sin = active_sin / norm_factor
+            active_cos = active_cos / norm_factor
         else:
             active_sin = None
             active_cos = None

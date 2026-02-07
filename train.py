@@ -16,6 +16,7 @@ import sys
 import time
 import math
 import argparse
+import threading
 from pathlib import Path
 
 import torch
@@ -1075,7 +1076,7 @@ def train(args):
 
     # Wrap with DDP
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], static_graph=True)
         raw_model = model.module
     else:
         raw_model = model
@@ -1234,6 +1235,9 @@ def train(args):
         last_eval_tokens = 0
         last_save_tokens = 0
 
+    # Background thread for async checkpoint saving
+    _save_thread = None
+
     if master_process:
         print(f"Token-based triggers: eval every {format_tokens(eval_token_threshold)}, save every {format_tokens(save_token_threshold)}")
 
@@ -1244,6 +1248,13 @@ def train(args):
     for opt in optimizers_list:
         opt_lrs = [pg['lr'] for pg in opt.param_groups]
         initial_lrs.append(opt_lrs)
+
+    # Pre-compute cautious WD parameter list (avoids per-step string matching)
+    no_wd_keywords = ['.bias', 'norm', 'ln_', 'wte', 'wpe', 'lambdas', 'engram']
+    cautious_wd_params = [
+        param for name, param in model.named_parameters()
+        if param.requires_grad and not any(nd in name for nd in no_wd_keywords)
+    ]
 
     # Prefetch first batch
     next_batch = None
@@ -1351,55 +1362,60 @@ def train(args):
             fp8_group = dist.group.WORLD if is_ddp and use_te_fp8 else None
             fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group) if use_te_fp8 else nullcontext()
 
-            # Forward pass with mixed precision (BF16 + optional FP8 via TE)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                with fp8_ctx:
-                    if args.use_wedlm and wedlm_masker is not None:
-                        # WeDLM training: dual-stream forward pass
-                        wedlm_batch = wedlm_masker(input_ids)
+            # Suppress DDP gradient sync on non-final micro-steps (saves N-1 allreduce ops)
+            is_last_micro_step = (micro_step == args.gradient_accumulation_steps - 1)
+            sync_ctx = nullcontext() if (not is_ddp or is_last_micro_step) else model.no_sync()
 
-                        dual_input_ids = wedlm_batch['dual_input_ids']
-                        dual_position_ids = wedlm_batch['dual_position_ids']
-                        dual_attention_mask = wedlm_batch['dual_attention_mask']
-                        target_ids = wedlm_batch['target_ids']
-                        target_mask = wedlm_batch['target_mask']
-                        mask_ratios = wedlm_batch['mask_ratios']
+            with sync_ctx:
+                # Forward pass with mixed precision (BF16 + optional FP8 via TE)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                    with fp8_ctx:
+                        if args.use_wedlm and wedlm_masker is not None:
+                            # WeDLM training: dual-stream forward pass
+                            wedlm_batch = wedlm_masker(input_ids)
 
-                        # Forward pass with dual-stream inputs
-                        logits, _ = model(
-                            dual_input_ids,
-                            position_ids=dual_position_ids,
-                            attention_mask_2d=dual_attention_mask,
-                            return_all_logits=True,
-                        )
+                            dual_input_ids = wedlm_batch['dual_input_ids']
+                            dual_position_ids = wedlm_batch['dual_position_ids']
+                            dual_attention_mask = wedlm_batch['dual_attention_mask']
+                            target_ids = wedlm_batch['target_ids']
+                            target_mask = wedlm_batch['target_mask']
+                            mask_ratios = wedlm_batch['mask_ratios']
 
-                        # Extract prediction stream logits (second half)
-                        L = input_ids.size(1)
-                        pred_logits = logits[:, L:, :]  # [B, L, V]
+                            # Forward pass with dual-stream inputs
+                            logits, _ = model(
+                                dual_input_ids,
+                                position_ids=dual_position_ids,
+                                attention_mask_2d=dual_attention_mask,
+                                return_all_logits=True,
+                            )
 
-                        # Compute WeDLM loss
-                        loss, loss_dict = wedlm_loss_fn(
-                            pred_logits,
-                            target_ids,
-                            target_mask,
-                            mask_ratios,
-                            wedlm_config.block_size,
-                        )
-                    else:
-                        # Standard AR training
-                        logits, loss = model(
-                            input_ids,
-                            targets=labels,
-                        )
+                            # Extract prediction stream logits (second half)
+                            L = input_ids.size(1)
+                            pred_logits = logits[:, L:, :]  # [B, L, V]
 
-                    # Add MoE auxiliary loss if model has MoE layers
-                    if hasattr(raw_model, 'get_moe_aux_loss'):
-                        moe_aux_loss = raw_model.get_moe_aux_loss()
-                        loss = loss + moe_aux_loss
-                    loss = loss / args.gradient_accumulation_steps
+                            # Compute WeDLM loss
+                            loss, loss_dict = wedlm_loss_fn(
+                                pred_logits,
+                                target_ids,
+                                target_mask,
+                                mask_ratios,
+                                wedlm_config.block_size,
+                            )
+                        else:
+                            # Standard AR training
+                            logits, loss = model(
+                                input_ids,
+                                targets=labels,
+                            )
 
-            # Backward pass
-            scaler.scale(loss).backward()
+                        # Add MoE auxiliary loss if model has MoE layers
+                        if hasattr(raw_model, 'get_moe_aux_loss'):
+                            moe_aux_loss = raw_model.get_moe_aux_loss()
+                            loss = loss + moe_aux_loss
+                        loss = loss / args.gradient_accumulation_steps
+
+                # Backward pass (allreduce only on last micro-step when DDP)
+                scaler.scale(loss).backward()
             accum_loss += loss.detach()
 
         # Update MoE router biases after backward (must be after backward for checkpoint compatibility)
@@ -1429,22 +1445,15 @@ def train(args):
 
         # Cautious weight decay (nanochat: only decay where update * weight >= 0)
         # This prevents weight decay from fighting the gradient update
+        # Uses pre-computed parameter list to avoid per-step string matching
         if args.cautious_wd and args.weight_decay > 0:
             current_wd = get_wd_schedule(step, args.max_iters, args.weight_decay) if args.wd_schedule else args.weight_decay
             with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param.grad is None or not param.requires_grad:
+                for param in cautious_wd_params:
+                    if param.grad is None:
                         continue
-                    # Skip parameters that shouldn't have weight decay
-                    if any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe', 'lambdas', 'engram']):
-                        continue
-                    # Cautious WD: only decay where grad and weight have same sign
-                    # (i.e., where the update would push weight toward zero)
-                    # Ensure grad is on same device as param.data
-                    grad = param.grad.to(param.data.device)
-                    mask = (grad * param.data) >= 0
-                    # Apply selective weight decay manually
-                    param.data.mul_(1 - lr * current_wd * mask.float())
+                    mask = (param.grad * param.data) >= 0
+                    param.data.mul_(1 - lr * current_wd * mask.to(param.data.dtype))
 
         # Optimizer step
         if isinstance(optimizer, list):
@@ -1549,7 +1558,7 @@ def train(args):
 
             # Use EMA weights for validation if available
             ema_ctx = ema.apply(raw_model) if ema is not None else nullcontext()
-            with ema_ctx, torch.no_grad():
+            with ema_ctx, torch.inference_mode():
                 for _ in range(val_steps):
                     try:
                         batch = next(data_iter)
@@ -1705,8 +1714,13 @@ def train(args):
             # Use token count in checkpoint filename for clarity
             tokens_str = format_tokens(total_tokens_seen).replace('.', '_')
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{tokens_str}_step{step}.pt')
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path} ({format_tokens(total_tokens_seen)} tokens)")
+
+            # Async checkpoint save: wait for any previous save to finish, then save in background
+            if _save_thread is not None:
+                _save_thread.join()
+            _save_thread = threading.Thread(target=torch.save, args=(checkpoint, checkpoint_path), daemon=True)
+            _save_thread.start()
+            print(f"Saving checkpoint to {checkpoint_path} ({format_tokens(total_tokens_seen)} tokens)")
 
         # Profiler step
         if profiler is not None:
@@ -1754,6 +1768,10 @@ def train(args):
         except Exception:
             pass  # Already stopped
 
+    # Wait for any async checkpoint save to finish
+    if _save_thread is not None:
+        _save_thread.join()
+
     # Cleanup
     if tb_writer is not None:
         tb_writer.close()
@@ -1787,7 +1805,7 @@ def main():
                         help='Enable cuDNN SDPA (H100+ supports head_dim ≤ 256, no dimension adjustment needed)')
 
     # DeltaNet options (always enabled)
-    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
                         help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
     parser.add_argument('--use_triton_mla', action='store_true', default=True,
                         help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')

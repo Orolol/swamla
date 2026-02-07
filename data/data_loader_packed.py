@@ -366,8 +366,6 @@ class PackedFinewebDataset(IterableDataset):
         return {
             "input_ids": input_ids.contiguous(),  # [B, L]
             "attention_mask": attention_mask.contiguous(),  # [B, L]
-            "decoder_input_ids": input_ids.clone().contiguous(),
-            "decoder_attention_mask": attention_mask.clone().contiguous(),
             "labels": labels.contiguous(),
         }
 

@@ -28,6 +28,14 @@ try:
 except ImportError as e:
     raise ImportError("Triton not found. Please install Triton and try again.", e)
 
+# Fused SwiGLU kernel: chunk + silu + mul in one pass
+try:
+    from triton_kernels import fused_swiglu
+    FUSED_SWIGLU_AVAILABLE = True
+except ImportError:
+    FUSED_SWIGLU_AVAILABLE = False
+    fused_swiglu = None
+
 
 class SwiGLUExpert(nn.Module):
     """
@@ -61,10 +69,12 @@ class SwiGLUExpert(nn.Module):
         """
         # Combined projection
         combined = self.gate_up_proj(x)
-        # Split into gate and up
-        gate, up = combined.chunk(2, dim=-1)
-        # SwiGLU activation
-        hidden = F.silu(gate) * up
+        # SwiGLU activation (fused Triton kernel when available)
+        if FUSED_SWIGLU_AVAILABLE:
+            hidden = fused_swiglu(combined)
+        else:
+            gate, up = combined.chunk(2, dim=-1)
+            hidden = F.silu(gate) * up
         # Down projection
         return self.down_proj(hidden)
 
@@ -136,9 +146,12 @@ class BatchedExperts(nn.Module):
             gate_up_b = self.gate_up_bias[expert_indices]  # [num_tokens, 2*d_ff]
             combined = combined + gate_up_b
 
-        # SwiGLU: split and apply activation
-        gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, d_ff]
-        hidden = F.silu(gate) * up  # [num_tokens, d_ff]
+        # SwiGLU activation (fused Triton kernel when available)
+        if FUSED_SWIGLU_AVAILABLE:
+            hidden = fused_swiglu(combined)
+        else:
+            gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, d_ff]
+            hidden = F.silu(gate) * up  # [num_tokens, d_ff]
 
         # Down projection
         # hidden: [num_tokens, d_ff] -> [num_tokens, 1, d_ff]
@@ -516,9 +529,12 @@ class MoELayer(nn.Module):
             expert_ids = self._get_expert_ids_from_offsets(expert_offsets, total_tokens, device)
             combined = combined + self.experts.gate_up_bias[expert_ids].to(dtype)
 
-        # SwiGLU activation
-        gate, up = combined.chunk(2, dim=-1)
-        hidden = F.silu(gate) * up
+        # SwiGLU activation (fused Triton kernel when available)
+        if FUSED_SWIGLU_AVAILABLE:
+            hidden = fused_swiglu(combined)
+        else:
+            gate, up = combined.chunk(2, dim=-1)
+            hidden = F.silu(gate) * up
 
         # Down projection: hidden @ down_weight
         # hidden: [Total, d_ff]
@@ -818,9 +834,12 @@ class LatentMoELayer(nn.Module):
             expert_ids = self._get_expert_ids_from_offsets(expert_offsets, total_tokens, device)
             combined = combined + self.experts.gate_up_bias[expert_ids].to(dtype)
 
-        # SwiGLU activation
-        gate, up = combined.chunk(2, dim=-1)
-        hidden = F.silu(gate) * up
+        # SwiGLU activation (fused Triton kernel when available)
+        if FUSED_SWIGLU_AVAILABLE:
+            hidden = fused_swiglu(combined)
+        else:
+            gate, up = combined.chunk(2, dim=-1)
+            hidden = F.silu(gate) * up
 
         # Down projection: hidden @ down_weight
         # hidden: [Total, d_ff]
