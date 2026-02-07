@@ -947,27 +947,16 @@ def train(args):
         if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-        # Debug: check key matching before load
-        model_keys = set(model.state_dict().keys())
-        ckpt_keys = set(state_dict.keys())
-        missing_in_ckpt = model_keys - ckpt_keys
-        extra_in_ckpt = ckpt_keys - model_keys
-
-        if rank == 0:
-            if missing_in_ckpt:
-                print(f"Warning: {len(missing_in_ckpt)} keys missing in checkpoint: {list(missing_in_ckpt)[:5]}...")
-            if extra_in_ckpt:
-                print(f"Warning: {len(extra_in_ckpt)} extra keys in checkpoint: {list(extra_in_ckpt)[:5]}...")
-
-        # Load with strict=True to catch issues
+        # Load with strict=False — _load_from_state_dict handles backward compat
+        # (fusing old g_proj+beta_proj→g_beta_proj, q/k/v_conv→qkv_conv, etc.)
         load_result = model.load_state_dict(state_dict, strict=False)
         if rank == 0:
             if load_result.missing_keys:
-                print(f"Missing keys after load: {load_result.missing_keys[:5]}...")
+                print(f"⚠ {len(load_result.missing_keys)} keys missing after load: {load_result.missing_keys[:5]}...")
             if load_result.unexpected_keys:
-                print(f"Unexpected keys after load: {load_result.unexpected_keys[:5]}...")
+                print(f"⚠ {len(load_result.unexpected_keys)} unexpected keys after load: {load_result.unexpected_keys[:5]}...")
             if not load_result.missing_keys and not load_result.unexpected_keys:
-                print("Model weights loaded successfully (all keys matched)")
+                print("✓ Model weights loaded successfully (all keys matched)")
 
     # Setup WeDLM training if enabled
     wedlm_masker = None
