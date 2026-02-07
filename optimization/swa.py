@@ -51,6 +51,7 @@ class EMAModel:
 
         # Clone all parameters, stored with normalized names
         self.ema_params: Dict[str, torch.Tensor] = {}
+        self._param_order: set = set()  # Cached names for foreach updates
         for name, param in model.named_parameters():
             if param.requires_grad:
                 norm_name = self._normalize_name(name)
@@ -61,22 +62,45 @@ class EMAModel:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        """Update EMA parameters with current model parameters."""
-        matched = 0
+        """Update EMA parameters with current model parameters.
+
+        Uses torch._foreach_lerp_ for batched update (single kernel launch
+        per dtype instead of N individual lerp_ calls).
+        """
+        if not self._param_order:
+            # First call: build and cache the parameter order mapping
+            self._build_param_order(model)
+
+        if self._param_order:
+            # Batched path: one foreach_lerp_ call for all params
+            model_params = []
+            ema_params = []
+            for name, param in model.named_parameters():
+                norm_name = self._normalize_name(name)
+                if norm_name in self._param_order and param.requires_grad:
+                    model_params.append(param.data)
+                    ema_params.append(self.ema_params[norm_name])
+
+            if ema_params:
+                torch._foreach_lerp_(ema_params, model_params, 1 - self.decay)
+        else:
+            # Fallback: per-parameter loop (only on mismatch)
+            for name, param in model.named_parameters():
+                norm_name = self._normalize_name(name)
+                if norm_name in self.ema_params and param.requires_grad:
+                    self.ema_params[norm_name].lerp_(param.data, 1 - self.decay)
+
+    def _build_param_order(self, model: nn.Module) -> None:
+        """Cache parameter name set for fast foreach updates."""
+        self._param_order = set()
         for name, param in model.named_parameters():
             norm_name = self._normalize_name(name)
             if norm_name in self.ema_params and param.requires_grad:
-                # theta_ema = decay * theta_ema + (1 - decay) * theta
-                if param.device != self.ema_params[norm_name].device:
-                    param_data = param.data.to(self.ema_params[norm_name].device)
-                else:
-                    param_data = param.data
-                self.ema_params[norm_name].lerp_(param_data, 1 - self.decay)
-                matched += 1
-
-        if matched == 0 and len(self.ema_params) > 0:
-            model_sample = [n for n, _ in zip(model.named_parameters(), range(3))]
-            model_names = [n[0] for n in model_sample]
+                self._param_order.add(norm_name)
+        if not self._param_order:
+            model_names = [n for n, _ in zip(
+                (n for n, _ in model.named_parameters()), range(3)
+            )]
             ema_sample = list(self.ema_params.keys())[:3]
             logger.warning(
                 f"EMA update matched 0/{len(self.ema_params)} params! "

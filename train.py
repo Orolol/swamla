@@ -382,26 +382,18 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
                     nesterov=True,
                     ns_steps=5,
                 ))
+            # Merge all AdamW param groups into single optimizer (saves 3 step() calls)
+            adamw_groups = []
             if adamw_params:
-                optimizers.append(torch.optim.AdamW(adamw_params, lr=adamw_lr, betas=betas, weight_decay=weight_decay, fused=True))
-            # Engram embeddings: separate optimizer with high LR and no weight decay
+                adamw_groups.append({'params': adamw_params, 'lr': adamw_lr, 'weight_decay': weight_decay, 'betas': betas, 'name': 'adamw'})
             if engram_embed_params:
-                optimizers.append(torch.optim.AdamW(
-                    [{'params': engram_embed_params, 'weight_decay': 0.0}],
-                    lr=engram_embed_lr, betas=betas, fused=True
-                ))
-            # x0_lambdas: high LR (0.5), higher beta1 (0.96), no weight decay
+                adamw_groups.append({'params': engram_embed_params, 'lr': engram_embed_lr, 'weight_decay': 0.0, 'betas': betas, 'name': 'engram_embed'})
             if x0_lambda_params:
-                optimizers.append(torch.optim.AdamW(
-                    [{'params': x0_lambda_params, 'weight_decay': 0.0}],
-                    lr=x0_lr, betas=(x0_beta1, betas[1]), fused=True
-                ))
-            # resid_lambdas: low LR (~100x smaller), standard betas, no weight decay
+                adamw_groups.append({'params': x0_lambda_params, 'lr': x0_lr, 'weight_decay': 0.0, 'betas': (x0_beta1, betas[1]), 'name': 'x0_lambdas'})
             if resid_lambda_params:
-                optimizers.append(torch.optim.AdamW(
-                    [{'params': resid_lambda_params, 'weight_decay': 0.0}],
-                    lr=resid_lr, betas=betas, fused=True
-                ))
+                adamw_groups.append({'params': resid_lambda_params, 'lr': resid_lr, 'weight_decay': 0.0, 'betas': betas, 'name': 'resid_lambdas'})
+            if adamw_groups:
+                optimizers.append(torch.optim.AdamW(adamw_groups, lr=adamw_lr, betas=betas, fused=True))
 
             return optimizers
 
@@ -1430,7 +1422,7 @@ def train(args):
                     scaler.unscale_(opt)
             else:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip, foreach=True)
 
         # Update weight decay schedule (nanochat: linear decay from initial to 0)
         if args.wd_schedule:
@@ -1445,15 +1437,16 @@ def train(args):
 
         # Cautious weight decay (nanochat: only decay where update * weight >= 0)
         # This prevents weight decay from fighting the gradient update
-        # Uses pre-computed parameter list to avoid per-step string matching
+        # Per-param loop: each iteration allocates only 1 temp tensor (freed immediately)
+        # foreach version was 2x param memory overhead (products + masks allocated simultaneously)
         if args.cautious_wd and args.weight_decay > 0:
             current_wd = get_wd_schedule(step, args.max_iters, args.weight_decay) if args.wd_schedule else args.weight_decay
+            wd_factor = lr * current_wd
             with torch.no_grad():
-                for param in cautious_wd_params:
-                    if param.grad is None:
-                        continue
-                    mask = (param.grad * param.data) >= 0
-                    param.data.mul_(1 - lr * current_wd * mask.to(param.data.dtype))
+                for p in cautious_wd_params:
+                    if p.grad is not None:
+                        mask = (p.grad * p.data > 0).to(p.data.dtype)
+                        p.data.mul_(1.0 - wd_factor * mask)
 
         # Optimizer step
         if isinstance(optimizer, list):
