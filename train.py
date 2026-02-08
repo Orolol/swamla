@@ -232,24 +232,28 @@ def print_training_banner(args, model, world_size, device, resume_step=0, resume
 
 
 def check_blackwell_kernel_dispatch(verbose: bool = True) -> dict:
-    """Check if Blackwell GPU is using native sm_120 CUTLASS kernels or falling back to sm_80.
+    """Check if Blackwell GPU is using native CUTLASS kernels or falling back to sm_80.
 
-    PyTorch's cuBLAS uses CUTLASS internally for GEMM operations. As of PyTorch 2.9.x
-    (CUDA 12.8), the bundled CUTLASS library may not include sm_120 (Blackwell) optimized
-    kernels, causing fallback to sm_80 (Ampere) kernels. This results in ~35-40% of peak
-    BF16 tensor throughput instead of the expected ~80%+.
+    Blackwell has two SM targets:
+    - sm_100 (CC 10.0): Datacenter GPUs (B100, B200, GB200)
+    - sm_120 (CC 12.0): Consumer GPUs (RTX 5090, 5080, 5070)
+
+    PyTorch's cuBLAS may not include native CUTLASS GEMM kernels for either
+    target, falling back to sm_80 (Ampere) kernels at ~35-40% of peak throughput.
 
     Returns:
         dict with keys:
-        - 'is_blackwell': bool, whether the GPU is Blackwell (CC >= 12.0)
-        - 'has_sm120_arch': bool, whether PyTorch was compiled with sm_120 support
+        - 'is_blackwell': bool, whether the GPU is Blackwell (CC >= 10.0)
+        - 'sm_target': str, expected SM target ('sm_100', 'sm_120', or '')
+        - 'has_native_arch': bool, whether PyTorch was compiled with the expected SM
         - 'kernel_fallback': bool, whether sm_80 CUTLASS kernels are being dispatched
         - 'kernel_name': str, the kernel name observed during profiling
         - 'measured_tflops': float, measured BF16 matmul TFLOPS (0 if profiling failed)
     """
     result = {
         'is_blackwell': False,
-        'has_sm120_arch': False,
+        'sm_target': '',
+        'has_native_arch': False,
         'kernel_fallback': False,
         'kernel_name': '',
         'measured_tflops': 0.0,
@@ -259,13 +263,21 @@ def check_blackwell_kernel_dispatch(verbose: bool = True) -> dict:
         return result
 
     device_cap = torch.cuda.get_device_capability()
-    result['is_blackwell'] = device_cap[0] >= 12
+    cc_major = device_cap[0]
+
+    # Blackwell: CC 10.x (datacenter sm_100) or CC 12.x (consumer sm_120)
+    if cc_major >= 12:
+        result['is_blackwell'] = True
+        result['sm_target'] = 'sm_120'
+    elif cc_major >= 10:
+        result['is_blackwell'] = True
+        result['sm_target'] = 'sm_100'
+    else:
+        return result
 
     arch_list = torch.cuda.get_arch_list()
-    result['has_sm120_arch'] = any('120' in a for a in arch_list)
-
-    if not result['is_blackwell']:
-        return result
+    sm_num = result['sm_target'].replace('sm_', '')
+    result['has_native_arch'] = any(sm_num in a for a in arch_list)
 
     # Profile a representative matmul to check which CUTLASS kernel is dispatched
     try:
@@ -289,7 +301,8 @@ def check_blackwell_kernel_dispatch(verbose: bool = True) -> dict:
         for event in prof.key_averages():
             if event.device_time_total > 0 and ('cutlass' in event.key.lower() or 'gemm' in event.key.lower()):
                 result['kernel_name'] = event.key
-                # Check for sm80 fallback indicators
+                # Check for sm80 fallback: kernel name contains cutlass_80/75/sm80
+                # but NOT the native target (cutlass_100 or cutlass_120)
                 if 'cutlass_80' in event.key or 'cutlass_75' in event.key or 'sm80' in event.key:
                     result['kernel_fallback'] = True
 
@@ -299,45 +312,40 @@ def check_blackwell_kernel_dispatch(verbose: bool = True) -> dict:
                 result['measured_tflops'] = flops / elapsed_s / 1e12 if elapsed_s > 0 else 0.0
                 break
 
-        # Clean up profiling tensors
         del x, w
 
     except Exception:
-        # Profiling failed, still report architecture info
         pass
 
     if verbose and result['kernel_fallback']:
         device_name = torch.cuda.get_device_name(0)
+        sm = result['sm_target']
         print(f"\n{'=' * 70}")
         print(f"  WARNING: sm_80 CUTLASS kernel fallback on {device_name}")
         print(f"{'=' * 70}")
-        print(f"  GPU compute capability: {device_cap[0]}.{device_cap[1]} (Blackwell)")
-        print(f"  PyTorch sm_120 arch support: {'yes' if result['has_sm120_arch'] else 'no'}")
+        print(f"  GPU compute capability: {device_cap[0]}.{device_cap[1]} (Blackwell {sm})")
+        print(f"  PyTorch {sm} arch support: {'yes' if result['has_native_arch'] else 'no'}")
         print(f"  CUDA version (PyTorch): {torch.version.cuda}")
         print(f"  PyTorch version: {torch.__version__}")
         print(f"  Dispatched kernel: ...{result['kernel_name'][-80:]}")
         if result['measured_tflops'] > 0:
-            print(f"  Measured BF16 matmul: {result['measured_tflops']:.0f} TFLOPS (~35-40% of peak)")
+            print(f"  Measured BF16 matmul: {result['measured_tflops']:.0f} TFLOPS")
         print()
-        print("  DIAGNOSIS: PyTorch's bundled cuBLAS/CUTLASS does not include")
-        print("  Blackwell-native (sm_120) GEMM kernels. Matmul operations fall")
-        print("  back to Ampere (sm_80) kernels, which work correctly but do not")
-        print("  fully utilize Blackwell tensor cores.")
-        print()
-        print("  IMPACT: ~35-40% of peak BF16 TFLOPS for matmul-heavy operations")
-        print("  (linear layers, MLP, attention projections). Fused Triton kernels")
-        print("  (SwiGLU, DeltaNet via fla) are NOT affected as they JIT-compile")
-        print("  for the current GPU.")
+        print(f"  DIAGNOSIS: cuBLAS does not include {sm} CUTLASS GEMM kernels.")
+        print("  Matmul operations fall back to sm_80 (Ampere) kernels, which work")
+        print("  correctly but do not fully utilize Blackwell tensor cores.")
         print()
         print("  POSSIBLE FIXES:")
         print("  1. Upgrade PyTorch to a version with Blackwell CUTLASS kernels")
-        print("     (check: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128)")
-        print("  2. Build PyTorch from source with CUDA 13.0+ and latest CUTLASS")
+        print("     (pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128)")
+        print("  2. Build PyTorch from source with latest CUTLASS")
         print("  3. Use torch.compile fusions to reduce standalone matmul calls")
         print(f"{'=' * 70}\n")
 
     elif verbose and result['is_blackwell'] and not result['kernel_fallback']:
-        print(f"  Blackwell native CUTLASS kernels: OK")
+        kernel_info = f" ({result['kernel_name'][-60:]})" if result['kernel_name'] else ""
+        tflops_info = f" - {result['measured_tflops']:.0f} TFLOPS" if result['measured_tflops'] > 0 else ""
+        print(f"  Blackwell {result['sm_target']} CUTLASS kernels: OK{tflops_info}{kernel_info}")
 
     return result
 
