@@ -609,6 +609,22 @@ COMMON_ARGS="--size $MODEL_SIZE \
 # =============================================================================
 # Launch Training
 # =============================================================================
+
+# B200/Blackwell NVLink 5 optimizations (multi-GPU only)
+if [ $NUM_GPUS -gt 1 ]; then
+    # Check if any GPU is Blackwell (CC >= 10.0)
+    if nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | grep -q "^1[0-9]\."; then
+        export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
+        export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
+        export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-16}"
+        export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-32}"
+        echo "Blackwell detected: NCCL NVLink 5 optimizations enabled"
+        echo "  NCCL_P2P_LEVEL=$NCCL_P2P_LEVEL NCCL_NET_GDR_LEVEL=$NCCL_NET_GDR_LEVEL"
+        echo "  NCCL_MIN_NCHANNELS=$NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS=$NCCL_MAX_NCHANNELS"
+        echo ""
+    fi
+fi
+
 if [ $NUM_GPUS -gt 1 ]; then
     echo "Launching DDP training on $NUM_GPUS GPUs..."
     echo ""

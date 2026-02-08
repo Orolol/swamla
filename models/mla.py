@@ -155,10 +155,20 @@ class MLA(nn.Module):
         if self.use_cudnn_sdpa and self.qk_head_dim > 128:
             # cuDNN SDPA runtime limit is head_dim ≤ 128 on most GPUs
             self.use_cudnn_sdpa = False
-            
-        elif self.use_cudnn_sdpa:
+
+        # Blackwell (CC >= 10.0): disable cuDNN SDPA to avoid graph breaks.
+        # PyTorch 2.10 auto-selects the best SDPA backend (FlashAttention2 or
+        # math fallback) without requiring @torch.compiler.disable, so the
+        # native SDPA path is fully compilable with zero graph breaks.
+        if self.use_cudnn_sdpa and torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability()
+            if cc[0] >= 10:
+                self.use_cudnn_sdpa = False
+                print(f"MLA: Blackwell detected (CC {cc[0]}.{cc[1]}), using native SDPA (no graph break)")
+
+        if self.use_cudnn_sdpa:
             print(f"MLA: Using cuDNN SDPA backend (head_dim={self.qk_head_dim})")
-            
+
         if not self.use_cudnn_sdpa and not self.use_flash_attention and not self.use_triton_mla:
             print(f"MLA: Using PyTorch native SDPA backend (head_dim={self.qk_head_dim})")   
         
