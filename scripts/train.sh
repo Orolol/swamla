@@ -587,7 +587,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --log_interval 50 \
     --eval_tokens $EVAL_TOKENS \
     --save_tokens $SAVE_TOKENS \
-    --fp8_backend auto \
+    --fp8_backend none \
     --compile \
     --compile_mode default \
     $MUP_ARGS \
