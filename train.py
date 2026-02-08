@@ -1166,8 +1166,12 @@ def train(args):
     profiler_results = []  # Store results for final summary
 
     def profiler_trace_handler(prof):
-        """Custom handler that prints summary tables instead of TensorBoard."""
+        """Custom handler that saves trace + summary."""
         profiler_results.append(prof.key_averages())
+        # Export Chrome trace for timeline visualization (chrome://tracing)
+        trace_path = os.path.join(args.output_dir, "profiler_trace.json")
+        prof.export_chrome_trace(trace_path)
+        print(f"📁 Chrome trace saved to {trace_path}")
 
     if args.profile and master_process:
         profiler = torch.profiler.profile(
@@ -1736,11 +1740,27 @@ def train(args):
                     print("-" * 80)
                     print(key_avg.table(sort_by="cuda_memory_usage", row_limit=15))
 
-                    # Summary statistics (use cpu_time as cuda_time may not be available)
+                    # Table 4: Top CUDA kernels by self time
+                    print("\n📊 TOP 20 CUDA KERNELS BY SELF CUDA TIME:")
+                    print("-" * 80)
+                    print(key_avg.table(sort_by="self_cuda_time_total", row_limit=20))
+
+                    # Summary statistics
                     total_cpu_time = sum(e.self_cpu_time_total for e in key_avg)
+                    total_cuda_time = sum(e.self_cuda_time_total for e in key_avg)
+                    total_flops = sum(e.flops for e in key_avg if e.flops > 0)
+                    n_cuda_calls = sum(e.count for e in key_avg if e.self_cuda_time_total > 0)
+
                     print(f"\n{'='*80}")
                     print(f"📈 SUMMARY:")
-                    print(f"   Total CPU time: {total_cpu_time / 1e6:.2f} s")
+                    print(f"   Total CPU time:    {total_cpu_time / 1e6:.2f} s")
+                    print(f"   Total CUDA time:   {total_cuda_time / 1e6:.2f} s")
+                    print(f"   CPU/CUDA ratio:    {total_cpu_time / max(total_cuda_time, 1):.2f}x (>1 = CPU bottleneck)")
+                    print(f"   Total CUDA calls:  {n_cuda_calls}")
+                    if total_flops > 0:
+                        print(f"   Total FLOPS:       {total_flops / 1e12:.2f} TFLOPS")
+                        if total_cuda_time > 0:
+                            print(f"   FLOPS/s:           {total_flops / (total_cuda_time / 1e6) / 1e12:.2f} TFLOPS/s")
                     print(f"{'='*80}\n")
 
                 break  # Exit training loop after profiling
