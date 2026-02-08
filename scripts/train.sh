@@ -632,7 +632,7 @@ if [ $NUM_GPUS -gt 1 ]; then
 else
     echo "Launching single GPU training..."
     echo ""
-    python train.py $COMMON_ARGS
+    python3 train.py $COMMON_ARGS
 fi
 
 exit 0
