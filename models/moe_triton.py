@@ -95,8 +95,8 @@ def _moe_gemm_kernel_v2(
     # Pointers
     a_ptr, b_ptr, c_ptr,
     expert_offsets_ptr,
-    layout_expert_idx_ptr,  # [total_m_blocks] expert index per block
-    layout_m_block_ptr,     # [total_m_blocks] local M block index per expert
+    layout_expert_idx_ptr,  # [max_m_blocks] expert index per block (sentinel=-1 for padding)
+    layout_m_block_ptr,     # [max_m_blocks] local M block index per expert
     # Dimensions
     K, N,
     # Strides
@@ -108,13 +108,18 @@ def _moe_gemm_kernel_v2(
     GROUP_SIZE_M: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
-    # Grid: (total_m_blocks, N_blocks)
-    # Each program handles one (expert, m_block) pair for one N tile.
+    # Grid: (max_m_blocks, N_blocks) — uses upper bound to avoid GPU sync.
+    # Padding blocks have expert_idx=-1 (sentinel) and are skipped.
     flat_m_id = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     # Look up which expert and local M-block this program handles
     expert_idx = tl.load(layout_expert_idx_ptr + flat_m_id)
+
+    # Skip padding blocks (sentinel value from unfilled layout slots)
+    if expert_idx < 0:
+        return
+
     pid_m = tl.load(layout_m_block_ptr + flat_m_id)
 
     # Get this expert's row range in A/C
@@ -170,13 +175,13 @@ def _build_layout_tables(expert_offsets, num_experts, block_size_m, total_tokens
     """
     Build layout tables that map flat M-block IDs to (expert_idx, local_m_block).
 
-    Uses a fixed-size upper-bound allocation to avoid GPU-CPU sync (.item()) and
-    slow repeat_interleave. Instead, uses a Triton kernel for O(E) work.
+    Uses a fixed-size upper-bound allocation with sentinel values (-1) to avoid
+    any GPU-CPU sync (.item()). The kernel checks for sentinel and skips padding.
 
     Returns:
-        layout_expert_idx: [total_m_blocks] int32 tensor
-        layout_m_block: [total_m_blocks] int32 tensor
-        total_m_blocks: int (for grid launch)
+        layout_expert_idx: [max_m_blocks] int32 tensor (-1 for padding blocks)
+        layout_m_block: [max_m_blocks] int32 tensor
+        max_m_blocks: int (Python int, no GPU sync needed)
     """
     # Compute tokens per expert from offsets: offsets[i+1] - offsets[i]
     tokens_per_expert = expert_offsets[1:] - expert_offsets[:-1]  # [E]
@@ -188,24 +193,24 @@ def _build_layout_tables(expert_offsets, num_experts, block_size_m, total_tokens
     block_cumsum = torch.zeros(num_experts + 1, device=device, dtype=torch.int32)
     block_cumsum[1:] = torch.cumsum(m_blocks_per_expert.int(), dim=0)
 
-    # Upper bound on total blocks (avoids .item() GPU sync)
+    # Upper bound on total blocks — Python int, zero GPU sync
     max_m_blocks = (total_tokens + block_size_m - 1) // block_size_m
 
-    # Allocate with upper bound, then slice to actual size
-    layout_expert_idx = torch.empty(max_m_blocks, device=device, dtype=torch.int32)
-    layout_m_block = torch.empty(max_m_blocks, device=device, dtype=torch.int32)
+    if max_m_blocks == 0:
+        empty = torch.empty(0, device=device, dtype=torch.int32)
+        return empty, empty, 0
 
-    # Fill layout tables with a simple Triton kernel: one program per expert
+    # Initialize with sentinel (-1) so padding blocks are skipped by kernel
+    layout_expert_idx = torch.full((max_m_blocks,), -1, device=device, dtype=torch.int32)
+    layout_m_block = torch.zeros(max_m_blocks, device=device, dtype=torch.int32)
+
+    # Fill valid positions with a simple Triton kernel: one program per expert
     _fill_layout_kernel[(num_experts,)](
         block_cumsum, layout_expert_idx, layout_m_block,
         num_experts,
     )
 
-    # Get actual total (last element of cumsum) -- still need .item() for grid launch
-    # but now it's a single scalar read, not repeat_interleave
-    total_m_blocks = block_cumsum[num_experts].item()
-
-    return layout_expert_idx[:total_m_blocks], layout_m_block[:total_m_blocks], total_m_blocks
+    return layout_expert_idx, layout_m_block, max_m_blocks
 
 
 @triton.jit
@@ -379,12 +384,12 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
     else:
         block_m = 32
 
-    # Build layout tables
-    layout_expert_idx, layout_m_block, total_m_blocks = _build_layout_tables(
+    # Build layout tables (no GPU sync — uses sentinel for padding blocks)
+    layout_expert_idx, layout_m_block, max_m_blocks = _build_layout_tables(
         expert_offsets, num_experts, block_m, a.shape[0], a.device
     )
 
-    if total_m_blocks == 0:
+    if max_m_blocks == 0:
         return
 
     # Select block sizes for N and K dimensions based on problem shape
@@ -411,7 +416,7 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
     num_stages = min(4, max(1, max_smem // smem_per_stage))
 
     n_blocks = triton.cdiv(N, block_n)
-    grid = (total_m_blocks, n_blocks)
+    grid = (max_m_blocks, n_blocks)
 
     _moe_gemm_kernel_v2[grid](
         a, b, c,

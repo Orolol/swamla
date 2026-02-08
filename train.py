@@ -1888,17 +1888,18 @@ def train(args):
                     print("-" * 80)
                     print(key_avg.table(sort_by="self_cuda_time_total", row_limit=20))
 
-                    # Summary statistics
+                    # Summary statistics — attribute name varies across PyTorch versions
+                    def _cuda_time(e):
+                        for attr in ('self_cuda_time_total', 'cuda_time_total', 'device_time_total'):
+                            v = getattr(e, attr, None)
+                            if v is not None and v > 0:
+                                return v
+                        return 0
+
                     total_cpu_time = sum(e.self_cpu_time_total for e in key_avg)
-                    total_cuda_time = sum(
-                        getattr(e, 'self_cuda_time_total', 0) or getattr(e, 'cuda_time_total', 0) or 0
-                        for e in key_avg
-                    )
+                    total_cuda_time = sum(_cuda_time(e) for e in key_avg)
                     total_flops = sum(e.flops for e in key_avg if e.flops > 0)
-                    n_cuda_calls = sum(
-                        e.count for e in key_avg
-                        if (getattr(e, 'self_cuda_time_total', 0) or getattr(e, 'cuda_time_total', 0) or 0) > 0
-                    )
+                    n_cuda_calls = sum(e.count for e in key_avg if _cuda_time(e) > 0)
 
                     print(f"\n{'='*80}")
                     print(f"📈 SUMMARY:")
