@@ -385,6 +385,13 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
     block_n = max(16, block_n)
     block_k = max(16, block_k)
 
+    # Dynamically compute num_stages to fit hardware shared memory limit.
+    # Shared memory per stage ≈ (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N) * 2 bytes (bf16).
+    # B200 (sm_100) limit: 232,448 bytes. Leave margin for alignment overhead.
+    smem_per_stage = (block_m * block_k + block_k * block_n) * 2
+    max_smem = 228 * 1024  # 228 KB conservative (hw limit ~232 KB)
+    num_stages = min(4, max(1, max_smem // smem_per_stage))
+
     n_blocks = triton.cdiv(N, block_n)
     grid = (total_m_blocks, n_blocks)
 
@@ -402,7 +409,7 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
         GROUP_SIZE_M=8,
         ACTIVATION=activation,
         num_warps=8 if (block_m >= 64 and block_n >= 64) else 4,
-        num_stages=4,
+        num_stages=num_stages,
     )
 
 
