@@ -41,6 +41,7 @@ OPTIONS:
   --output DIR        Output directory (default: outputs/train)
   --resume PATH       Resume from checkpoint (true=HF, false=none, or local path)
   --optimizer TYPE    Optimizer (adamw, muon, lion) [default: muon]
+  --attn-backend NAME Attention backend (auto, sdpa, sdpa-native, triton, flash)
   --hf-repo ID        HuggingFace repo for auto-push
   --no-tensorboard    Disable TensorBoard
   --profile           Enable profiling
@@ -134,6 +135,7 @@ BLOCK_SIZE=""
 OUTPUT_DIR=""
 RESUME_FROM="false"
 OPTIMIZER="muon"
+ATTN_BACKEND="${ATTN_BACKEND:-auto}"
 HF_REPO_ID=""
 USE_TENSORBOARD="true"
 TENSORBOARD_PORT="6006"
@@ -164,6 +166,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --optimizer)
             OPTIMIZER="$2"
+            shift 2
+            ;;
+        --attn-backend)
+            ATTN_BACKEND="$2"
             shift 2
             ;;
         --hf-repo)
@@ -377,8 +383,14 @@ SAVE_TOKENS="${SAVE_TOKENS:-500M}"
 # =============================================================================
 if command -v nvidia-smi &> /dev/null; then
     NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    if nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | grep -q "^1[0-9]\."; then
+        HAS_BLACKWELL="true"
+    else
+        HAS_BLACKWELL="false"
+    fi
 else
     NUM_GPUS=0
+    HAS_BLACKWELL="false"
 fi
 
 # =============================================================================
@@ -397,6 +409,7 @@ echo "  Batch size: $BATCH_SIZE"
 echo "  Block size: $BLOCK_SIZE"
 echo "  Output dir: $OUTPUT_DIR"
 echo "  Optimizer: $OPTIMIZER"
+echo "  Attention backend (requested): $ATTN_BACKEND"
 echo "  Detected GPUs: $NUM_GPUS"
 echo ""
 
@@ -440,6 +453,44 @@ if [ "$USE_TENSORBOARD" = "true" ]; then
     fi
     echo ""
 fi
+
+# =============================================================================
+# Attention Backend Selection
+# =============================================================================
+ATTN_ARGS=""
+RESOLVED_ATTN_BACKEND="$ATTN_BACKEND"
+case "$ATTN_BACKEND" in
+    auto)
+        if [ "$HAS_BLACKWELL" = "true" ]; then
+            # Blackwell default: pure SDPA path (no FA, no custom Triton MLA).
+            RESOLVED_ATTN_BACKEND="sdpa-native"
+            ATTN_ARGS="--no-use_flash_attention --no-use_triton_mla --no-use_cudnn_sdpa"
+        else
+            # Hopper/Ampere default: Triton MLA for mature stability/perf.
+            RESOLVED_ATTN_BACKEND="triton"
+            ATTN_ARGS="--no-use_flash_attention --use_triton_mla --no-use_cudnn_sdpa"
+        fi
+        ;;
+    sdpa)
+        ATTN_ARGS="--no-use_flash_attention --no-use_triton_mla --use_cudnn_sdpa"
+        ;;
+    sdpa-native)
+        ATTN_ARGS="--no-use_flash_attention --no-use_triton_mla --no-use_cudnn_sdpa"
+        ;;
+    triton)
+        ATTN_ARGS="--no-use_flash_attention --use_triton_mla --no-use_cudnn_sdpa"
+        ;;
+    flash)
+        ATTN_ARGS="--use_flash_attention --no-use_triton_mla --no-use_cudnn_sdpa"
+        ;;
+    *)
+        echo "Unknown attention backend: $ATTN_BACKEND"
+        echo "Available: auto, sdpa, sdpa-native, triton, flash"
+        exit 1
+        ;;
+esac
+echo "  Attention backend (resolved): $RESOLVED_ATTN_BACKEND"
+echo ""
 
 # =============================================================================
 # Build Command Arguments
@@ -583,6 +634,7 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
+    $ATTN_ARGS \
     --tokenizer_name openai-community/gpt2 \
     --log_interval 50 \
     --eval_tokens $EVAL_TOKENS \

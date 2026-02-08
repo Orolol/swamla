@@ -880,6 +880,7 @@ def train(args):
         use_flash_attention=args.use_flash_attention,
         use_triton_mla=args.use_triton_mla,
         use_triton_kernels=args.use_triton_kernels,
+        use_cudnn_sdpa=args.use_cudnn_sdpa,
         use_gated_deltanet=args.use_gated_deltanet,
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
@@ -1785,12 +1786,14 @@ def main():
     parser.add_argument('--mla_v_head_dim', type=int, default=128)
     parser.add_argument('--cudnn_compatible_heads', action='store_true', default=False,
                         help='Enable cuDNN SDPA (H100+ supports head_dim ≤ 256, no dimension adjustment needed)')
+    parser.add_argument('--use_cudnn_sdpa', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use cuDNN SDPA backend when available for MLA SDPA path')
 
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
                         help='Use Flash Attention for MLA blocks (--no-use_flash_attention to disable)')
-    parser.add_argument('--use_triton_mla', action='store_true', default=True,
-                        help='Use custom Triton MLA kernel (H100 compatible, avoids FA2 CUDA graph issues)')
+    parser.add_argument('--use_triton_mla', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use custom Triton MLA kernel (--no-use_triton_mla to force SDPA/FA path)')
     parser.add_argument('--use_triton_kernels', action='store_true', default=True,
                         help='Use fused Triton kernels for SwiGLU and RMSNorm (15-25%% speedup)')
     parser.add_argument('--use_gated_deltanet', action='store_true', default=True,
