@@ -87,6 +87,8 @@ class SWAMLAConfig:
 
     # cuDNN SDPA backend: uses native Hopper/Blackwell kernels instead of sm80 CUTLASS
     use_cudnn_sdpa: bool = True
+    # Override safety fallback and force cuDNN SDPA on Hopper/Blackwell
+    force_cudnn_sdpa: bool = False
 
     # Custom Triton MLA kernel (H100 compatible alternative to FA2)
     # Use this when FA2 causes CUDA graph issues with torch.compile on H100
@@ -708,7 +710,9 @@ def _create_mla_block_config(config: SWAMLAConfig):
         # Triton kernel control
         use_triton_kernels: bool = config.use_triton_kernels
         # SDPA backend control
+        cudnn_compatible_heads: bool = config.cudnn_compatible_heads
         use_cudnn_sdpa: bool = config.use_cudnn_sdpa
+        force_cudnn_sdpa: bool = config.force_cudnn_sdpa
 
     return _Config()
 

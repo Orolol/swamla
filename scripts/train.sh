@@ -41,7 +41,9 @@ OPTIONS:
   --output DIR        Output directory (default: outputs/train)
   --resume PATH       Resume from checkpoint (true=HF, false=none, or local path)
   --optimizer TYPE    Optimizer (adamw, muon, lion) [default: muon]
-  --attn-backend NAME Attention backend (auto, sdpa, sdpa-native, triton, flash)
+  --attn-backend NAME Attention backend (auto, sdpa, sdpa-native, sdpa-cudnn-force, triton, flash)
+  --fp8-backend NAME  FP8 backend (auto, native, te, none) [default: auto]
+  --compile-mode MODE torch.compile mode (default, max-autotune, reduce-overhead)
   --hf-repo ID        HuggingFace repo for auto-push
   --no-tensorboard    Disable TensorBoard
   --profile           Enable profiling
@@ -136,6 +138,8 @@ OUTPUT_DIR=""
 RESUME_FROM="false"
 OPTIMIZER="muon"
 ATTN_BACKEND="${ATTN_BACKEND:-auto}"
+FP8_BACKEND="${FP8_BACKEND:-auto}"
+COMPILE_MODE="${COMPILE_MODE:-default}"
 HF_REPO_ID=""
 USE_TENSORBOARD="true"
 TENSORBOARD_PORT="6006"
@@ -170,6 +174,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --attn-backend)
             ATTN_BACKEND="$2"
+            shift 2
+            ;;
+        --fp8-backend)
+            FP8_BACKEND="$2"
+            shift 2
+            ;;
+        --compile-mode)
+            COMPILE_MODE="$2"
             shift 2
             ;;
         --hf-repo)
@@ -410,6 +422,8 @@ echo "  Block size: $BLOCK_SIZE"
 echo "  Output dir: $OUTPUT_DIR"
 echo "  Optimizer: $OPTIMIZER"
 echo "  Attention backend (requested): $ATTN_BACKEND"
+echo "  FP8 backend: $FP8_BACKEND"
+echo "  Compile mode: $COMPILE_MODE"
 echo "  Detected GPUs: $NUM_GPUS"
 echo ""
 
@@ -477,6 +491,10 @@ case "$ATTN_BACKEND" in
     sdpa-native)
         ATTN_ARGS="--no-use_flash_attention --no-use_triton_mla --no-use_cudnn_sdpa"
         ;;
+    sdpa-cudnn-force)
+        # Experimental path: force cuDNN SDPA on Hopper/Blackwell.
+        ATTN_ARGS="--no-use_flash_attention --no-use_triton_mla --use_cudnn_sdpa --force_cudnn_sdpa"
+        ;;
     triton)
         ATTN_ARGS="--no-use_flash_attention --use_triton_mla --no-use_cudnn_sdpa"
         ;;
@@ -485,12 +503,32 @@ case "$ATTN_BACKEND" in
         ;;
     *)
         echo "Unknown attention backend: $ATTN_BACKEND"
-        echo "Available: auto, sdpa, sdpa-native, triton, flash"
+        echo "Available: auto, sdpa, sdpa-native, sdpa-cudnn-force, triton, flash"
         exit 1
         ;;
 esac
 echo "  Attention backend (resolved): $RESOLVED_ATTN_BACKEND"
 echo ""
+
+case "$FP8_BACKEND" in
+    auto|native|te|none)
+        ;;
+    *)
+        echo "Unknown FP8 backend: $FP8_BACKEND"
+        echo "Available: auto, native, te, none"
+        exit 1
+        ;;
+esac
+
+case "$COMPILE_MODE" in
+    default|max-autotune|reduce-overhead)
+        ;;
+    *)
+        echo "Unknown compile mode: $COMPILE_MODE"
+        echo "Available: default, max-autotune, reduce-overhead"
+        exit 1
+        ;;
+esac
 
 # =============================================================================
 # Build Command Arguments
@@ -639,9 +677,9 @@ COMMON_ARGS="--size $MODEL_SIZE \
     --log_interval 50 \
     --eval_tokens $EVAL_TOKENS \
     --save_tokens $SAVE_TOKENS \
-    --fp8_backend auto \
+    --fp8_backend $FP8_BACKEND \
     --compile \
-    --compile_mode default \
+    --compile_mode $COMPILE_MODE \
     $MUP_ARGS \
     $PROGRESSIVE_ARGS \
     $EMA_ARGS \

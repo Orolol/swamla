@@ -881,6 +881,7 @@ def train(args):
         use_triton_mla=args.use_triton_mla,
         use_triton_kernels=args.use_triton_kernels,
         use_cudnn_sdpa=args.use_cudnn_sdpa,
+        force_cudnn_sdpa=args.force_cudnn_sdpa,
         use_gated_deltanet=args.use_gated_deltanet,
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
@@ -1788,6 +1789,8 @@ def main():
                         help='Enable cuDNN SDPA (H100+ supports head_dim ≤ 256, no dimension adjustment needed)')
     parser.add_argument('--use_cudnn_sdpa', action=argparse.BooleanOptionalAction, default=True,
                         help='Use cuDNN SDPA backend when available for MLA SDPA path')
+    parser.add_argument('--force_cudnn_sdpa', action='store_true', default=False,
+                        help='Force cuDNN SDPA on Hopper/Blackwell even when default safety checks would disable it')
 
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
