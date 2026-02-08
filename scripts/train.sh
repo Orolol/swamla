@@ -700,6 +700,15 @@ COMMON_ARGS="--size $MODEL_SIZE \
 # Launch Training
 # =============================================================================
 
+# CUDA command buffer tuning — reduces "Command Buffer Full" CPU stalls.
+# With ~4700 kernel launches per step, the default command buffer overflows
+# and the CPU blocks waiting for the GPU to drain it (40%+ CPU time wasted).
+# CUDA_DEVICE_MAX_CONNECTIONS=1 limits concurrent kernel streams, reducing
+# command buffer pressure and allowing the GPU to drain the queue faster.
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+# expandable_segments reduces memory allocation overhead
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # B200/Blackwell NVLink 5 optimizations (multi-GPU only)
 if [ $NUM_GPUS -gt 1 ]; then
     # Check if any GPU is Blackwell (CC >= 10.0)

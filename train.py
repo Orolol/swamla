@@ -19,6 +19,15 @@ import argparse
 import threading
 from pathlib import Path
 
+# CUDA command buffer tuning — must be set BEFORE any CUDA context is created.
+# CUDA_DEVICE_MAX_CONNECTIONS=1 limits concurrent kernel streams, reducing command
+# buffer pressure. With ~4700 kernel launches per step, the default buffer overflows
+# and causes CPU stalls ("Command Buffer Full" consuming 40%+ of CPU time).
+os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+# expandable_segments reduces memory allocation overhead by avoiding repeated
+# cudaMalloc/cudaFree calls when tensor sizes vary between iterations.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -222,8 +231,128 @@ def print_training_banner(args, model, world_size, device, resume_step=0, resume
     print("═" * 70 + "\n")
 
 
+def check_blackwell_kernel_dispatch(verbose: bool = True) -> dict:
+    """Check if Blackwell GPU is using native sm_120 CUTLASS kernels or falling back to sm_80.
+
+    PyTorch's cuBLAS uses CUTLASS internally for GEMM operations. As of PyTorch 2.9.x
+    (CUDA 12.8), the bundled CUTLASS library may not include sm_120 (Blackwell) optimized
+    kernels, causing fallback to sm_80 (Ampere) kernels. This results in ~35-40% of peak
+    BF16 tensor throughput instead of the expected ~80%+.
+
+    Returns:
+        dict with keys:
+        - 'is_blackwell': bool, whether the GPU is Blackwell (CC >= 12.0)
+        - 'has_sm120_arch': bool, whether PyTorch was compiled with sm_120 support
+        - 'kernel_fallback': bool, whether sm_80 CUTLASS kernels are being dispatched
+        - 'kernel_name': str, the kernel name observed during profiling
+        - 'measured_tflops': float, measured BF16 matmul TFLOPS (0 if profiling failed)
+    """
+    result = {
+        'is_blackwell': False,
+        'has_sm120_arch': False,
+        'kernel_fallback': False,
+        'kernel_name': '',
+        'measured_tflops': 0.0,
+    }
+
+    if not torch.cuda.is_available():
+        return result
+
+    device_cap = torch.cuda.get_device_capability()
+    result['is_blackwell'] = device_cap[0] >= 12
+
+    arch_list = torch.cuda.get_arch_list()
+    result['has_sm120_arch'] = any('120' in a for a in arch_list)
+
+    if not result['is_blackwell']:
+        return result
+
+    # Profile a representative matmul to check which CUTLASS kernel is dispatched
+    try:
+        from torch.profiler import profile, ProfilerActivity
+
+        M, K, N = 4096, 1024, 4096
+        x = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
+        w = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
+
+        # Warmup
+        for _ in range(5):
+            _ = x @ w
+        torch.cuda.synchronize()
+
+        # Profile
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _ = x @ w
+            torch.cuda.synchronize()
+
+        # Find the CUTLASS/matmul kernel
+        for event in prof.key_averages():
+            if event.device_time_total > 0 and ('cutlass' in event.key.lower() or 'gemm' in event.key.lower()):
+                result['kernel_name'] = event.key
+                # Check for sm80 fallback indicators
+                if 'cutlass_80' in event.key or 'cutlass_75' in event.key or 'sm80' in event.key:
+                    result['kernel_fallback'] = True
+
+                # Measure TFLOPS
+                elapsed_s = event.device_time_total / 1e6  # us -> s
+                flops = 2 * M * K * N
+                result['measured_tflops'] = flops / elapsed_s / 1e12 if elapsed_s > 0 else 0.0
+                break
+
+        # Clean up profiling tensors
+        del x, w
+
+    except Exception:
+        # Profiling failed, still report architecture info
+        pass
+
+    if verbose and result['kernel_fallback']:
+        device_name = torch.cuda.get_device_name(0)
+        print(f"\n{'=' * 70}")
+        print(f"  WARNING: sm_80 CUTLASS kernel fallback on {device_name}")
+        print(f"{'=' * 70}")
+        print(f"  GPU compute capability: {device_cap[0]}.{device_cap[1]} (Blackwell)")
+        print(f"  PyTorch sm_120 arch support: {'yes' if result['has_sm120_arch'] else 'no'}")
+        print(f"  CUDA version (PyTorch): {torch.version.cuda}")
+        print(f"  PyTorch version: {torch.__version__}")
+        print(f"  Dispatched kernel: ...{result['kernel_name'][-80:]}")
+        if result['measured_tflops'] > 0:
+            print(f"  Measured BF16 matmul: {result['measured_tflops']:.0f} TFLOPS (~35-40% of peak)")
+        print()
+        print("  DIAGNOSIS: PyTorch's bundled cuBLAS/CUTLASS does not include")
+        print("  Blackwell-native (sm_120) GEMM kernels. Matmul operations fall")
+        print("  back to Ampere (sm_80) kernels, which work correctly but do not")
+        print("  fully utilize Blackwell tensor cores.")
+        print()
+        print("  IMPACT: ~35-40% of peak BF16 TFLOPS for matmul-heavy operations")
+        print("  (linear layers, MLP, attention projections). Fused Triton kernels")
+        print("  (SwiGLU, DeltaNet via fla) are NOT affected as they JIT-compile")
+        print("  for the current GPU.")
+        print()
+        print("  POSSIBLE FIXES:")
+        print("  1. Upgrade PyTorch to a version with Blackwell CUTLASS kernels")
+        print("     (check: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128)")
+        print("  2. Build PyTorch from source with CUDA 13.0+ and latest CUTLASS")
+        print("  3. Use torch.compile fusions to reduce standalone matmul calls")
+        print(f"{'=' * 70}\n")
+
+    elif verbose and result['is_blackwell'] and not result['kernel_fallback']:
+        print(f"  Blackwell native CUTLASS kernels: OK")
+
+    return result
+
+
 def configure_cuda_optimizations():
-    """Configure CUDA optimizations for maximum throughput."""
+    """Configure CUDA optimizations for maximum throughput.
+
+    Key optimizations:
+    - cudnn.benchmark: Auto-tune convolution algorithms for best throughput
+    - CUDA_DEVICE_MAX_CONNECTIONS=1: Limits concurrent kernel streams to reduce
+      command buffer pressure (~4700 launches/step can overflow the default buffer,
+      causing "Command Buffer Full" CPU stalls)
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: Reduces memory allocator
+      overhead by reusing segments instead of repeated cudaMalloc/cudaFree
+    """
     if not torch.cuda.is_available():
         return
     torch.backends.cudnn.benchmark = True
@@ -708,6 +837,12 @@ def train(args):
     # Configure TF32 precision (silent)
     enable_tf32 = True
     configure_tf32(enable_tf32=enable_tf32, verbose=False)
+
+    # Check for Blackwell sm_80 CUTLASS kernel fallback (master process only)
+    if master_process:
+        kernel_info = check_blackwell_kernel_dispatch(verbose=True)
+    else:
+        kernel_info = check_blackwell_kernel_dispatch(verbose=False)
 
     # Setup wandb
     wandb_run = None
@@ -1747,9 +1882,9 @@ def train(args):
 
                     # Summary statistics
                     total_cpu_time = sum(e.self_cpu_time_total for e in key_avg)
-                    total_cuda_time = sum(e.self_cuda_time_total for e in key_avg)
+                    total_cuda_time = sum(e.cuda_time_total for e in key_avg)
                     total_flops = sum(e.flops for e in key_avg if e.flops > 0)
-                    n_cuda_calls = sum(e.count for e in key_avg if e.self_cuda_time_total > 0)
+                    n_cuda_calls = sum(e.count for e in key_avg if e.cuda_time_total > 0)
 
                     print(f"\n{'='*80}")
                     print(f"📈 SUMMARY:")

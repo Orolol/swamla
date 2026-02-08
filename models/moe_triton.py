@@ -56,7 +56,7 @@ def fused_moe_routing(
     N = flat_indices.shape[0]
     device = flat_indices.device
 
-    # Step 1: Compute histogram — use scatter_add_ instead of bincount to avoid
+    # Step 1: Compute histogram -- use scatter_add_ instead of bincount to avoid
     # graph breaks (bincount has data-dependent output shape that dynamo can't trace)
     tokens_per_expert = torch.zeros(n_experts, dtype=torch.int64, device=device)
     tokens_per_expert.scatter_add_(0, flat_indices.long(), torch.ones(N, dtype=torch.int64, device=device))
@@ -79,7 +79,138 @@ def fused_moe_routing(
 
 
 # ============================================================================
-# Original MoE GEMM Kernel
+# MoE GEMM Kernel -- Optimized for high expert counts (256+)
+# ============================================================================
+# Key optimization: Use a 2D grid (flat_block_id, N_blocks) instead of 3D
+# (experts, M_blocks, N_blocks). A precomputed layout table maps each
+# flat_block_id to (expert_idx, local_m_block) so we launch exactly the
+# number of M-blocks needed per expert -- no wasted early-exit blocks.
+#
+# With 256 experts and ~3072 tokens/expert (BLOCK_M=64 => 48 M-blocks each),
+# this launches 256*48 = 12,288 M-blocks vs the old 256*cdiv(786432,128) =
+# 1,572,864 M-blocks -- a 128x reduction in grid dimension 1.
+
+@triton.jit
+def _moe_gemm_kernel_v2(
+    # Pointers
+    a_ptr, b_ptr, c_ptr,
+    expert_offsets_ptr,
+    layout_expert_idx_ptr,  # [total_m_blocks] expert index per block
+    layout_m_block_ptr,     # [total_m_blocks] local M block index per expert
+    # Dimensions
+    K, N,
+    # Strides
+    stride_am, stride_ak,
+    stride_be, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+):
+    # Grid: (total_m_blocks, N_blocks)
+    # Each program handles one (expert, m_block) pair for one N tile.
+    flat_m_id = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Look up which expert and local M-block this program handles
+    expert_idx = tl.load(layout_expert_idx_ptr + flat_m_id)
+    pid_m = tl.load(layout_m_block_ptr + flat_m_id)
+
+    # Get this expert's row range in A/C
+    off_start = tl.load(expert_offsets_ptr + expert_idx)
+    off_end = tl.load(expert_offsets_ptr + expert_idx + 1)
+    m_size = off_end - off_start
+
+    # Offsets for this block
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Base pointers
+    a_base = a_ptr + (off_start * stride_am)
+    b_base = b_ptr + (expert_idx * stride_be)
+    c_base = c_ptr + (off_start * stride_cm)
+
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Masks that are loop-invariant
+    a_mask = offs_am < m_size
+    n_mask = offs_bn < N
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k * BLOCK_SIZE_K
+        k_mask = (k_start + offs_k) < K
+
+        # Load A tile [BLOCK_M, BLOCK_K]
+        a_ptrs = a_base + (offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak)
+        a = tl.load(a_ptrs, mask=a_mask[:, None] & k_mask[None, :], other=0.0)
+
+        # Load B tile [BLOCK_K, BLOCK_N]
+        b_ptrs = b_base + ((k_start + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        # Accumulate
+        accumulator += tl.dot(a, b)
+
+    # Activation
+    if ACTIVATION == "silu":
+        accumulator = accumulator * tl.sigmoid(accumulator)
+    elif ACTIVATION == "relu":
+        accumulator = tl.maximum(accumulator, 0.0)
+
+    # Store C
+    c_ptrs = c_base + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
+    c_mask = (offs_am[:, None] < m_size) & (offs_bn[None, :] < N)
+    tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
+
+
+def _build_layout_tables(expert_offsets, num_experts, block_size_m, device):
+    """
+    Build layout tables that map flat M-block IDs to (expert_idx, local_m_block).
+
+    Given expert_offsets [E+1], computes the number of M-blocks each expert needs,
+    then creates a flat mapping so we can use a 2D grid (total_m_blocks, N_blocks)
+    instead of a 3D grid (experts, max_m_blocks, N_blocks).
+
+    Returns:
+        layout_expert_idx: [total_m_blocks] int32 tensor
+        layout_m_block: [total_m_blocks] int32 tensor
+        total_m_blocks: int (for grid launch)
+    """
+    # Compute tokens per expert from offsets: offsets[i+1] - offsets[i]
+    tokens_per_expert = expert_offsets[1:] - expert_offsets[:-1]  # [E]
+
+    # Number of M-blocks per expert: ceil(tokens / block_size_m)
+    # Clamp to at least 0 (experts with 0 tokens get 0 blocks)
+    m_blocks_per_expert = (tokens_per_expert + block_size_m - 1) // block_size_m  # [E]
+
+    total_m_blocks = m_blocks_per_expert.sum()
+
+    # Build the flat layout using repeat_interleave:
+    # expert_idx[i] = which expert flat block i belongs to
+    # m_block[i] = which local M-block within that expert
+    layout_expert_idx = torch.repeat_interleave(
+        torch.arange(num_experts, device=device, dtype=torch.int32),
+        m_blocks_per_expert.int()
+    )
+
+    # For local m_block indices, we need [0,1,...,n_blocks_0-1, 0,1,...,n_blocks_1-1, ...]
+    # Use cumsum trick: cumsum of ones, subtract the cumulative start per expert
+    block_offsets = torch.zeros(num_experts + 1, device=device, dtype=torch.int32)
+    block_offsets[1:] = torch.cumsum(m_blocks_per_expert.int(), dim=0)
+    flat_indices = torch.arange(total_m_blocks.item(), device=device, dtype=torch.int32)
+    # Subtract the start offset of each expert's block range
+    expert_block_starts = block_offsets[:-1]  # [E]
+    per_block_start = expert_block_starts[layout_expert_idx]  # [total_m_blocks]
+    layout_m_block = flat_indices - per_block_start
+
+    return layout_expert_idx, layout_m_block, total_m_blocks.item()
+
+
+# ============================================================================
+# Legacy MoE GEMM Kernel (kept for H100 backward compat / small expert counts)
 # ============================================================================
 
 @triton.autotune(
@@ -90,7 +221,7 @@ def fused_moe_routing(
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        # B200/Blackwell configs: larger blocks, more stages, higher warps
+        # B200/Blackwell configs
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
     ],
@@ -112,103 +243,78 @@ def moe_gemm_kernel(
     GROUP_SIZE_M: tl.constexpr,
     ACTIVATION: tl.constexpr
 ):
-    # Grid: (Num_Experts, M_blocks, N_blocks)
-    # Note: When using autotune, we cannot pass grid as a callable that depends on META parameters easily if we want to use the same grid logic.
-    # But here we are launching the kernel from python with explicit grid.
-    # Wait, autotune requires the kernel to be called with .run() or similar if we want it to manage grid?
-    # No, autotune works with JIT functions.
-    # But we need to make sure the grid calculation in the python wrapper matches the block sizes chosen by autotune.
-    # The python wrapper `moe_gemm` calls `moe_gemm_kernel[grid](...)`.
-    # `moe_gemm_kernel` is now the Autotuner object.
-    # We need to pass the grid to it.
-    # But the grid depends on BLOCK_SIZE_M, which is chosen by autotune!
-    # So we cannot pass a fixed grid tuple.
-    # We must pass a callable grid that accepts META.
-    
     expert_idx = tl.program_id(0)
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(2)
-    
-    # Get start and end of this expert's rows in A/C
-    # expert_offsets_ptr is [E+1]
-    # We need to load it.
-    # Note: pointers in Triton are 64-bit.
-    
+
     off_start = tl.load(expert_offsets_ptr + expert_idx)
     off_end = tl.load(expert_offsets_ptr + expert_idx + 1)
-    
+
     m_size = off_end - off_start
-    
+
     # Check if this block is within bounds
     if pid_m * BLOCK_SIZE_M >= m_size:
         return
-        
+
     # Offsets for this block
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    # Pointers
-    # A: start at off_start rows
-    # a_ptrs = a_ptr + (off_start + offs_am)[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # But we iterate K.
-    
+
     a_base = a_ptr + (off_start * stride_am)
     b_base = b_ptr + (expert_idx * stride_be)
     c_base = c_ptr + (off_start * stride_cm)
-    
+
     # Initialize accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
+
+    a_mask = offs_am < m_size
+    n_mask = offs_bn < N
+
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load A
-        # Mask for M dimension (variable size)
-        a_mask = offs_am < m_size
-        
-        # A pointers for this K chunk
-        # [BLOCK_M, BLOCK_K]
-        a_ptrs = a_base + (offs_am[:, None] * stride_am + (k * BLOCK_SIZE_K + offs_k[None, :]) * stride_ak)
-        # Load A with boundary checks
-        # K dimension check: k * BLOCK_K + offs_k < K
-        k_mask = (k * BLOCK_SIZE_K + offs_k) < K
-        
+        k_start = k * BLOCK_SIZE_K
+        k_mask = (k_start + offs_k) < K
+
+        a_ptrs = a_base + (offs_am[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak)
         a = tl.load(a_ptrs, mask=a_mask[:, None] & k_mask[None, :], other=0.0)
-        
-        # Load B
-        # [BLOCK_K, BLOCK_N]
-        # B is [E, K, N] usually.
-        # b_ptrs = b_base + ((k * BLOCK_SIZE_K + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-        b_ptrs = b_base + ((k * BLOCK_SIZE_K + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-        
-        # N dimension check: offs_bn < N
-        n_mask = offs_bn < N
-        
+
+        b_ptrs = b_base + ((k_start + offs_k)[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
         b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
-        
-        # Accumulate
+
         accumulator += tl.dot(a, b)
-        
+
     # Activation
     if ACTIVATION == "silu":
         accumulator = accumulator * tl.sigmoid(accumulator)
     elif ACTIVATION == "relu":
         accumulator = tl.maximum(accumulator, 0.0)
-        
+
     # Store C
-    # c_ptrs = c_base + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
     c_ptrs = c_base + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
-    
     c_mask = (offs_am[:, None] < m_size) & (offs_bn[None, :] < N)
     tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
 
+
+# Threshold: use layout-based kernel when num_experts exceeds this value.
+# For small expert counts (e.g., 32), the 3D grid overhead is negligible
+# and the layout table construction cost is not worth it.
+_LAYOUT_KERNEL_EXPERT_THRESHOLD = 64
+
+
 def moe_gemm(a, b, expert_offsets, activation="", max_tokens_hint=None):
     """
-    a: [Total_Tokens, K]
-    b: [Num_Experts, K, N]
-    expert_offsets: [Num_Experts + 1]
-    max_tokens_hint: Optional hint for max tokens per expert (avoids CPU sync)
+    Grouped GEMM for MoE: A[Total_Tokens, K] @ B[E, K, N] -> C[Total_Tokens, N].
+
+    Each expert processes a contiguous slice of rows in A/C, with boundaries
+    defined by expert_offsets[E+1].
+
+    Args:
+        a: [Total_Tokens, K] input activations (sorted by expert)
+        b: [Num_Experts, K, N] expert weight matrices
+        expert_offsets: [Num_Experts + 1] cumulative token counts
+        activation: Optional activation ("silu", "relu", or "")
+        max_tokens_hint: Optional upper bound on tokens per expert (avoids sync)
     """
-    # Checks
     assert a.ndim == 2
     assert b.ndim == 3
     assert a.shape[1] == b.shape[1]
@@ -219,19 +325,100 @@ def moe_gemm(a, b, expert_offsets, activation="", max_tokens_hint=None):
     # Output
     c = torch.empty((total_tokens, N), device=a.device, dtype=a.dtype)
 
-    # Grid
-    # To avoid CPU sync (.item()) which breaks cudagraphs, we use a safe upper bound.
-    # Worst case: all tokens go to one expert = total_tokens
-    # With good load balancing: ~total_tokens / num_experts * some_factor
-    # We use total_tokens as safe upper bound (kernel early-exits for empty blocks anyway)
+    if total_tokens == 0:
+        return c
+
+    # Choose kernel strategy based on expert count.
+    # For high expert counts (256+), the 3D grid with max_m=total_tokens is
+    # catastrophically wasteful: 256 * cdiv(786432, 128) * cdiv(512, 128) =
+    # ~6M blocks, of which 99.6% early-exit. The layout-based 2D kernel
+    # launches only the blocks that have actual work.
+    if num_experts >= _LAYOUT_KERNEL_EXPERT_THRESHOLD:
+        _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation)
+    else:
+        _moe_gemm_legacy(a, b, c, expert_offsets, num_experts, total_tokens, K, N,
+                         activation, max_tokens_hint)
+
+    return c
+
+
+def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
+    """Layout-based kernel: builds a mapping table so each GPU block does useful work."""
+    # We need to pick a BLOCK_SIZE_M for layout construction. Since the kernel
+    # is not autotuned (we use fixed configs optimized for the target shapes),
+    # we select BLOCK_SIZE_M based on the problem geometry.
+    #
+    # For LatentMoE with K=256, N=256/512 and ~3072 tokens/expert:
+    #   BLOCK_M=64: 48 blocks/expert, good occupancy, fits register file
+    #   BLOCK_M=128: 24 blocks/expert, may underutilize for small experts
+    #
+    # Choose based on expected tokens per expert
+    avg_tokens = a.shape[0] // max(num_experts, 1)
+    if avg_tokens >= 512:
+        block_m = 128
+    elif avg_tokens >= 64:
+        block_m = 64
+    else:
+        block_m = 32
+
+    # Build layout tables
+    layout_expert_idx, layout_m_block, total_m_blocks = _build_layout_tables(
+        expert_offsets, num_experts, block_m, a.device
+    )
+
+    if total_m_blocks == 0:
+        return
+
+    # Select block sizes for N and K dimensions based on problem shape
+    if K >= 256:
+        block_k = 128 if K >= 512 else 64
+    else:
+        block_k = min(32, K)
+
+    if N >= 256:
+        block_n = 128
+    else:
+        block_n = min(64, N)
+
+    # Ensure block sizes are powers of 2 and at least 16
+    block_m = max(16, block_m)
+    block_n = max(16, block_n)
+    block_k = max(16, block_k)
+
+    n_blocks = triton.cdiv(N, block_n)
+    grid = (total_m_blocks, n_blocks)
+
+    _moe_gemm_kernel_v2[grid](
+        a, b, c,
+        expert_offsets,
+        layout_expert_idx, layout_m_block,
+        K, N,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1), b.stride(2),
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        GROUP_SIZE_M=8,
+        ACTIVATION=activation,
+        num_warps=8 if (block_m >= 64 and block_n >= 64) else 4,
+        num_stages=4,
+    )
+
+
+def _moe_gemm_legacy(a, b, c, expert_offsets, num_experts, total_tokens, K, N,
+                      activation, max_tokens_hint):
+    """Legacy 3D-grid kernel for small expert counts where overhead is acceptable."""
     if max_tokens_hint is not None:
         max_m = max_tokens_hint
     else:
-        # Use total_tokens as upper bound - kernel will early-exit for out-of-bounds blocks
-        # This avoids the CPU sync that breaks cudagraphs
         max_m = total_tokens
 
-    grid = lambda META: (num_experts, triton.cdiv(max_m, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
+    grid = lambda META: (
+        num_experts,
+        triton.cdiv(max_m, META['BLOCK_SIZE_M']),
+        triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
 
     moe_gemm_kernel[grid](
         a, b, c,
@@ -240,7 +427,5 @@ def moe_gemm(a, b, expert_offsets, activation="", max_tokens_hint=None):
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1), b.stride(2),
         c.stride(0), c.stride(1),
-        ACTIVATION=activation
+        ACTIVATION=activation,
     )
-
-    return c
