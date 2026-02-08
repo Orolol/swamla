@@ -193,8 +193,10 @@ def _build_layout_tables(expert_offsets, num_experts, block_size_m, total_tokens
     block_cumsum = torch.zeros(num_experts + 1, device=device, dtype=torch.int32)
     block_cumsum[1:] = torch.cumsum(m_blocks_per_expert.int(), dim=0)
 
-    # Upper bound on total blocks — Python int, zero GPU sync
-    max_m_blocks = (total_tokens + block_size_m - 1) // block_size_m
+    # Upper bound on total blocks — Python int, zero GPU sync.
+    # Each expert adds at most 1 extra block from ceiling division, so:
+    # total_m_blocks = sum(ceil(t_i/B)) <= ceil(total/B) + num_experts
+    max_m_blocks = (total_tokens + block_size_m - 1) // block_size_m + num_experts
 
     if max_m_blocks == 0:
         empty = torch.empty(0, device=device, dtype=torch.int32)
