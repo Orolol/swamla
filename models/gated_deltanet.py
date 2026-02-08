@@ -15,6 +15,11 @@ import torch.nn.functional as F
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     FLA_AVAILABLE = True
+    # The fla library wraps chunk_gated_delta_rule with @torch.compiler.disable,
+    # causing a graph break per DeltaNet block (16 breaks with grad checkpoint).
+    # allow_in_graph tells the compiler to treat it as an opaque op — no graph break,
+    # the function still runs eagerly but the surrounding graph stays intact.
+    torch.compiler.allow_in_graph(chunk_gated_delta_rule)
 except ImportError:
     FLA_AVAILABLE = False
     print("Warning: flash-linear-attention not available, GatedDeltaNet will be slow")
