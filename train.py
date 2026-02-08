@@ -1890,9 +1890,15 @@ def train(args):
 
                     # Summary statistics
                     total_cpu_time = sum(e.self_cpu_time_total for e in key_avg)
-                    total_cuda_time = sum(e.cuda_time_total for e in key_avg)
+                    total_cuda_time = sum(
+                        getattr(e, 'self_cuda_time_total', 0) or getattr(e, 'cuda_time_total', 0) or 0
+                        for e in key_avg
+                    )
                     total_flops = sum(e.flops for e in key_avg if e.flops > 0)
-                    n_cuda_calls = sum(e.count for e in key_avg if e.cuda_time_total > 0)
+                    n_cuda_calls = sum(
+                        e.count for e in key_avg
+                        if (getattr(e, 'self_cuda_time_total', 0) or getattr(e, 'cuda_time_total', 0) or 0) > 0
+                    )
 
                     print(f"\n{'='*80}")
                     print(f"📈 SUMMARY:")

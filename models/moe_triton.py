@@ -166,13 +166,12 @@ def _moe_gemm_kernel_v2(
     tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 
-def _build_layout_tables(expert_offsets, num_experts, block_size_m, device):
+def _build_layout_tables(expert_offsets, num_experts, block_size_m, total_tokens, device):
     """
     Build layout tables that map flat M-block IDs to (expert_idx, local_m_block).
 
-    Given expert_offsets [E+1], computes the number of M-blocks each expert needs,
-    then creates a flat mapping so we can use a 2D grid (total_m_blocks, N_blocks)
-    instead of a 3D grid (experts, max_m_blocks, N_blocks).
+    Uses a fixed-size upper-bound allocation to avoid GPU-CPU sync (.item()) and
+    slow repeat_interleave. Instead, uses a Triton kernel for O(E) work.
 
     Returns:
         layout_expert_idx: [total_m_blocks] int32 tensor
@@ -183,30 +182,49 @@ def _build_layout_tables(expert_offsets, num_experts, block_size_m, device):
     tokens_per_expert = expert_offsets[1:] - expert_offsets[:-1]  # [E]
 
     # Number of M-blocks per expert: ceil(tokens / block_size_m)
-    # Clamp to at least 0 (experts with 0 tokens get 0 blocks)
     m_blocks_per_expert = (tokens_per_expert + block_size_m - 1) // block_size_m  # [E]
 
-    total_m_blocks = m_blocks_per_expert.sum()
+    # Cumulative block offsets per expert
+    block_cumsum = torch.zeros(num_experts + 1, device=device, dtype=torch.int32)
+    block_cumsum[1:] = torch.cumsum(m_blocks_per_expert.int(), dim=0)
 
-    # Build the flat layout using repeat_interleave:
-    # expert_idx[i] = which expert flat block i belongs to
-    # m_block[i] = which local M-block within that expert
-    layout_expert_idx = torch.repeat_interleave(
-        torch.arange(num_experts, device=device, dtype=torch.int32),
-        m_blocks_per_expert.int()
+    # Upper bound on total blocks (avoids .item() GPU sync)
+    max_m_blocks = (total_tokens + block_size_m - 1) // block_size_m
+
+    # Allocate with upper bound, then slice to actual size
+    layout_expert_idx = torch.empty(max_m_blocks, device=device, dtype=torch.int32)
+    layout_m_block = torch.empty(max_m_blocks, device=device, dtype=torch.int32)
+
+    # Fill layout tables with a simple Triton kernel: one program per expert
+    _fill_layout_kernel[(num_experts,)](
+        block_cumsum, layout_expert_idx, layout_m_block,
+        num_experts,
     )
 
-    # For local m_block indices, we need [0,1,...,n_blocks_0-1, 0,1,...,n_blocks_1-1, ...]
-    # Use cumsum trick: cumsum of ones, subtract the cumulative start per expert
-    block_offsets = torch.zeros(num_experts + 1, device=device, dtype=torch.int32)
-    block_offsets[1:] = torch.cumsum(m_blocks_per_expert.int(), dim=0)
-    flat_indices = torch.arange(total_m_blocks.item(), device=device, dtype=torch.int32)
-    # Subtract the start offset of each expert's block range
-    expert_block_starts = block_offsets[:-1]  # [E]
-    per_block_start = expert_block_starts[layout_expert_idx]  # [total_m_blocks]
-    layout_m_block = flat_indices - per_block_start
+    # Get actual total (last element of cumsum) -- still need .item() for grid launch
+    # but now it's a single scalar read, not repeat_interleave
+    total_m_blocks = block_cumsum[num_experts].item()
 
-    return layout_expert_idx, layout_m_block, total_m_blocks.item()
+    return layout_expert_idx[:total_m_blocks], layout_m_block[:total_m_blocks], total_m_blocks
+
+
+@triton.jit
+def _fill_layout_kernel(
+    block_cumsum_ptr,   # [E+1] cumulative block counts
+    expert_idx_ptr,     # [max_m_blocks] output: expert index per block
+    m_block_ptr,        # [max_m_blocks] output: local M-block index
+    NUM_EXPERTS: tl.constexpr,
+):
+    """Fill layout tables: one program per expert, writes its range of blocks."""
+    eid = tl.program_id(0)
+    start = tl.load(block_cumsum_ptr + eid)
+    end = tl.load(block_cumsum_ptr + eid + 1)
+    n_blocks = end - start
+
+    # Each expert writes its block range
+    for i in range(n_blocks):
+        tl.store(expert_idx_ptr + start + i, eid)
+        tl.store(m_block_ptr + start + i, i)
 
 
 # ============================================================================
@@ -363,7 +381,7 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
 
     # Build layout tables
     layout_expert_idx, layout_m_block, total_m_blocks = _build_layout_tables(
-        expert_offsets, num_experts, block_m, a.device
+        expert_offsets, num_experts, block_m, a.shape[0], a.device
     )
 
     if total_m_blocks == 0:
