@@ -1967,7 +1967,7 @@ def main():
                         help='Legacy: enable FP8 via Transformer Engine (prefer --fp8_backend)')
 
     # TensorBoard
-    parser.add_argument('--use_tensorboard', action='store_true', default=True)
+    parser.add_argument('--use_tensorboard', action='store_true', default=False)
 
     # WeDLM (Causal Diffusion Language Model) training
     parser.add_argument('--use_wedlm', action='store_true', default=False,

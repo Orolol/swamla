@@ -24,6 +24,8 @@ bitsandbytes>=0.41.0
 flash-linear-attention
 
 # Native FP8 training via torchao (recommended, easy install)
+--pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128# torchao>=0.5.0
+
 
 # Optional: FP8 training with Transformer Engine on H100/H200 (requires CUDA 12.6+)
 # Install manually if needed: pip install transformer-engine[pytorch]>=2.0.0
