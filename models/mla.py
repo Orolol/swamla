@@ -153,6 +153,7 @@ class MLA(nn.Module):
 
         self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
         self.force_cudnn_sdpa = getattr(config, 'force_cudnn_sdpa', False)
+        self._warned_cudnn_fallback = False
         cudnn_compatible_heads = getattr(config, 'cudnn_compatible_heads', False)
         cudnn_head_dim_limit = 256 if cudnn_compatible_heads else 128
         if self.use_cudnn_sdpa and self.qk_head_dim > cudnn_head_dim_limit:
@@ -650,10 +651,8 @@ class MLA(nn.Module):
 
         return attn_output
 
-    # Disable torch.compile tracing for this method: dynamo's fake tensor check
-    # has a stale head_dim<=128 limit for cuDNN SDPA, but the actual cuDNN runtime
-    # supports head_dim<=256 on Hopper/Blackwell GPUs. Running eagerly bypasses
-    # the false rejection while still using the cuDNN kernel.
+    # Disable torch.compile tracing for this method because backend selection
+    # and fallback handling depend on runtime kernel availability.
     @torch.compiler.disable
     def _sdpa_attention(self, q, k, v, attn_mask=None, is_causal=False):
         """
@@ -673,16 +672,43 @@ class MLA(nn.Module):
         """
         d_qk = q.shape[-1]
         d_v = v.shape[-1]
-        v_padded = v
-
-        if self.use_cudnn_sdpa and d_v != d_qk:
-            # Pad V to match Q/K dimension for cuDNN compatibility
-            v_padded = F.pad(v, (0, d_qk - d_v), value=0.0).contiguous()
+        used_cudnn = False
+        padded_v_for_cudnn = self.use_cudnn_sdpa and d_v != d_qk
+        v_for_cudnn = F.pad(v, (0, d_qk - d_v), value=0.0).contiguous() if padded_v_for_cudnn else v
 
         if self.use_cudnn_sdpa:
-            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            try:
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    attn_output = F.scaled_dot_product_attention(
+                        q, k, v_for_cudnn,
+                        attn_mask=attn_mask,
+                        dropout_p=self.dropout if self.training else 0.0,
+                        is_causal=is_causal,
+                        scale=self.softmax_scale
+                    )
+                used_cudnn = True
+            except RuntimeError as e:
+                err = str(e)
+                cudnn_unavailable = (
+                    "No available kernel" in err
+                    or "CUDNN_ATTENTION is not available" in err
+                    or "head_dim should be no more than 128" in err
+                    or "No execution plans support the graph" in err
+                )
+                if not cudnn_unavailable:
+                    raise
+
+                if not self._warned_cudnn_fallback:
+                    print(
+                        "MLA: cuDNN SDPA kernel unavailable at runtime, "
+                        "falling back to native SDPA for stability."
+                    )
+                    self._warned_cudnn_fallback = True
+                # Disable cuDNN path for subsequent steps to avoid repeated failures.
+                self.use_cudnn_sdpa = False
+
                 attn_output = F.scaled_dot_product_attention(
-                    q, k, v_padded,
+                    q, k, v,
                     attn_mask=attn_mask,
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=is_causal,
@@ -690,15 +716,15 @@ class MLA(nn.Module):
                 )
         else:
             attn_output = F.scaled_dot_product_attention(
-                q, k, v_padded,
+                q, k, v,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal,
                 scale=self.softmax_scale
             )
 
-        # Remove padding from output if we padded V
-        if self.use_cudnn_sdpa and d_v != d_qk:
+        # Remove padding only when cuDNN path actually ran with padded V.
+        if used_cudnn and padded_v_for_cudnn:
             attn_output = attn_output[..., :d_v].contiguous()
 
         return attn_output
