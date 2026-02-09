@@ -44,6 +44,8 @@ OPTIONS:
   --attn-backend NAME Attention backend (auto, sdpa, sdpa-native, sdpa-cudnn-force, triton, flash)
   --fp8-backend NAME  FP8 backend (auto, native, te, none) [default: auto]
   --compile-mode MODE torch.compile mode (default, max-autotune, reduce-overhead)
+  --no-cautious-wd    Disable cautious weight decay (overrides preset)
+  --no-wd-schedule    Disable weight decay schedule (overrides preset)
   --hf-repo ID        HuggingFace repo for auto-push
   --no-tensorboard    Disable TensorBoard
   --profile           Enable profiling
@@ -144,6 +146,8 @@ HF_REPO_ID=""
 USE_TENSORBOARD="false"
 TENSORBOARD_PORT="6006"
 PROFILE="false"
+OVERRIDE_CAUTIOUS_WD=""
+OVERRIDE_WD_SCHEDULE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -183,6 +187,14 @@ while [[ $# -gt 0 ]]; do
         --compile-mode)
             COMPILE_MODE="$2"
             shift 2
+            ;;
+        --no-cautious-wd)
+            OVERRIDE_CAUTIOUS_WD="false"
+            shift
+            ;;
+        --no-wd-schedule)
+            OVERRIDE_WD_SCHEDULE="false"
+            shift
             ;;
         --hf-repo)
             HF_REPO_ID="$2"
@@ -329,6 +341,14 @@ if [ -n "$FEATURES" ]; then
             *) echo "Unknown feature: $feature"; exit 1 ;;
         esac
     done
+fi
+
+# Explicit CLI overrides (must apply after preset and --features)
+if [ -n "$OVERRIDE_CAUTIOUS_WD" ]; then
+    USE_CAUTIOUS_WD="$OVERRIDE_CAUTIOUS_WD"
+fi
+if [ -n "$OVERRIDE_WD_SCHEDULE" ]; then
+    USE_WD_SCHEDULE="$OVERRIDE_WD_SCHEDULE"
 fi
 
 # Apply defaults after preset/features processing
