@@ -134,6 +134,7 @@ class SWAMLAConfig:
     engram_conv_kernel: int = 4  # Causal conv kernel size
     engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
     engram_lr_multiplier: float = 5.0  # LR multiplier for Engram embeddings
+    engram_gate_bias_init: float = 1.0  # Initial gate bias (sigmoid(1.0)=0.73, prevents collapse)
 
     # μP (Maximal Update Parametrization)
     use_mup: bool = False
@@ -594,6 +595,22 @@ class SWAMLAModel(nn.Module):
                 engram_modules.append((block.layer_id, block.engram))
         return engram_modules
 
+    def get_engram_gate_loss(self) -> torch.Tensor:
+        """Collect gate anti-collapse losses from all Engram layers.
+
+        Returns mean of -log(gate + eps) across all Engram modules.
+        Analogous to MoE z-loss: prevents gates from collapsing to 0.
+        """
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        count = 0
+        for block in self.transformer.h:
+            if isinstance(block, MLABlock) and getattr(block, 'has_engram', False):
+                total_loss = total_loss + block.engram.get_gate_loss()
+                count += 1
+        if count > 0:
+            total_loss = total_loss / count
+        return total_loss
+
     @torch.no_grad()
     def generate(
         self,
@@ -692,6 +709,7 @@ def _create_mla_block_config(config: SWAMLAConfig):
         engram_ngram_orders: List[int] = field(default_factory=lambda: list(config.engram_ngram_orders))
         engram_conv_kernel: int = config.engram_conv_kernel
         engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = config.engram_table_sizes
+        engram_gate_bias_init: float = config.engram_gate_bias_init
         # Value Embeddings
         use_value_embeds: bool = config.use_value_embeds
         ve_gate_dim: int = config.ve_gate_dim

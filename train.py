@@ -499,8 +499,8 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
                     x0_lambda_params.append(param)
                 elif 'resid_lambdas' in name:
                     resid_lambda_params.append(param)
-                # Engram embedding tables: special treatment (5x LR, no decay)
-                elif 'engram' in name and 'embeddings' in name and 'tables' in name:
+                # ALL Engram params: 5x LR, no decay (prevents gate collapse)
+                elif 'engram' in name:
                     engram_embed_params.append(param)
                 elif any(nd in name for nd in ['wte', 'wpe', 'lm_head', 'embed']):
                     adamw_params.append(param)
@@ -537,8 +537,7 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     # Standard AdamW configuration with Engram and residual scalar support
     decay_params = []
     no_decay_params = []
-    engram_embed_params = []  # Engram embeddings: high LR, no decay
-    engram_other_params = []  # Engram w_k, w_v, conv: normal LR, with decay
+    engram_params = []  # ALL Engram params: 5x LR, no decay (prevents gate collapse)
     x0_lambda_params = []  # x0_lambdas: high LR, higher beta1, no decay
     resid_lambda_params = []  # resid_lambdas: low LR, no decay
 
@@ -550,15 +549,10 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
             x0_lambda_params.append(param)
         elif 'resid_lambdas' in name:
             resid_lambda_params.append(param)
-        # Engram embedding tables: 5x LR, no weight decay (paper spec)
-        elif 'engram' in name and 'embeddings' in name and 'tables' in name:
-            engram_embed_params.append(param)
-        # Engram other params (w_k, w_v, conv weights): normal LR with decay
+        # ALL Engram params: 5x LR, no weight decay (prevents gate collapse)
+        # WD on w_k pushes dot product toward 0 → reinforces gate collapse
         elif 'engram' in name:
-            if any(nd in name for nd in ['.bias', 'norm']):
-                no_decay_params.append(param)
-            else:
-                engram_other_params.append(param)
+            engram_params.append(param)
         # Standard no-decay params
         elif any(nd in name for nd in ['.bias', 'norm', 'ln_', 'wte', 'wpe']):
             no_decay_params.append(param)
@@ -570,20 +564,13 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
         {'params': no_decay_params, 'weight_decay': 0.0, 'lr': learning_rate, 'name': 'no_decay'},
     ]
 
-    # Add Engram param groups
-    if engram_embed_params:
+    # Add Engram param group (all params: 5x LR, no decay)
+    if engram_params:
         param_groups.append({
-            'params': engram_embed_params,
-            'weight_decay': 0.0,  # No weight decay for embeddings
-            'lr': learning_rate * engram_lr_multiplier,  # 5x LR
+            'params': engram_params,
+            'weight_decay': 0.0,
+            'lr': learning_rate * engram_lr_multiplier,
             'name': 'engram_embed',
-        })
-    if engram_other_params:
-        param_groups.append({
-            'params': engram_other_params,
-            'weight_decay': weight_decay,
-            'lr': learning_rate,
-            'name': 'engram_other',
         })
 
     # Add residual scalar param groups (nanochat x0/resid lambdas)
@@ -1039,6 +1026,7 @@ def train(args):
         engram_n_hash_heads=args.engram_n_hash_heads,
         engram_ngram_orders=engram_ngram_orders,
         engram_conv_kernel=args.engram_conv_kernel,
+        engram_gate_bias_init=args.engram_gate_bias_init,
         # cuDNN-compatible heads
         cudnn_compatible_heads=args.cudnn_compatible_heads,
         # Per-layer residual scalars (nanochat)
@@ -1219,6 +1207,12 @@ def train(args):
         if rank == 0:
             print(f"Progressive training: starting at seq_len={initial_seq_len}, batch_size={initial_batch_size}")
 
+    # Compute start_offset from resume_tokens to avoid re-reading data already seen
+    # Estimate: tokens_seen / seq_len ≈ number of packed sequences consumed
+    data_start_offset = resume_tokens // initial_seq_len if resume_tokens > 0 else 0
+    if data_start_offset > 0 and master_process:
+        print(f"Data loader: skipping ~{data_start_offset:,} examples (resume from {format_tokens(resume_tokens)})")
+
     data_loader = PackedFinewebDataset(
         split='train',
         max_length=initial_seq_len,
@@ -1226,6 +1220,7 @@ def train(args):
         tokenizer=tokenizer,
         shuffle=True,
         num_workers=args.num_workers,
+        start_offset=data_start_offset,
         use_bestfit_crop=args.use_bestfit_crop,
     )
 
@@ -1542,6 +1537,10 @@ def train(args):
                         if hasattr(raw_model, 'get_moe_aux_loss'):
                             moe_aux_loss = raw_model.get_moe_aux_loss()
                             loss = loss + moe_aux_loss
+                        # Add Engram gate anti-collapse loss
+                        if args.use_engram and args.engram_gate_loss_weight > 0:
+                            engram_gate_loss = raw_model.get_engram_gate_loss()
+                            loss = loss + args.engram_gate_loss_weight * engram_gate_loss
                         loss = loss / args.gradient_accumulation_steps
 
                 # Backward pass (allreduce only on last micro-step when DDP)
@@ -1568,7 +1567,7 @@ def train(args):
             for opt in optimizers_list:
                 for pg in opt.param_groups:
                     # Only update groups that originally had weight decay
-                    if pg.get('name') in ['decay', 'engram_other'] or 'weight_decay' not in pg:
+                    if pg.get('name') in ['decay'] or 'weight_decay' not in pg:
                         continue
                     if pg.get('name') not in ['no_decay', 'engram_embed', 'x0_lambdas', 'resid_lambdas']:
                         pg['weight_decay'] = current_wd
@@ -1670,6 +1669,14 @@ def train(args):
                             wandb.log({k: avg_value, 'step': step})
                         if tb_writer is not None:
                             tb_writer.add_scalar(k, avg_value, step)
+                    # Log gate loss (computed from live tensors during training)
+                    if args.engram_gate_loss_weight > 0:
+                        with torch.no_grad():
+                            gate_loss_val = raw_model.get_engram_gate_loss().item()
+                        if wandb_run is not None:
+                            wandb.log({'engram/gate_loss': gate_loss_val, 'step': step})
+                        if tb_writer is not None:
+                            tb_writer.add_scalar('engram/gate_loss', gate_loss_val, step)
 
         # Validation (using next batches from same data loader)
         # Token-based trigger: validate when we cross a new token threshold
@@ -1992,7 +1999,11 @@ def main():
     parser.add_argument('--engram_conv_kernel', type=int, default=4,
                         help='Engram causal convolution kernel size')
     parser.add_argument('--engram_lr_multiplier', type=float, default=5.0,
-                        help='Learning rate multiplier for Engram embedding tables')
+                        help='Learning rate multiplier for all Engram parameters')
+    parser.add_argument('--engram_gate_bias_init', type=float, default=1.0,
+                        help='Initial gate bias value (sigmoid(1.0)=0.73, prevents gate collapse)')
+    parser.add_argument('--engram_gate_loss_weight', type=float, default=0.01,
+                        help='Weight for gate anti-collapse auxiliary loss (0 to disable)')
 
     # μP arguments
     parser.add_argument('--use_mup', action='store_true', help='Enable μP (Maximal Update Parametrization)')

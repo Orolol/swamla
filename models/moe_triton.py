@@ -2,6 +2,23 @@
 import torch
 import triton
 import triton.language as tl
+from functools import lru_cache
+
+
+@lru_cache(maxsize=8)
+def _get_device_max_smem(device) -> int:
+    """Get max shared memory per block for the given CUDA device.
+
+    Cached per device to avoid repeated queries.
+    RTX 5090 (sm_120): ~99 KB, B200 (sm_100): ~228 KB, H100 (sm_90): ~228 KB.
+    """
+    cc_major = torch.cuda.get_device_capability(device)[0]
+    if cc_major >= 12:
+        return 100 * 1024   # Blackwell consumer (RTX 50xx)
+    elif cc_major >= 9:
+        return 228 * 1024   # Hopper / Blackwell datacenter
+    else:
+        return 160 * 1024   # Ampere and older
 
 
 # ============================================================================
@@ -412,9 +429,8 @@ def _moe_gemm_layout(a, b, c, expert_offsets, num_experts, K, N, activation):
 
     # Dynamically compute num_stages to fit hardware shared memory limit.
     # Shared memory per stage ≈ (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N) * 2 bytes (bf16).
-    # B200 (sm_100) limit: 232,448 bytes. Leave margin for alignment overhead.
     smem_per_stage = (block_m * block_k + block_k * block_n) * 2
-    max_smem = 228 * 1024  # 228 KB conservative (hw limit ~232 KB)
+    max_smem = _get_device_max_smem(a.device)
     num_stages = min(4, max(1, max_smem // smem_per_stage))
 
     n_blocks = triton.cdiv(N, block_n)
