@@ -668,7 +668,11 @@ def load_swamla_from_hf(
         config = SWAMLAConfig(**config_dict)
         model = SWAMLAModel(config)
 
-    model.load_state_dict(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print0(f"  Missing keys (will use default init): {missing}")
+    if unexpected:
+        print0(f"  Unexpected keys (ignored): {unexpected}")
     model.to(device)
     model.eval()
 

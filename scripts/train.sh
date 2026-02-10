@@ -48,6 +48,7 @@ OPTIONS:
   --no-wd-schedule    Disable weight decay schedule (overrides preset)
   --hf-repo ID        HuggingFace repo for auto-push
   --no-tensorboard    Disable TensorBoard
+  --instruct          Instruction fine-tuning mode (SlimOrca + ChatML + loss masking)
   --profile           Enable profiling
   --help              Show this help message
 
@@ -148,6 +149,7 @@ TENSORBOARD_PORT="6006"
 PROFILE="false"
 OVERRIDE_CAUTIOUS_WD=""
 OVERRIDE_WD_SCHEDULE=""
+INSTRUCT_MODE="false"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -202,6 +204,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-tensorboard)
             USE_TENSORBOARD="false"
+            shift
+            ;;
+        --instruct)
+            INSTRUCT_MODE="true"
             shift
             ;;
         --profile)
@@ -580,6 +586,12 @@ if [ "$PROFILE" = "true" ]; then
     PROFILE_ARG="--profile --profile_steps $PROFILE_STEPS --profile_warmup $PROFILE_WARMUP"
 fi
 
+# Instruct fine-tuning
+INSTRUCT_ARG=""
+if [ "$INSTRUCT_MODE" = "true" ]; then
+    INSTRUCT_ARG="--instruct"
+fi
+
 # μP
 MUP_ARGS=""
 if [ "$USE_MUP" = "true" ]; then
@@ -714,7 +726,8 @@ COMMON_ARGS="--size $MODEL_SIZE \
     $HF_REPO_ARG \
     $RESUME_ARG \
     $TB_ARG \
-    $PROFILE_ARG"
+    $PROFILE_ARG \
+    $INSTRUCT_ARG"
 
 # =============================================================================
 # Launch Training

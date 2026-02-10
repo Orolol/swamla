@@ -252,12 +252,12 @@ class PackedInstructDataset(IterableDataset):
             # Combine tokens for this message
             msg_tokens = header_ids + content_ids + closing_ids
 
-            # Create loss mask: only train on assistant content (not header/closing)
+            # Create loss mask: train on assistant content + closing <|im_end|>
             if chatml_role == "assistant":
-                # Mask: 0 for header, 1 for content, 0 for closing
+                # Mask: 0 for header, 1 for content, 1 for closing (model must learn to stop)
                 msg_mask = ([0] * len(header_ids) +
                            [1] * len(content_ids) +
-                           [0] * len(closing_ids))
+                           [1] * len(closing_ids))
             else:
                 # Don't train on system/user messages
                 msg_mask = [0] * len(msg_tokens)

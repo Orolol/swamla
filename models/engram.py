@@ -408,7 +408,7 @@ class EngramGating(nn.Module):
         hidden_dim: int,      # d from backbone
         memory_dim: int,      # d_mem from embeddings
         num_branches: int = 1,  # M for multi-branch (mHC)
-        gate_bias_init: float = 1.0,  # Learnable bias before sigmoid (breaks collapse equilibrium)
+        gate_bias_init: float = 0.0,  # Learnable bias before sigmoid (0.0 = neutral start)
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -431,9 +431,9 @@ class EngramGating(nn.Module):
         # Scaling factor
         self.scale = hidden_dim ** -0.5
 
-        # Learnable gate bias: sigmoid(dot_product * scale + gate_bias)
-        # With gate_bias=1.0, sigmoid(1.0)=0.73 — gates start open, model must
-        # actively learn to close them. Prevents collapse where gates drift to 0.
+        # Learnable gate bias: sigmoid(element_product + gate_bias)
+        # Default 0.0: sigmoid(0)=0.5, neutral start. Aux loss pushes gates open.
+        # For old checkpoint resume, train.py sets this to -3.0 (conservative).
         self.gate_bias = nn.Parameter(torch.tensor(gate_bias_init))
 
     def forward(
@@ -459,11 +459,12 @@ class EngramGating(nn.Module):
             q_norm = self.query_norm(h)
             k_norm = self.key_norm(k)
 
-            # Gate: sigmoid of scaled dot product + learnable bias
-            # [B, T, d] * [B, T, d] -> [B, T] (sum over d)
+            # Element-wise gate: sigmoid of per-dimension product + learnable bias
+            # Each q_i*k_i ∈ [-3, 3] after RMSNorm → sigmoid stays in [0.05, 0.95]
+            # Resistant to collapse: even anti-correlated dims give sigmoid(-3+1)=0.12
             gate = torch.sigmoid(
-                (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale + self.gate_bias
-            )  # [B, T, 1]
+                q_norm * k_norm + self.gate_bias
+            )  # [B, T, d]
 
             # Gate stored by Engram._store_monitoring via self.gating.last_gate
             self.last_gate = gate
@@ -481,7 +482,7 @@ class EngramGating(nn.Module):
                 k_norm = self.key_norm(k_m)
 
                 gate_m = torch.sigmoid(
-                    (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale + self.gate_bias
+                    q_norm * k_norm + self.gate_bias
                 )
 
                 outputs.append(gate_m * v)
@@ -586,7 +587,7 @@ class Engram(nn.Module):
         tokenizer_compression: Optional[TokenizerCompression] = None,
         num_branches: int = 1,
         conv_kernel_size: int = 4,
-        gate_bias_init: float = 1.0,
+        gate_bias_init: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -771,7 +772,7 @@ def create_engram(
     conv_kernel_size: int = 4,
     table_sizes: Optional[Dict[Tuple[int, int], int]] = None,
     tokenizer_compression: Optional[TokenizerCompression] = None,
-    gate_bias_init: float = 1.0,
+    gate_bias_init: float = 0.0,
 ) -> Engram:
     """
     Factory function to create Engram module with custom configuration.
@@ -785,7 +786,7 @@ def create_engram(
         conv_kernel_size: Kernel size for causal conv (default: 4)
         table_sizes: Custom table sizes {(n, k): size}
         tokenizer_compression: Pre-built compression mapping
-        gate_bias_init: Initial value for learnable gate bias (default: 1.0)
+        gate_bias_init: Initial value for learnable gate bias (default: 0.0)
 
     Returns:
         Configured Engram module
@@ -838,7 +839,7 @@ def create_engram_for_config(config, layer_id: int) -> Optional[Engram]:
     num_heads = getattr(config, 'engram_n_hash_heads', 8)
     conv_kernel_size = getattr(config, 'engram_conv_kernel', 4)
     table_sizes = getattr(config, 'engram_table_sizes', None)
-    gate_bias_init = getattr(config, 'engram_gate_bias_init', 1.0)
+    gate_bias_init = getattr(config, 'engram_gate_bias_init', 0.0)
 
     # Get vocab_size for dynamic table scaling (paper specification)
     vocab_size = getattr(config, 'vocab_size', None)

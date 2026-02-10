@@ -11,8 +11,12 @@ from datetime import datetime
 
 import torch
 from torch.utils.data import IterableDataset
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 from transformers import AutoTokenizer
+
+# Increase HF Hub timeouts for streaming (default 10s is too short under load)
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
+os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '30')
 
 # Global registry to track active datasets for cleanup
 _active_datasets = weakref.WeakSet()
@@ -130,31 +134,53 @@ class PackedFinewebDataset(IterableDataset):
             self.rank = 0
             self.world_size = 1
 
-        # For DDP: each rank skips to a different starting point to avoid data overlap
-        effective_offset = start_offset + (self.rank * 1000)  # Offset each rank by 1000 examples
+        # For DDP: each rank uses a different seed to avoid data overlap
+        effective_offset = start_offset + (self.rank * 1000)
 
-        # Load dataset
-        self.dataset = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name="CC-MAIN-2024-10",
-            split=split,
-            streaming=True,
+        # Load dataset with extended timeouts (default 10s causes timeouts under multi-GPU load)
+        dl_config = DownloadConfig(
+            max_retries=10,
+            num_proc=1,
         )
 
-        # Apply shuffle BEFORE skip to ensure different data order on resume
-        # Use start_offset as seed so each resume gets a different shuffle order
+        # Resume strategy: use split slicing for O(1) shard-level seeking via parquet metadata.
+        # HF datasets resolves "train[N:]" at the file level before creating the iterator,
+        # skipping entire parquet shards whose cumulative row count < N.
+        # Fallback: if offset is 0 or split slicing fails, load full split.
+        if effective_offset > 0:
+            split_with_offset = f"{split}[{effective_offset}:]"
+            print(f"[PackedDataset Rank {self.rank}] Loading with split slice: {split_with_offset}")
+            try:
+                self.dataset = load_dataset(
+                    "HuggingFaceFW/fineweb-edu",
+                    name="CC-MAIN-2024-10",
+                    split=split_with_offset,
+                    streaming=True,
+                    download_config=dl_config,
+                )
+            except Exception as e:
+                print(f"[PackedDataset Rank {self.rank}] Split slicing failed ({e}), falling back to full dataset with seed-based resume")
+                self.dataset = load_dataset(
+                    "HuggingFaceFW/fineweb-edu",
+                    name="CC-MAIN-2024-10",
+                    split=split,
+                    streaming=True,
+                    download_config=dl_config,
+                )
+        else:
+            self.dataset = load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                name="CC-MAIN-2024-10",
+                split=split,
+                streaming=True,
+                download_config=dl_config,
+            )
+
+        # Shuffle with offset-dependent seed: different resume point → different data order
         if self.shuffle:
-            # Seed based on start_offset + rank to ensure:
-            # 1. Different shuffle order each time we resume training
-            # 2. Each DDP rank gets different shuffle order
             shuffle_seed = start_offset + self.rank
             print(f"[PackedDataset Rank {self.rank}] Shuffling dataset with seed={shuffle_seed}, buffer_size={shuffle_buffer_size}")
             self.dataset = self.dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_size)
-
-        # Skip to starting position AFTER shuffle
-        if effective_offset > 0:
-            print(f"[PackedDataset Rank {self.rank}] Skipping to offset {effective_offset}")
-            self.dataset = self.dataset.skip(effective_offset)
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -380,7 +406,20 @@ class PackedFinewebDataset(IterableDataset):
                 # Fill documents buffer
                 while len(docs) < self.buffer_docs and not self.should_stop.is_set():
                     try:
-                        ex = next(it)
+                        # Retry with exponential backoff on network errors (HF timeouts)
+                        for retry in range(10):
+                            try:
+                                ex = next(it)
+                                break
+                            except StopIteration:
+                                raise  # Re-raise StopIteration to outer handler
+                            except Exception as net_err:
+                                if retry < 9:
+                                    wait = min(2 ** retry, 60)
+                                    print(f"[PackedDataset Rank {self.rank}] Network error: {net_err}, retry {retry+1}/10 in {wait}s")
+                                    time.sleep(wait)
+                                else:
+                                    raise  # Give up after 10 retries
                         example_count += 1
 
                         # DDP sharding: only process examples assigned to this rank

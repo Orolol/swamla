@@ -134,7 +134,7 @@ class SWAMLAConfig:
     engram_conv_kernel: int = 4  # Causal conv kernel size
     engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
     engram_lr_multiplier: float = 5.0  # LR multiplier for Engram embeddings
-    engram_gate_bias_init: float = 1.0  # Initial gate bias (sigmoid(1.0)=0.73, prevents collapse)
+    engram_gate_bias_init: float = 0.0  # Initial gate bias (sigmoid(0)=0.5, neutral start)
 
     # μP (Maximal Update Parametrization)
     use_mup: bool = False

@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'data'))
 
 from swa_mla_model import create_swa_mla_model, SWAMLAConfig
 from data_loader_packed import PackedFinewebDataset
+from data_loader_instruct import PackedInstructDataset
 
 # Try to import wandb
 try:
@@ -213,7 +214,7 @@ def print_training_banner(args, model, world_size, device, resume_step=0, resume
         print(f"  MoE: {moe_info}")
 
     # Training config line
-    mode_str = " [WeDLM]" if args.use_wedlm else ""
+    mode_str = " [WeDLM]" if args.use_wedlm else (" [Instruct]" if getattr(args, 'instruct', False) else "")
     print(f"  Training: bs={eff_batch} (×{args.gradient_accumulation_steps} accum) │ seq={args.block_size} │ lr={args.learning_rate:.0e}{mode_str}")
 
     # Optimizer and device line
@@ -598,79 +599,143 @@ def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, 
     return optimizer
 
 
-def load_latest_from_huggingface(repo_id, hf_token=None):
-    """Load the latest checkpoint from HuggingFace Hub.
+def _parse_hf_token_str(tokens_str: str) -> int:
+    """Parse a token string like '500M', '2B', '100k' into an integer."""
+    multipliers = {'k': 1000, 'K': 1000, 'm': 1_000_000, 'M': 1_000_000, 'b': 1_000_000_000, 'B': 1_000_000_000}
+    suffix = tokens_str[-1]
+    if suffix in multipliers:
+        return int(float(tokens_str[:-1]) * multipliers[suffix])
+    return int(tokens_str)
+
+
+def _find_hf_checkpoints(files, prefix, patterns):
+    """Search HF repo files for checkpoints matching given patterns.
+
+    Args:
+        files: List of files in the repo
+        prefix: Directory prefix to search (e.g., 'base/', 'instruct/', '')
+        patterns: List of (compiled_regex, sort_key_fn, checkpoint_type) tuples
 
     Returns:
-        dict: Checkpoint data with keys 'model_state_dict', 'optimizer_state_dict', 'step', 'total_tokens', 'config', 'val_loss'
-        None: If loading fails
+        List of checkpoint dicts sorted by sort key (descending)
+    """
+    checkpoints = []
+    for file in files:
+        for pattern, sort_key_fn, ckpt_type in patterns:
+            match = pattern.match(file)
+            if match:
+                ckpt = {
+                    'file': file,
+                    'dir': file.rsplit('/', 1)[0],
+                    'loss': float(match.group('loss')),
+                    'checkpoint_type': ckpt_type,
+                    'sort_key': sort_key_fn(match),
+                }
+                checkpoints.append(ckpt)
+                break
+    checkpoints.sort(key=lambda x: x['sort_key'], reverse=True)
+    return checkpoints
+
+
+def load_latest_from_huggingface(repo_id, hf_token=None, instruct_mode=False):
+    """Load the latest checkpoint from HuggingFace Hub.
+
+    Search order:
+    - instruct_mode=True: instruct/ -> base/ -> root/ (legacy)
+    - instruct_mode=False: base/ -> root/ (legacy)
+
+    Args:
+        repo_id: HuggingFace repository ID
+        hf_token: HuggingFace API token
+        instruct_mode: If True, search instruct/ first then fall back to base/root
+
+    Returns:
+        dict: Checkpoint data, or None if loading fails
     """
     if not HF_AVAILABLE:
         print("huggingface_hub not available - cannot load from HF")
         return None
 
     try:
-        from huggingface_hub import list_repo_files
+        from huggingface_hub import list_repo_files, hf_hub_download
         import re
 
-        print(f"Loading latest checkpoint from {repo_id}...")
+        print(f"Loading latest checkpoint from {repo_id} ({'instruct' if instruct_mode else 'base'} mode)...")
 
-        # List all files in the repo
         files = list_repo_files(repo_id, token=hf_token)
 
-        # Find all checkpoint directories (format: checkpoint_tokens_XXX_loss_Y.YYYY)
-        checkpoint_pattern = re.compile(r'checkpoint_tokens_(\d+[kKmMbB])_loss_([\d.]+)/pytorch_model\.bin')
-        checkpoints = []
+        # New naming: base/checkpoint_tokens_{tokens}_loss_{loss}/pytorch_model.bin
+        base_pattern = re.compile(
+            r'base/checkpoint_tokens_(?P<tokens>[\d.]+[kKmMbB]?)_loss_(?P<loss>[\d.]+)/pytorch_model\.bin'
+        )
+        # New naming: instruct/checkpoint_pt{pt}_it{it}_loss_{loss}/pytorch_model.bin
+        instruct_pattern = re.compile(
+            r'instruct/checkpoint_pt(?P<pt>[\d.]+[kKmMbB]?)_it(?P<it>[\d.]+[kKmMbB]?)_loss_(?P<loss>[\d.]+)/pytorch_model\.bin'
+        )
+        # Legacy naming (root): checkpoint_tokens_{tokens}_loss_{loss}/pytorch_model.bin
+        legacy_root_pattern = re.compile(
+            r'checkpoint_tokens_(?P<tokens>[\d.]+[kKmMbB]?)_loss_(?P<loss>[\d.]+)/pytorch_model\.bin'
+        )
+        # Legacy naming (old instruct): instruct/checkpoint_tokens_{tokens}_loss_{loss}/pytorch_model.bin
+        legacy_instruct_pattern = re.compile(
+            r'instruct/checkpoint_tokens_(?P<tokens>[\d.]+[kKmMbB]?)_loss_(?P<loss>[\d.]+)/pytorch_model\.bin'
+        )
 
-        for file in files:
-            match = checkpoint_pattern.match(file)
-            if match:
-                tokens_str = match.group(1)
-                loss_str = match.group(2)
+        def base_sort_key(m):
+            return _parse_hf_token_str(m.group('tokens'))
 
-                # Parse tokens (convert k/M/B to actual number)
-                tokens_multiplier = {'k': 1000, 'K': 1000, 'm': 1_000_000, 'M': 1_000_000, 'b': 1_000_000_000, 'B': 1_000_000_000}
-                tokens_value = int(tokens_str[:-1])
-                tokens_suffix = tokens_str[-1]
-                total_tokens = tokens_value * tokens_multiplier.get(tokens_suffix, 1)
+        def instruct_sort_key(m):
+            return _parse_hf_token_str(m.group('it'))
 
-                checkpoints.append({
-                    'file': file,
-                    'total_tokens': total_tokens,
-                    'loss': float(loss_str),
-                    'dir': file.rsplit('/', 1)[0]
-                })
+        def legacy_sort_key(m):
+            return _parse_hf_token_str(m.group('tokens'))
 
-        if not checkpoints:
+        # Build search order based on mode
+        search_phases = []
+        if instruct_mode:
+            # New instruct format, then old instruct format
+            search_phases.append(("instruct/", [
+                (instruct_pattern, instruct_sort_key, "instruct"),
+                (legacy_instruct_pattern, legacy_sort_key, "instruct"),
+            ]))
+            # Fall back to base checkpoints
+            search_phases.append(("base/", [(base_pattern, base_sort_key, "base")]))
+            search_phases.append(("root (legacy)", [(legacy_root_pattern, legacy_sort_key, "base")]))
+        else:
+            search_phases.append(("base/", [(base_pattern, base_sort_key, "base")]))
+            search_phases.append(("root (legacy)", [(legacy_root_pattern, legacy_sort_key, "base")]))
+
+        # Search each phase in order, stop at first match
+        latest = None
+        for phase_name, patterns in search_phases:
+            checkpoints = _find_hf_checkpoints(files, phase_name, patterns)
+            if checkpoints:
+                latest = checkpoints[0]
+                print(f"Found {len(checkpoints)} checkpoint(s) in {phase_name}")
+                break
+
+        if not latest:
             print(f"No checkpoints found in {repo_id}")
             return None
 
-        # Sort by total tokens (most recent training)
-        checkpoints.sort(key=lambda x: x['total_tokens'], reverse=True)
-        latest = checkpoints[0]
+        print(f"Loading: {latest['dir']} (type={latest['checkpoint_type']}, loss={latest['loss']:.4f})")
 
-        print(f"Found {len(checkpoints)} checkpoints")
-        print(f"Loading latest: {latest['dir']} (tokens: {latest['total_tokens']:,}, loss: {latest['loss']:.4f})")
-
-        # Download the checkpoint file
-        from huggingface_hub import hf_hub_download
         checkpoint_path = hf_hub_download(
             repo_id=repo_id,
             filename=latest['file'],
-            token=hf_token
+            token=hf_token,
         )
 
-        # Load checkpoint
-        # Note: Using weights_only=False because we trust our own checkpoints
-        # and they may contain custom optimizer states
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except TypeError:
-            # Fallback for older PyTorch versions that don't have weights_only parameter
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-        print(f"✓ Successfully loaded checkpoint from HuggingFace")
+        # Ensure checkpoint_type is set (legacy checkpoints won't have it)
+        if 'checkpoint_type' not in checkpoint:
+            checkpoint['checkpoint_type'] = latest['checkpoint_type']
 
+        print(f"Successfully loaded checkpoint from HuggingFace")
         return checkpoint
 
     except Exception as e:
@@ -680,8 +745,13 @@ def load_latest_from_huggingface(repo_id, hf_token=None):
         return None
 
 
-def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token, optimizer=None, step=None):
-    """Push model to Hugging Face Hub with automatic naming."""
+def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens, val_loss, repo_id, hf_token, optimizer=None, step=None, instruct_mode=False, pretrain_tokens=0, instruct_tokens=0):
+    """Push model to Hugging Face Hub with automatic naming.
+
+    Args:
+        pretrain_tokens: Total pretraining tokens (for instruct checkpoint naming)
+        instruct_tokens: Total instruction-tuning tokens (0 for base)
+    """
     if not HF_AVAILABLE:
         print("huggingface_hub not available - skipping HF push")
         return
@@ -692,11 +762,18 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
 
     try:
         # Create temporary save directory with informative name
-        # Format: tokens_XXXk_loss_Y.YYYY
-        tokens_str = f"{total_tokens // 1000}k" if total_tokens < 1_000_000 else f"{total_tokens // 1_000_000}M"
-        model_name = f"checkpoint_tokens_{tokens_str}_loss_{val_loss:.4f}"
+        if instruct_mode:
+            pt_str = format_tokens(pretrain_tokens)
+            it_str = format_tokens(instruct_tokens)
+            model_name = f"instruct/checkpoint_pt{pt_str}_it{it_str}_loss_{val_loss:.4f}"
+        else:
+            tokens_str = format_tokens(total_tokens)
+            model_name = f"base/checkpoint_tokens_{tokens_str}_loss_{val_loss:.4f}"
         save_path = os.path.join(output_dir, "hf_upload", model_name)
         os.makedirs(save_path, exist_ok=True)
+
+        # Determine checkpoint type
+        ckpt_type = "instruct" if instruct_mode else "base"
 
         # Save model state dict and config
         print(f"Saving model to {save_path}...")
@@ -705,6 +782,9 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
             'config': config_args,
             'total_tokens': total_tokens,
             'val_loss': val_loss,
+            'checkpoint_type': ckpt_type,
+            'pretrain_tokens': pretrain_tokens,
+            'instruct_tokens': instruct_tokens,
         }
 
         # Add optimizer state and step if provided (for resuming)
@@ -726,7 +806,10 @@ def push_to_huggingface(model, tokenizer, config_args, output_dir, total_tokens,
         with open(os.path.join(save_path, "config.json"), "w") as f:
             json.dump({
                 'model_type': 'swa_mla',
+                'checkpoint_type': ckpt_type,
                 'total_tokens': total_tokens,
+                'pretrain_tokens': pretrain_tokens,
+                'instruct_tokens': instruct_tokens,
                 'val_loss': val_loss,
                 'training_config': config_args,
             }, f, indent=2)
@@ -744,8 +827,12 @@ tags:
 
 # SWA-MLA Model Checkpoint
 
+**Checkpoint Type:** {ckpt_type}
+
 **Training Progress:**
-- Total tokens processed: {total_tokens:,}
+- Pretraining tokens: {pretrain_tokens:,}
+- Instruction-tuning tokens: {instruct_tokens:,}
+- Total tokens: {total_tokens:,}
 - Validation loss: {val_loss:.4f}
 - Perplexity: {math.exp(val_loss):.2f}
 
@@ -803,7 +890,7 @@ Generated with [SWA-MLA](https://github.com/yourusername/swamla)
             repo_id=repo_id,
             repo_type="model",
             path_in_repo=model_name,
-            commit_message=f"Add checkpoint: {total_tokens:,} tokens, val_loss={val_loss:.4f}"
+            commit_message=f"Add {ckpt_type} checkpoint: {total_tokens:,} tokens, val_loss={val_loss:.4f}"
         )
 
         print(f"Successfully uploaded to https://huggingface.co/{repo_id}/tree/main/{model_name}")
@@ -863,6 +950,14 @@ def train(args):
     # Configure tokenizer to support longer sequences (suppress warning)
     # GPT-2 tokenizer defaults to 1024, but our model supports longer sequences
     tokenizer.model_max_length = args.block_size
+
+    # Add ChatML special tokens for instruct mode
+    num_added_tokens = 0
+    if args.instruct:
+        special_tokens = {"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]}
+        num_added_tokens = tokenizer.add_special_tokens(special_tokens)
+        if master_process and num_added_tokens > 0:
+            print(f"Added {num_added_tokens} ChatML special tokens to tokenizer")
     vocab_size = len(tokenizer)
 
     # Try to load checkpoint from HuggingFace or local path if requested
@@ -875,17 +970,43 @@ def train(args):
         checkpoint_path = args.resume_from
         if os.path.isdir(checkpoint_path):
             import glob
-            checkpoint_files = glob.glob(os.path.join(checkpoint_path, "checkpoint_*.pt"))
-            if checkpoint_files:
-                def get_step(f):
-                    try:
-                        return int(os.path.basename(f).replace("checkpoint_", "").replace(".pt", ""))
-                    except:
-                        return 0
-                checkpoint_files.sort(key=get_step, reverse=True)
-                checkpoint_path = checkpoint_files[0]
+            import re as _re
+
+            # Search for checkpoints with priority based on mode
+            if args.instruct:
+                # Instruct: search instruct first, then base, then legacy
+                search_patterns = [
+                    ("checkpoint_instruct_*.pt", "instruct"),
+                    ("checkpoint_base_*.pt", "base"),
+                    ("checkpoint_*.pt", "legacy"),
+                ]
             else:
-                checkpoint_path = None
+                # Base: search base first, then legacy
+                search_patterns = [
+                    ("checkpoint_base_*.pt", "base"),
+                    ("checkpoint_*.pt", "legacy"),
+                ]
+
+            checkpoint_path = None
+            for pattern, label in search_patterns:
+                matched = glob.glob(os.path.join(args.resume_from, pattern))
+                # For legacy pattern, only match old format: checkpoint_{tokens}_step{N}.pt
+                if label == "legacy":
+                    legacy_re = _re.compile(r'^checkpoint_[\d._]+[kKmMbB]?_step\d+\.pt$')
+                    matched = [f for f in matched
+                               if not os.path.basename(f).startswith("checkpoint_base_")
+                               and not os.path.basename(f).startswith("checkpoint_instruct_")
+                               and legacy_re.match(os.path.basename(f))]
+                if matched:
+                    # Sort by step number (extract from _step{N}.pt suffix)
+                    def _extract_step(f):
+                        m = _re.search(r'_step(\d+)\.pt$', os.path.basename(f))
+                        return int(m.group(1)) if m else 0
+                    matched.sort(key=_extract_step, reverse=True)
+                    checkpoint_path = matched[0]
+                    if master_process:
+                        print(f"Found {label} checkpoint: {os.path.basename(checkpoint_path)}")
+                    break
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             try:
@@ -894,15 +1015,43 @@ def train(args):
                 resume_tokens = resume_checkpoint.get('total_tokens', 0)
             except Exception as e:
                 if master_process:
-                    print(f"⚠ Failed to load checkpoint: {e}")
+                    print(f"Warning: Failed to load checkpoint: {e}")
 
     elif args.resume_from_hf and args.hf_repo_id:
-        # Resume from HuggingFace
+        # Resume from HuggingFace — instruct_mode enables instruct->base fallback
         hf_token = os.getenv("HF_TOKEN")
-        resume_checkpoint = load_latest_from_huggingface(args.hf_repo_id, hf_token)
+        resume_checkpoint = load_latest_from_huggingface(args.hf_repo_id, hf_token, instruct_mode=args.instruct)
         if resume_checkpoint:
             resume_step = resume_checkpoint.get('step', 0)
             resume_tokens = resume_checkpoint.get('total_tokens', 0)
+
+    # Track pretrain vs instruct tokens for checkpoint naming
+    pretrain_tokens = 0  # Total pretraining tokens (constant in instruct mode)
+
+    # For instruct mode: handle checkpoint type detection and token tracking
+    if resume_checkpoint and args.instruct:
+        checkpoint_type = resume_checkpoint.get('checkpoint_type', 'base')
+        if checkpoint_type == 'instruct':
+            # Resuming from an instruct checkpoint — restore both counters
+            pretrain_tokens = resume_checkpoint.get('pretrain_tokens', 0)
+            resume_step = resume_checkpoint.get('step', 0)
+            resume_tokens = resume_checkpoint.get('instruct_tokens', resume_checkpoint.get('total_tokens', 0))
+            if master_process:
+                print(f"Instruct: resuming from instruct checkpoint (pretrain={format_tokens(pretrain_tokens)}, instruct={format_tokens(resume_tokens)}, step={resume_step})")
+        else:
+            # Loading a base checkpoint — start instruct from scratch
+            pretrain_tokens = resume_checkpoint.get('pretrain_tokens', resume_checkpoint.get('total_tokens', 0))
+            if master_process:
+                print(f"Instruct: loaded pretrained weights ({format_tokens(pretrain_tokens)} pretrain tokens)")
+                print(f"Instruct: starting from step 0 with fresh optimizer")
+            resume_step = 0
+            resume_tokens = 0
+    elif resume_checkpoint and not args.instruct:
+        # Resuming base training — restore pretrain_tokens
+        pretrain_tokens = resume_checkpoint.get('pretrain_tokens', resume_checkpoint.get('total_tokens', 0))
+    elif not resume_checkpoint and args.instruct and master_process:
+        print("WARNING: Starting instruct training without loading a base checkpoint!")
+        print("         pretrain_tokens will be 0. Use --resume_from or --resume_from_hf to load base weights.")
 
     # Resolve FP8 backend
     fp8_backend = args.fp8_backend
@@ -992,10 +1141,16 @@ def train(args):
         print(f"[cuDNN compat] H100+ supports head_dim ≤ 256, using original dimensions "
               f"(qk_nope={args.mla_qk_nope_head_dim} + rope={args.mla_qk_rope_head_dim})")
 
+    # For instruct mode: create model with original vocab_size so checkpoint loads correctly
+    # Embeddings will be resized AFTER loading weights
+    model_vocab_size = vocab_size
+    if args.instruct and num_added_tokens > 0 and resume_checkpoint:
+        model_vocab_size = vocab_size - num_added_tokens  # Original size for checkpoint compat
+
     # Common model kwargs
     model_kwargs = dict(
         size=args.size,
-        vocab_size=vocab_size,
+        vocab_size=model_vocab_size,
         block_size=args.block_size,
         dropout=args.dropout,
         local_layers_per_cycle=args.local_layers_per_cycle,
@@ -1090,6 +1245,54 @@ def train(args):
                 print(f"⚠ {len(load_result.unexpected_keys)} unexpected keys after load: {load_result.unexpected_keys[:5]}...")
             if not load_result.missing_keys and not load_result.unexpected_keys:
                 print("✓ Model weights loaded successfully (all keys matched)")
+
+        # Reinitialize gate_bias for old checkpoints that don't have it
+        # Old checkpoints had collapsed gates (~0.01). Starting gate_bias at default 0.0
+        # would inject sigmoid(0)=0.5 signal — still a massive spike vs 0.01.
+        # Use -3.0 so sigmoid(-3)=0.05, close to old behavior. Aux loss warms up gradually.
+        if load_result.missing_keys:
+            gate_bias_missing = any('gate_bias' in k for k in load_result.missing_keys)
+            if gate_bias_missing:
+                for block in model.transformer.h:
+                    if hasattr(block, 'engram') and block.engram is not None:
+                        with torch.no_grad():
+                            block.engram.gating.gate_bias.fill_(-3.0)
+                if rank == 0:
+                    print("Engram: gate_bias initialized to -3.0 (old checkpoint, gradual warmup via aux loss)")
+
+    # Resize embeddings for instruct mode (after checkpoint load, before compile/DDP)
+    if args.instruct and num_added_tokens > 0:
+        import torch.nn as nn
+        old_vocab = model.config.vocab_size
+        new_vocab = vocab_size
+        if master_process:
+            print(f"Resizing embeddings {old_vocab} -> {new_vocab} (+{num_added_tokens} ChatML tokens)")
+
+        # Resize wte (token embedding)
+        old_wte = model.transformer.wte.weight.data
+        new_wte = torch.zeros(new_vocab, model.config.n_embd, device=old_wte.device, dtype=old_wte.dtype)
+        new_wte[:old_vocab] = old_wte
+        torch.nn.init.normal_(new_wte[old_vocab:], mean=0.0, std=0.02)
+        model.transformer.wte.weight = torch.nn.Parameter(new_wte)
+
+        # Re-tie lm_head to wte (model ties lm_head.weight = wte.weight at init)
+        model.lm_head.weight = model.transformer.wte.weight
+
+        # Resize all value_embeds in MLA/DeltaNet blocks (also use vocab_size)
+        resized_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Embedding) and module.num_embeddings == old_vocab and module is not model.transformer.wte:
+                embed_dim = module.embedding_dim
+                old_data = module.weight.data
+                new_data = torch.zeros(new_vocab, embed_dim, device=old_data.device, dtype=old_data.dtype)
+                new_data[:old_vocab] = old_data
+                torch.nn.init.normal_(new_data[old_vocab:], mean=0.0, std=0.02)
+                module.weight = torch.nn.Parameter(new_data)
+                resized_count += 1
+        if master_process and resized_count > 0:
+            print(f"  Resized {resized_count} additional value_embeds layers")
+
+        model.config.vocab_size = new_vocab
 
     # Setup WeDLM training if enabled
     wedlm_masker = None
@@ -1189,8 +1392,10 @@ def train(args):
         args.compile_mode = compile_mode
 
     # Wrap with DDP
+    # Instruct freeze/unfreeze changes requires_grad mid-training, incompatible with static_graph
+    instruct_will_freeze = args.instruct and args.instruct_freeze_steps > 0 and num_added_tokens > 0
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank], static_graph=True)
+        model = DDP(model, device_ids=[local_rank], static_graph=not instruct_will_freeze)
         raw_model = model.module
     else:
         raw_model = model
@@ -1213,16 +1418,29 @@ def train(args):
     if data_start_offset > 0 and master_process:
         print(f"Data loader: skipping ~{data_start_offset:,} examples (resume from {format_tokens(resume_tokens)})")
 
-    data_loader = PackedFinewebDataset(
-        split='train',
-        max_length=initial_seq_len,
-        batch_size=initial_batch_size,
-        tokenizer=tokenizer,
-        shuffle=True,
-        num_workers=args.num_workers,
-        start_offset=data_start_offset,
-        use_bestfit_crop=args.use_bestfit_crop,
-    )
+    if args.instruct:
+        data_loader = PackedInstructDataset(
+            split='train',
+            max_length=initial_seq_len,
+            batch_size=initial_batch_size,
+            tokenizer=tokenizer,
+            shuffle=True,
+            num_workers=1,
+            start_offset=data_start_offset,
+        )
+        if master_process:
+            print("Instruct mode: PackedInstructDataset (SlimOrca, ChatML, loss masking)")
+    else:
+        data_loader = PackedFinewebDataset(
+            split='train',
+            max_length=initial_seq_len,
+            batch_size=initial_batch_size,
+            tokenizer=tokenizer,
+            shuffle=True,
+            num_workers=args.num_workers,
+            start_offset=data_start_offset,
+            use_bestfit_crop=args.use_bestfit_crop,
+        )
 
     # Configure optimizer (μP-aware if enabled)
     if mup_config is not None:
@@ -1250,7 +1468,11 @@ def train(args):
         )
 
     # Load optimizer state if resuming
-    if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint:
+    # Skip for instruct mode loading a base checkpoint (fresh optimizer needed)
+    # But DO load if instruct mode resuming from an instruct checkpoint
+    instruct_resuming_instruct = args.instruct and resume_checkpoint and resume_checkpoint.get('checkpoint_type') == 'instruct'
+    skip_optimizer_load = args.instruct and not instruct_resuming_instruct
+    if resume_checkpoint and 'optimizer_state_dict' in resume_checkpoint and not skip_optimizer_load:
         try:
             saved_state = resume_checkpoint['optimizer_state_dict']
             saved_is_list = isinstance(saved_state, list)
@@ -1258,10 +1480,17 @@ def train(args):
 
             if opt_is_list and saved_is_list:
                 if len(optimizer) == len(saved_state):
-                    for opt, state in zip(optimizer, saved_state):
-                        opt.load_state_dict(state)
+                    restored = 0
+                    for i, (opt, state) in enumerate(zip(optimizer, saved_state)):
+                        try:
+                            opt.load_state_dict(state)
+                            restored += 1
+                        except Exception as e_inner:
+                            if rank == 0:
+                                opt_name = type(opt).__name__
+                                print(f"  Optimizer {i} ({opt_name}): fresh state (param groups changed)")
                     if rank == 0:
-                        print(f"Restored optimizer state ({len(optimizer)} optimizers)")
+                        print(f"Restored {restored}/{len(optimizer)} optimizer states")
                 else:
                     if rank == 0:
                         print(f"Warning: Optimizer count mismatch (checkpoint={len(saved_state)}, current={len(optimizer)}), starting fresh")
@@ -1276,6 +1505,8 @@ def train(args):
             if rank == 0:
                 print(f"Warning: Could not restore optimizer state: {e}")
                 print("Starting with fresh optimizer state")
+    elif skip_optimizer_load and resume_checkpoint and master_process:
+        print("Instruct mode: fresh optimizer state (loading base checkpoint, not instruct resume)")
 
     # Load EMA state if resuming
     if resume_checkpoint and 'ema' in resume_checkpoint and ema is not None:
@@ -1394,7 +1625,27 @@ def train(args):
     current_seq_len = initial_seq_len
     current_batch_size = initial_batch_size
 
+    # Instruct freeze/unfreeze: warm-start new embeddings
+    instruct_frozen = False
+    if args.instruct and args.instruct_freeze_steps > 0 and num_added_tokens > 0:
+        for param in raw_model.parameters():
+            param.requires_grad = False
+        # Unfreeze wte and lm_head (the embedding layers that were resized)
+        raw_model.transformer.wte.weight.requires_grad = True
+        raw_model.lm_head.weight.requires_grad = True
+        instruct_frozen = True
+        if master_process:
+            print(f"Instruct: base model frozen for {args.instruct_freeze_steps} steps (training embeddings only)")
+
     for step in range(start_step, args.max_iters):
+        # Check for instruct unfreeze
+        if instruct_frozen and step >= args.instruct_freeze_steps:
+            for param in raw_model.parameters():
+                param.requires_grad = True
+            instruct_frozen = False
+            if master_process:
+                print(f"\nInstruct: unfreezing all parameters at step {step}")
+
         # Progressive training: check for phase transition
         if progressive is not None:
             new_seq_len, new_batch_size = progressive.get_current_config(total_tokens_seen)
@@ -1408,16 +1659,27 @@ def train(args):
                 except Exception:
                     pass
 
-                data_loader = PackedFinewebDataset(
-                    split='train',
-                    max_length=new_seq_len,
-                    batch_size=new_batch_size,
-                    tokenizer=tokenizer,
-                    shuffle=True,
-                    num_workers=args.num_workers,
-                    start_offset=total_tokens_seen // new_seq_len,  # Approximate position
-                    use_bestfit_crop=args.use_bestfit_crop,
-                )
+                if args.instruct:
+                    data_loader = PackedInstructDataset(
+                        split='train',
+                        max_length=new_seq_len,
+                        batch_size=new_batch_size,
+                        tokenizer=tokenizer,
+                        shuffle=True,
+                        num_workers=1,
+                        start_offset=total_tokens_seen // new_seq_len,
+                    )
+                else:
+                    data_loader = PackedFinewebDataset(
+                        split='train',
+                        max_length=new_seq_len,
+                        batch_size=new_batch_size,
+                        tokenizer=tokenizer,
+                        shuffle=True,
+                        num_workers=args.num_workers,
+                        start_offset=total_tokens_seen // new_seq_len,  # Approximate position
+                        use_bestfit_crop=args.use_bestfit_crop,
+                    )
                 data_iter = iter(data_loader)
                 current_seq_len = new_seq_len
                 current_batch_size = new_batch_size
@@ -1480,7 +1742,17 @@ def train(args):
                     next_batch = next(data_iter)
 
             input_ids = batch['input_ids'].to(device, non_blocking=True)
-            labels = batch['labels'].to(device, non_blocking=True)
+
+            if args.instruct:
+                # Instruct mode: construct labels with -100 masking from loss_mask
+                loss_mask = batch['loss_mask'].to(device, non_blocking=True)
+                # Shift: labels[t] = input_ids[t+1], mask based on loss_mask[t+1]
+                labels = input_ids[:, 1:].clone()       # [B, T-1]
+                shift_mask = loss_mask[:, 1:]            # [B, T-1]
+                labels[shift_mask == 0] = -100           # Ignore non-assistant positions
+                labels = F.pad(labels, (0, 1), value=-100)  # [B, T] — pad last position
+            else:
+                labels = batch['labels'].to(device, non_blocking=True)
 
             # Create FP8 autocast context if using TE backend
             # Native FP8 (torchao) doesn't need a context manager — Float8Linear handles it
@@ -1601,6 +1873,10 @@ def train(args):
 
         # Track total tokens processed
         total_tokens_seen += args.batch_size * args.block_size * args.gradient_accumulation_steps * world_size
+        # In base mode, pretrain_tokens mirrors total_tokens_seen
+        # In instruct mode, pretrain_tokens stays constant (set at resume time)
+        if not args.instruct:
+            pretrain_tokens = total_tokens_seen
 
         # Logging
         if step % args.log_interval == 0 and master_process:
@@ -1705,7 +1981,15 @@ def train(args):
                         batch = next(data_iter)
 
                     input_ids = batch['input_ids'].to(device, non_blocking=True)
-                    labels = batch['labels'].to(device, non_blocking=True)
+
+                    if args.instruct:
+                        loss_mask = batch['loss_mask'].to(device, non_blocking=True)
+                        labels = input_ids[:, 1:].clone()
+                        shift_mask = loss_mask[:, 1:]
+                        labels[shift_mask == 0] = -100
+                        labels = F.pad(labels, (0, 1), value=-100)
+                    else:
+                        labels = batch['labels'].to(device, non_blocking=True)
 
                     # FP8 context for validation (TE only; native FP8 doesn't need context)
                     val_fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe) if use_te_fp8 else nullcontext()
@@ -1782,17 +2066,22 @@ def train(args):
                     # Apply EMA weights for HF upload so saved weights match validation loss
                     ema_upload_ctx = ema.apply(raw_model) if ema is not None else nullcontext()
                     with ema_upload_ctx:
+                        hf_instruct_tokens = total_tokens_seen if args.instruct else 0
+                        hf_total = pretrain_tokens + hf_instruct_tokens
                         push_to_huggingface(
                             model=raw_model,
                             tokenizer=tokenizer,
                             config_args=vars(args),
                             output_dir=args.output_dir,
-                            total_tokens=total_tokens_seen,
+                            total_tokens=hf_total,
                             val_loss=val_loss,
                             repo_id=args.hf_repo_id,
                             hf_token=hf_token,
                             optimizer=optimizer,
-                            step=step
+                            step=step,
+                            instruct_mode=args.instruct,
+                            pretrain_tokens=pretrain_tokens,
+                            instruct_tokens=hf_instruct_tokens,
                         )
                 else:
                     print("HF_TOKEN not set - skipping HF push. Set HF_TOKEN environment variable to enable automatic uploads.")
@@ -1826,13 +2115,26 @@ def train(args):
             from dataclasses import asdict
             model_config_dict = asdict(raw_model.config)
 
+            # Compute token counts for checkpoint metadata
+            if args.instruct:
+                ckpt_instruct_tokens = total_tokens_seen
+                ckpt_total = pretrain_tokens + ckpt_instruct_tokens
+                ckpt_type = "instruct"
+            else:
+                ckpt_instruct_tokens = 0
+                ckpt_total = total_tokens_seen
+                ckpt_type = "base"
+
             checkpoint = {
                 'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer_state,
                 'step': step,
                 'config': model_config_dict,  # Use actual model config, not CLI args
                 'args': config_dict,  # Keep CLI args for reference
-                'total_tokens': total_tokens_seen,
+                'total_tokens': ckpt_total,  # pretrain + instruct for backward compat
+                'checkpoint_type': ckpt_type,
+                'pretrain_tokens': pretrain_tokens,
+                'instruct_tokens': ckpt_instruct_tokens,
                 # Token-based thresholds for correct resume
                 'last_eval_tokens': last_eval_tokens,
                 'last_save_tokens': last_save_tokens,
@@ -1850,15 +2152,23 @@ def train(args):
                 }
 
             # Use token count in checkpoint filename for clarity
-            tokens_str = format_tokens(total_tokens_seen).replace('.', '_')
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_{tokens_str}_step{step}.pt')
+            if args.instruct:
+                pt_str = format_tokens(pretrain_tokens).replace('.', '_')
+                it_str = format_tokens(ckpt_instruct_tokens).replace('.', '_')
+                checkpoint_path = os.path.join(args.output_dir, f'checkpoint_instruct_pt{pt_str}_it{it_str}_step{step}.pt')
+            else:
+                tokens_str = format_tokens(pretrain_tokens).replace('.', '_')
+                checkpoint_path = os.path.join(args.output_dir, f'checkpoint_base_{tokens_str}_step{step}.pt')
 
             # Async checkpoint save: wait for any previous save to finish, then save in background
             if _save_thread is not None:
                 _save_thread.join()
             _save_thread = threading.Thread(target=torch.save, args=(checkpoint, checkpoint_path), daemon=True)
             _save_thread.start()
-            print(f"Saving checkpoint to {checkpoint_path} ({format_tokens(total_tokens_seen)} tokens)")
+            if args.instruct:
+                print(f"Saving checkpoint to {checkpoint_path} (pretrain={format_tokens(pretrain_tokens)}, instruct={format_tokens(ckpt_instruct_tokens)})")
+            else:
+                print(f"Saving checkpoint to {checkpoint_path} ({format_tokens(pretrain_tokens)} tokens)")
 
         # Profiler step
         if profiler is not None:
@@ -2000,8 +2310,8 @@ def main():
                         help='Engram causal convolution kernel size')
     parser.add_argument('--engram_lr_multiplier', type=float, default=5.0,
                         help='Learning rate multiplier for all Engram parameters')
-    parser.add_argument('--engram_gate_bias_init', type=float, default=1.0,
-                        help='Initial gate bias value (sigmoid(1.0)=0.73, prevents gate collapse)')
+    parser.add_argument('--engram_gate_bias_init', type=float, default=0.0,
+                        help='Initial gate bias value (sigmoid(0)=0.5, neutral start)')
     parser.add_argument('--engram_gate_loss_weight', type=float, default=0.01,
                         help='Weight for gate anti-collapse auxiliary loss (0 to disable)')
 
@@ -2144,6 +2454,12 @@ def main():
     parser.add_argument('--wedlm_mask_token_id', type=int, default=None,
                         help='Token ID for [MASK] (default: use tokenizer.mask_token_id or vocab_size-1)')
 
+    # Instruction fine-tuning
+    parser.add_argument('--instruct', action='store_true', default=False,
+                        help='Instruction fine-tuning mode (SlimOrca + ChatML + loss masking)')
+    parser.add_argument('--instruct_freeze_steps', type=int, default=50,
+                        help='Steps to freeze base model, only training new ChatML embeddings (warm-start)')
+
     # Profiling
     parser.add_argument('--profile', action='store_true', default=False,
                         help='Enable PyTorch profiler for performance analysis')
@@ -2153,6 +2469,16 @@ def main():
                         help='Number of warmup steps before profiling (default: 2)')
 
     args = parser.parse_args()
+
+    # Apply instruct defaults (only when user didn't explicitly set them)
+    if args.instruct:
+        argv_str = ' '.join(sys.argv)
+        if '--learning_rate' not in argv_str:
+            args.learning_rate = 5e-5
+        if '--warmup_iters' not in argv_str:
+            args.warmup_iters = 100
+        if '--wandb_project' not in argv_str:
+            args.wandb_project = "swamla-instruct"
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
