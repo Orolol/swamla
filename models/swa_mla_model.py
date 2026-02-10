@@ -89,6 +89,8 @@ class SWAMLAConfig:
     use_cudnn_sdpa: bool = True
     # Override safety fallback and force cuDNN SDPA on Hopper/Blackwell
     force_cudnn_sdpa: bool = False
+    # Explicit SDPA backend: "auto" (CC-based), "native" (PyTorch default), "cudnn"
+    sdpa_backend: str = "native"
 
     # Custom Triton MLA kernel (H100 compatible alternative to FA2)
     # Use this when FA2 causes CUDA graph issues with torch.compile on H100
@@ -135,6 +137,7 @@ class SWAMLAConfig:
     engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = None  # Custom table sizes
     engram_lr_multiplier: float = 5.0  # LR multiplier for Engram embeddings
     engram_gate_bias_init: float = 0.0  # Initial gate bias (sigmoid(0)=0.5, neutral start)
+    engram_gate_mode: str = "auto"  # "auto", "scalar", or "elementwise"
 
     # μP (Maximal Update Parametrization)
     use_mup: bool = False
@@ -710,6 +713,7 @@ def _create_mla_block_config(config: SWAMLAConfig):
         engram_conv_kernel: int = config.engram_conv_kernel
         engram_table_sizes: Optional[Dict[Tuple[int, int], int]] = config.engram_table_sizes
         engram_gate_bias_init: float = config.engram_gate_bias_init
+        engram_gate_mode: str = config.engram_gate_mode
         # Value Embeddings
         use_value_embeds: bool = config.use_value_embeds
         ve_gate_dim: int = config.ve_gate_dim
@@ -731,6 +735,7 @@ def _create_mla_block_config(config: SWAMLAConfig):
         cudnn_compatible_heads: bool = config.cudnn_compatible_heads
         use_cudnn_sdpa: bool = config.use_cudnn_sdpa
         force_cudnn_sdpa: bool = config.force_cudnn_sdpa
+        sdpa_backend: str = config.sdpa_backend
 
     return _Config()
 

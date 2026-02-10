@@ -151,31 +151,44 @@ class MLA(nn.Module):
         self.use_flex_attention = getattr(config, 'use_flex_attention', False) and FLEX_ATTENTION_AVAILABLE
         self._flex_attention_compiled = None  # Will be compiled on first use
 
-        self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
-        self.force_cudnn_sdpa = getattr(config, 'force_cudnn_sdpa', False)
         self._warned_cudnn_fallback = False
-        cudnn_compatible_heads = getattr(config, 'cudnn_compatible_heads', False)
-        cudnn_head_dim_limit = 256 if cudnn_compatible_heads else 128
-        if self.use_cudnn_sdpa and self.qk_head_dim > cudnn_head_dim_limit:
-            if self.force_cudnn_sdpa:
-                print(
-                    f"MLA: force_cudnn_sdpa=True with head_dim={self.qk_head_dim} "
-                    f"(recommended ≤ {cudnn_head_dim_limit})"
-                )
-            else:
-                self.use_cudnn_sdpa = False
 
-        # Blackwell (CC >= 10.0): disable cuDNN SDPA to avoid graph breaks.
-        # PyTorch 2.10 auto-selects the best SDPA backend (FlashAttention2 or
-        # math fallback) without requiring @torch.compiler.disable, so the
-        # native SDPA path is fully compilable with zero graph breaks.
-        if self.use_cudnn_sdpa and torch.cuda.is_available():
-            cc = torch.cuda.get_device_capability()
-            if cc[0] >= 10 and not self.force_cudnn_sdpa:
-                self.use_cudnn_sdpa = False
-                print(f"MLA: Blackwell detected (CC {cc[0]}.{cc[1]}), using native SDPA (no graph break)")
-            elif cc[0] >= 10 and self.force_cudnn_sdpa:
-                print(f"MLA: Blackwell detected (CC {cc[0]}.{cc[1]}), force_cudnn_sdpa=True (experimental)")
+        # SDPA backend selection: config-driven or auto-detected
+        sdpa_backend = getattr(config, 'sdpa_backend', 'auto')
+
+        if sdpa_backend == 'native':
+            # Explicit native: skip all CC detection, use PyTorch default SDPA
+            self.use_cudnn_sdpa = False
+            self.force_cudnn_sdpa = False
+        elif sdpa_backend == 'cudnn':
+            # Explicit cuDNN: try to enable, warn if unavailable
+            self.use_cudnn_sdpa = SDPA_KERNEL_AVAILABLE
+            self.force_cudnn_sdpa = True
+            if not self.use_cudnn_sdpa:
+                print("MLA: cuDNN SDPA requested but not available, falling back to native")
+        else:
+            # Auto mode: existing CC-based logic
+            self.use_cudnn_sdpa = getattr(config, 'use_cudnn_sdpa', True) and SDPA_KERNEL_AVAILABLE
+            self.force_cudnn_sdpa = getattr(config, 'force_cudnn_sdpa', False)
+            cudnn_compatible_heads = getattr(config, 'cudnn_compatible_heads', False)
+            cudnn_head_dim_limit = 256 if cudnn_compatible_heads else 128
+            if self.use_cudnn_sdpa and self.qk_head_dim > cudnn_head_dim_limit:
+                if self.force_cudnn_sdpa:
+                    print(
+                        f"MLA: force_cudnn_sdpa=True with head_dim={self.qk_head_dim} "
+                        f"(recommended ≤ {cudnn_head_dim_limit})"
+                    )
+                else:
+                    self.use_cudnn_sdpa = False
+
+            # Blackwell (CC >= 10.0): disable cuDNN SDPA to avoid graph breaks.
+            if self.use_cudnn_sdpa and torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability()
+                if cc[0] >= 10 and not self.force_cudnn_sdpa:
+                    self.use_cudnn_sdpa = False
+                    print(f"MLA: Blackwell detected (CC {cc[0]}.{cc[1]}), using native SDPA (no graph break)")
+                elif cc[0] >= 10 and self.force_cudnn_sdpa:
+                    print(f"MLA: Blackwell detected (CC {cc[0]}.{cc[1]}), force_cudnn_sdpa=True (experimental)")
 
         if self.use_cudnn_sdpa:
             print(f"MLA: Using cuDNN SDPA backend (head_dim={self.qk_head_dim})")

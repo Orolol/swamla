@@ -1222,6 +1222,17 @@ def train(args):
         engram_layers = [int(x.strip()) for x in args.engram_layers.split(',') if x.strip()]
         engram_ngram_orders = [int(x.strip()) for x in args.engram_ngram_orders.split(',') if x.strip()]
 
+    # Auto-detect Engram gate mode from checkpoint
+    if args.engram_gate_mode == 'auto' and args.use_engram:
+        if resume_checkpoint and 'model_state_dict' in resume_checkpoint:
+            ckpt_keys = resume_checkpoint['model_state_dict'].keys()
+            has_gate_bias = any('gating.gate_bias' in k for k in ckpt_keys)
+            args.engram_gate_mode = 'elementwise' if has_gate_bias else 'scalar'
+            if master_process:
+                print(f"Engram: auto-detected gate_mode='{args.engram_gate_mode}' from checkpoint")
+        else:
+            args.engram_gate_mode = 'elementwise'  # Fresh training → new architecture
+
     # cuDNN-compatible heads: H100+ supports head_dim ≤ 256, no adjustment needed
     # (qk_nope_head_dim=128 + qk_rope_head_dim=64 = 192 ≤ 256)
     if args.cudnn_compatible_heads:
@@ -1254,6 +1265,7 @@ def train(args):
         use_triton_kernels=args.use_triton_kernels,
         use_cudnn_sdpa=args.use_cudnn_sdpa,
         force_cudnn_sdpa=args.force_cudnn_sdpa,
+        sdpa_backend=args.sdpa_backend,
         use_gated_deltanet=args.use_gated_deltanet,
         # DeltaNet latent compression options
         deltanet_latent_dim=args.deltanet_latent_dim,
@@ -1269,6 +1281,7 @@ def train(args):
         engram_ngram_orders=engram_ngram_orders,
         engram_conv_kernel=args.engram_conv_kernel,
         engram_gate_bias_init=args.engram_gate_bias_init,
+        engram_gate_mode=args.engram_gate_mode,
         # cuDNN-compatible heads
         cudnn_compatible_heads=args.cudnn_compatible_heads,
         # Per-layer residual scalars (nanochat)
@@ -1333,19 +1346,8 @@ def train(args):
             if not load_result.missing_keys and not load_result.unexpected_keys:
                 print("✓ Model weights loaded successfully (all keys matched)")
 
-        # Reinitialize gate_bias for old checkpoints that don't have it
-        # Old checkpoints had collapsed gates (~0.01). Starting gate_bias at default 0.0
-        # would inject sigmoid(0)=0.5 signal — still a massive spike vs 0.01.
-        # Use -3.0 so sigmoid(-3)=0.05, close to old behavior. Aux loss warms up gradually.
-        if load_result.missing_keys:
-            gate_bias_missing = any('gate_bias' in k for k in load_result.missing_keys)
-            if gate_bias_missing:
-                for block in model.transformer.h:
-                    if hasattr(block, 'engram') and block.engram is not None:
-                        with torch.no_grad():
-                            block.engram.gating.gate_bias.fill_(-3.0)
-                if rank == 0:
-                    print("Engram: gate_bias initialized to -3.0 (old checkpoint, gradual warmup via aux loss)")
+        # Note: gate_bias hack removed. Old checkpoints auto-detect gate_mode='scalar'
+        # which has no gate_bias parameter, so no missing keys and no hack needed.
 
     # Resize embeddings for instruct mode (after checkpoint load, before compile/DDP)
     if args.instruct and num_added_tokens > 0:
@@ -2377,6 +2379,9 @@ def main():
                         help='Use cuDNN SDPA backend when available for MLA SDPA path')
     parser.add_argument('--force_cudnn_sdpa', action='store_true', default=False,
                         help='Force cuDNN SDPA on Hopper/Blackwell even when default safety checks would disable it')
+    parser.add_argument('--sdpa_backend', type=str, default='native',
+                        choices=['auto', 'native', 'cudnn'],
+                        help='SDPA backend: native (consistent cross-GPU), cudnn (H100 cuDNN), auto (CC-based)')
 
     # DeltaNet options (always enabled)
     parser.add_argument('--use_flash_attention', action=argparse.BooleanOptionalAction, default=False,
@@ -2411,6 +2416,9 @@ def main():
                         help='Learning rate multiplier for all Engram parameters')
     parser.add_argument('--engram_gate_bias_init', type=float, default=0.0,
                         help='Initial gate bias value (sigmoid(0)=0.5, neutral start)')
+    parser.add_argument('--engram_gate_mode', type=str, default='auto',
+                        choices=['auto', 'scalar', 'elementwise'],
+                        help='Engram gate architecture: auto (detect from checkpoint), scalar (old), elementwise (new)')
     parser.add_argument('--engram_gate_loss_weight', type=float, default=0.01,
                         help='Weight for gate anti-collapse auxiliary loss (0 to disable)')
 

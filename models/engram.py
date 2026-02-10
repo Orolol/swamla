@@ -409,11 +409,13 @@ class EngramGating(nn.Module):
         memory_dim: int,      # d_mem from embeddings
         num_branches: int = 1,  # M for multi-branch (mHC)
         gate_bias_init: float = 0.0,  # Learnable bias before sigmoid (0.0 = neutral start)
+        gate_mode: str = "elementwise",  # "scalar" or "elementwise"
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.memory_dim = memory_dim
         self.num_branches = num_branches
+        self.gate_mode = gate_mode
 
         # Value projection (shared across branches)
         self.w_v = nn.Linear(memory_dim, hidden_dim, bias=False)
@@ -428,13 +430,13 @@ class EngramGating(nn.Module):
         self.query_norm = RMSNorm(hidden_dim)
         self.key_norm = RMSNorm(hidden_dim)
 
-        # Scaling factor
+        # Scaling factor (used by scalar gate mode)
         self.scale = hidden_dim ** -0.5
 
-        # Learnable gate bias: sigmoid(element_product + gate_bias)
-        # Default 0.0: sigmoid(0)=0.5, neutral start. Aux loss pushes gates open.
-        # For old checkpoint resume, train.py sets this to -3.0 (conservative).
-        self.gate_bias = nn.Parameter(torch.tensor(gate_bias_init))
+        # Learnable gate bias: only for elementwise mode
+        # sigmoid(element_product + gate_bias) → [B,T,d]
+        if gate_mode == "elementwise":
+            self.gate_bias = nn.Parameter(torch.tensor(gate_bias_init))
 
     def forward(
         self,
@@ -459,12 +461,18 @@ class EngramGating(nn.Module):
             q_norm = self.query_norm(h)
             k_norm = self.key_norm(k)
 
-            # Element-wise gate: sigmoid of per-dimension product + learnable bias
-            # Each q_i*k_i ∈ [-3, 3] after RMSNorm → sigmoid stays in [0.05, 0.95]
-            # Resistant to collapse: even anti-correlated dims give sigmoid(-3+1)=0.12
-            gate = torch.sigmoid(
-                q_norm * k_norm + self.gate_bias
-            )  # [B, T, d]
+            if self.gate_mode == "scalar":
+                # Old architecture: scalar gate from dot product
+                # sigmoid(sum(q*k, dim=-1) * scale) → [B,T,1]
+                gate = torch.sigmoid(
+                    (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale
+                )  # [B, T, 1]
+            else:
+                # New architecture: element-wise gate with learnable bias
+                # sigmoid(q*k + gate_bias) → [B,T,d]
+                gate = torch.sigmoid(
+                    q_norm * k_norm + self.gate_bias
+                )  # [B, T, d]
 
             # Gate stored by Engram._store_monitoring via self.gating.last_gate
             self.last_gate = gate
@@ -481,9 +489,14 @@ class EngramGating(nn.Module):
                 q_norm = self.query_norm(h_m)
                 k_norm = self.key_norm(k_m)
 
-                gate_m = torch.sigmoid(
-                    q_norm * k_norm + self.gate_bias
-                )
+                if self.gate_mode == "scalar":
+                    gate_m = torch.sigmoid(
+                        (q_norm * k_norm).sum(dim=-1, keepdim=True) * self.scale
+                    )
+                else:
+                    gate_m = torch.sigmoid(
+                        q_norm * k_norm + self.gate_bias
+                    )
 
                 outputs.append(gate_m * v)
 
@@ -588,6 +601,7 @@ class Engram(nn.Module):
         num_branches: int = 1,
         conv_kernel_size: int = 4,
         gate_bias_init: float = 0.0,
+        gate_mode: str = "elementwise",
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -611,6 +625,7 @@ class Engram(nn.Module):
             memory_dim=config.embed_dim,
             num_branches=num_branches,
             gate_bias_init=gate_bias_init,
+            gate_mode=gate_mode,
         )
 
         # 3. Causal convolution (zero-init for identity at start)
@@ -840,6 +855,7 @@ def create_engram_for_config(config, layer_id: int) -> Optional[Engram]:
     conv_kernel_size = getattr(config, 'engram_conv_kernel', 4)
     table_sizes = getattr(config, 'engram_table_sizes', None)
     gate_bias_init = getattr(config, 'engram_gate_bias_init', 0.0)
+    gate_mode = getattr(config, 'engram_gate_mode', 'elementwise')
 
     # Get vocab_size for dynamic table scaling (paper specification)
     vocab_size = getattr(config, 'vocab_size', None)
@@ -859,4 +875,5 @@ def create_engram_for_config(config, layer_id: int) -> Optional[Engram]:
         num_branches=1,
         conv_kernel_size=conv_kernel_size,
         gate_bias_init=gate_bias_init,
+        gate_mode=gate_mode,
     )
