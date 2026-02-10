@@ -463,6 +463,58 @@ def get_wd_schedule(it, max_iters, initial_wd):
     return initial_wd * max(0.0, 1.0 - it / max_iters)
 
 
+def _restore_optimizer_state_partial(optimizer, saved_state_dict, rank=0):
+    """Restore optimizer state group-by-group, skipping groups with size mismatches.
+
+    When new parameters are added (e.g., gate_bias), only the affected param group
+    loses its state. Other groups (embeddings, norms, residual scalars) keep their
+    momentum and variance estimates, preventing catastrophic LR amplification.
+    """
+    saved_groups = saved_state_dict['param_groups']
+    current_groups = optimizer.param_groups
+
+    if len(saved_groups) != len(current_groups):
+        if rank == 0:
+            print(f"  Param group count mismatch ({len(saved_groups)} -> {len(current_groups)}), cannot partially restore")
+        return 0
+
+    restored_params = 0
+    skipped_groups = 0
+
+    for gi, (sg, cg) in enumerate(zip(saved_groups, current_groups)):
+        old_indices = sg['params']  # flat indices in saved state
+        new_params = cg['params']   # actual Parameter objects
+        group_name = sg.get('name', f'group_{gi}')
+
+        if len(old_indices) != len(new_params):
+            skipped_groups += 1
+            if rank == 0:
+                print(f"  Group '{group_name}': size mismatch ({len(old_indices)} -> {len(new_params)}), fresh state")
+            continue
+
+        # Same size: restore state param-by-param
+        for old_idx, param in zip(old_indices, new_params):
+            if old_idx in saved_state_dict['state']:
+                old_s = saved_state_dict['state'][old_idx]
+                new_s = {}
+                for k, v in old_s.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.shape == param.shape:
+                            new_s[k] = v.to(device=param.device, dtype=v.dtype)
+                        # Shape mismatch within group -> skip this param's state
+                    else:
+                        new_s[k] = v  # step counter, etc.
+                if new_s:
+                    optimizer.state[param] = new_s
+                    restored_params += 1
+
+    if rank == 0:
+        total_params = sum(len(cg['params']) for cg in current_groups)
+        print(f"  Partially restored {restored_params}/{total_params} param states ({skipped_groups} groups skipped)")
+
+    return restored_params
+
+
 def configure_optimizer(model, learning_rate, weight_decay, betas, device_type, optimizer_type='adamw', engram_lr_multiplier=5.0,
                         x0_lr=0.5, resid_lr=0.005, x0_beta1=0.96):
     """Configure optimizer with proper parameter grouping.
@@ -1486,9 +1538,13 @@ def train(args):
                             opt.load_state_dict(state)
                             restored += 1
                         except Exception as e_inner:
-                            if rank == 0:
+                            # Param groups changed — try partial restoration (group-by-group)
+                            n_restored = _restore_optimizer_state_partial(opt, state, rank=rank)
+                            if n_restored > 0:
+                                restored += 1  # Count as partially restored
+                            elif rank == 0:
                                 opt_name = type(opt).__name__
-                                print(f"  Optimizer {i} ({opt_name}): fresh state (param groups changed)")
+                                print(f"  Optimizer {i} ({opt_name}): fresh state (could not partially restore)")
                     if rank == 0:
                         print(f"Restored {restored}/{len(optimizer)} optimizer states")
                 else:
