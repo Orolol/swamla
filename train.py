@@ -499,11 +499,14 @@ def _restore_optimizer_state_partial(optimizer, saved_state_dict, rank=0):
                 new_s = {}
                 for k, v in old_s.items():
                     if isinstance(v, torch.Tensor):
-                        if v.shape == param.shape:
+                        if v.dim() == 0:
+                            # Scalar tensor (e.g., step counter)
+                            new_s[k] = v.to(device=param.device)
+                        elif v.shape == param.shape:
                             new_s[k] = v.to(device=param.device, dtype=v.dtype)
                         # Shape mismatch within group -> skip this param's state
                     else:
-                        new_s[k] = v  # step counter, etc.
+                        new_s[k] = v
                 if new_s:
                     optimizer.state[param] = new_s
                     restored_params += 1
