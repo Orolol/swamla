@@ -464,35 +464,59 @@ def get_wd_schedule(it, max_iters, initial_wd):
 
 
 def _restore_optimizer_state_partial(optimizer, saved_state_dict, rank=0):
-    """Restore optimizer state group-by-group, skipping groups with size mismatches.
+    """Restore optimizer state group-by-group using name-based matching.
 
     When new parameters are added (e.g., gate_bias), only the affected param group
     loses its state. Other groups (embeddings, norms, residual scalars) keep their
     momentum and variance estimates, preventing catastrophic LR amplification.
+
+    Matching strategy:
+    1. Match groups by 'name' key if both saved and current groups have names
+    2. Fall back to positional index matching if names are unavailable
+    3. Skip groups with param count mismatches (new params added/removed)
     """
     saved_groups = saved_state_dict['param_groups']
     current_groups = optimizer.param_groups
 
-    if len(saved_groups) != len(current_groups):
-        if rank == 0:
-            print(f"  Param group count mismatch ({len(saved_groups)} -> {len(current_groups)}), cannot partially restore")
-        return 0
+    # Build name→index mapping for saved groups
+    saved_by_name = {}
+    for i, sg in enumerate(saved_groups):
+        name = sg.get('name')
+        if name:
+            saved_by_name[name] = i
 
     restored_params = 0
     skipped_groups = 0
 
-    for gi, (sg, cg) in enumerate(zip(saved_groups, current_groups)):
+    for gi, cg in enumerate(current_groups):
+        cur_name = cg.get('name', f'group_{gi}')
+
+        # Match by name first, fallback to positional index
+        if cur_name in saved_by_name:
+            sg = saved_groups[saved_by_name[cur_name]]
+            match_method = "name"
+        elif gi < len(saved_groups):
+            sg = saved_groups[gi]
+            match_method = "index"
+        else:
+            skipped_groups += 1
+            if rank == 0:
+                print(f"  Group '{cur_name}': no matching saved group, fresh state")
+            continue
+
+        saved_name = sg.get('name', f'saved_group_{gi}')
         old_indices = sg['params']  # flat indices in saved state
         new_params = cg['params']   # actual Parameter objects
-        group_name = sg.get('name', f'group_{gi}')
 
         if len(old_indices) != len(new_params):
             skipped_groups += 1
             if rank == 0:
-                print(f"  Group '{group_name}': size mismatch ({len(old_indices)} -> {len(new_params)}), fresh state")
+                print(f"  Group '{cur_name}' (matched '{saved_name}' by {match_method}): "
+                      f"size mismatch ({len(old_indices)} -> {len(new_params)}), fresh state")
             continue
 
         # Same size: restore state param-by-param
+        group_restored = 0
         for old_idx, param in zip(old_indices, new_params):
             if old_idx in saved_state_dict['state']:
                 old_s = saved_state_dict['state'][old_idx]
@@ -509,11 +533,19 @@ def _restore_optimizer_state_partial(optimizer, saved_state_dict, rank=0):
                         new_s[k] = v
                 if new_s:
                     optimizer.state[param] = new_s
-                    restored_params += 1
+                    group_restored += 1
+
+        restored_params += group_restored
+        if rank == 0:
+            saved_lr = sg.get('lr', '?')
+            lr_str = f"{saved_lr:.4g}" if isinstance(saved_lr, float) else str(saved_lr)
+            print(f"  Group '{cur_name}' (matched '{saved_name}' by {match_method}): "
+                  f"restored {group_restored}/{len(new_params)} params (lr={lr_str})")
 
     if rank == 0:
-        total_params = sum(len(cg['params']) for cg in current_groups)
-        print(f"  Partially restored {restored_params}/{total_params} param states ({skipped_groups} groups skipped)")
+        total = sum(len(cg['params']) for cg in current_groups)
+        print(f"  Total: {restored_params}/{total} param states restored "
+              f"({skipped_groups} groups skipped)")
 
     return restored_params
 
@@ -1554,9 +1586,17 @@ def train(args):
                     if rank == 0:
                         print(f"Warning: Optimizer count mismatch (checkpoint={len(saved_state)}, current={len(optimizer)}), starting fresh")
             elif not opt_is_list and not saved_is_list:
-                optimizer.load_state_dict(saved_state)
-                if rank == 0:
-                    print("Restored optimizer state")
+                try:
+                    optimizer.load_state_dict(saved_state)
+                    if rank == 0:
+                        print("Restored optimizer state")
+                except Exception as e_single:
+                    # Param groups changed — try partial restoration (group-by-group)
+                    if rank == 0:
+                        print(f"  Full restore failed ({e_single}), trying partial restore...")
+                    n_restored = _restore_optimizer_state_partial(optimizer, saved_state, rank=rank)
+                    if n_restored == 0 and rank == 0:
+                        print("  Could not partially restore, starting with fresh optimizer state")
             else:
                 if rank == 0:
                     print(f"Warning: Optimizer type mismatch (checkpoint={'list' if saved_is_list else 'single'}, current={'list' if opt_is_list else 'single'}), starting fresh")
